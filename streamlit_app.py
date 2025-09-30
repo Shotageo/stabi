@@ -11,14 +11,12 @@ st.title("Stabi LEM (MVP) : Bishop / Fellenius")
 
 # ---- Helpers ----
 def _rerun():
-    # Streamlit 1.27+ uses st.rerun(); older versions had st.experimental_rerun()
     if hasattr(st, "rerun"):
         st.rerun()
     else:
         st.experimental_rerun()
 
 def apply_preset(name: str):
-    """Quick presets -> set session_state then rerun."""
     ss = st.session_state
     if name == "Cut Slope (標準土)":
         ss["H"] = 20.0; ss["L"] = 40.0
@@ -102,4 +100,64 @@ with col1:
     if not candidates:
         fig, ax = plt.subplots(figsize=(8, 5))
         xg = np.array([0.0, L]); yg = np.array([H, 0.0])
-        ax.plot(xg, yg, linewidth=
+        ax.plot(xg, yg, linewidth=2)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+        ax.set_title("No valid slip circles. Adjust search ranges.")
+        st.pyplot(fig)
+    else:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        xg = np.array([0.0, L]); yg = np.array([H, 0.0])
+        ax.plot(xg, yg, linewidth=2)
+
+        cand_len = len(candidates)
+        max_show = min(300, cand_len)
+        default_show = min(150, cand_len)
+        show_top = st.slider("Show first N candidates (for speed)", 1, max_show, default_show)
+
+        for rec in candidates[:show_top]:
+            xc, yc0, R = rec["xc"], rec["yc"], rec["R"]
+            x1, x2 = rec["x1"], rec["x2"]
+            xs = np.linspace(x1, x2, 200)
+            inside = R**2 - (xs - xc)**2
+            ys = yc0 - np.sqrt(np.maximum(0.0, inside))
+            ax.plot(xs, ys, linewidth=0.8, alpha=0.3)
+
+        if best:
+            xc, yc0, R = best["xc"], best["yc"], best["R"]
+            x1, x2 = best["x1"], best["x2"]
+            xs = np.linspace(x1, x2, 400)
+            ys = yc0 - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
+            ax.plot(xs, ys, linewidth=2.5, color="red")
+
+        xs_centers = np.linspace(x_left, x_right, nx)
+        ax.scatter(xs_centers, np.full_like(xs_centers, yc), s=10)
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+        ax.set_title("Slip circles (gray), Best (red)")
+        st.pyplot(fig)
+
+with col2:
+    st.subheader("Results")
+    if not candidates:
+        st.error("No valid slip circles found. Adjust center/radius ranges or geometry.")
+    else:
+        st.metric("Candidates", f"{len(candidates)}")
+        if best:
+            st.metric("Min Fs", f"{best['Fs']:.3f}")
+            st.write(f"Method: **{'Bishop' if method_key=='bishop' else 'Fellenius'}**")
+            st.write(f"xc={best['xc']:.2f}, yc={best['yc']:.2f}, R={best['R']:.2f}")
+
+        with st.expander("Candidates table / CSV"):
+            df = pd.DataFrame(candidates)
+            st.dataframe(df, use_container_width=True)
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", data=csv, file_name="candidates.csv", mime="text/csv")
+
+    with st.expander("Formulas (教育用)"):
+        st.markdown("**Fellenius (Ordinary Method of Slices)**")
+        st.latex(r"FS = \frac{\sum_i \left(c\,b_i + W_i \cos\alpha_i \tan\phi\right)}{\sum_i W_i \sin\alpha_i}")
+        st.markdown("**Bishop (Simplified)**")
+        st.latex(r"FS = \frac{\sum_i \dfrac{c\,b_i + W_i \tan\phi \cos\alpha_i}{1 + \dfrac{\tan\phi\,\tan\alpha_i}{FS}}}{\sum_i W_i \sin\alpha_i}")
+        st.caption("※ 本MVPは地下水圧 u=0、単一層、等厚1m（平面ひずみ）を前提。")
