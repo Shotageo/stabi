@@ -1,23 +1,35 @@
 # streamlit_app.py
+import os
+import importlib.util
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from stabi_lem import Slope, Soil, grid_search_2d
+BUILD_TAG = "build-2025-09-30-12:45JST"  # 画面で反映確認用
+
+# ---- safe import for stabi_lem (hot-reload対策) ----
+try:
+    from stabi_lem import Slope, Soil, grid_search_2d
+except Exception as e:
+    # Fallback: 明示パスから読み直す（ホットリロード時の KeyError 対策）
+    here = os.path.dirname(__file__)
+    spec = importlib.util.spec_from_file_location("stabi_lem", os.path.join(here, "stabi_lem.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+    Slope, Soil, grid_search_2d = mod.Slope, mod.Soil, mod.grid_search_2d
 
 st.set_page_config(page_title="Stabi LEM (2D Center Search)", layout="wide")
 st.title("Stabi LEM : Bishop / Fellenius（2D Center Search）")
+st.caption(f"🔧 {BUILD_TAG}")
 
-# --- Helpers ---
 def suggest_search_ranges(H: float, L: float):
-    """Heuristic defaults based on slope size."""
     diag = float(np.hypot(H, L))
     x_min = -1.0 * L
     x_max =  0.3 * L
     y_min =  0.6 * H
     y_max =  3.0 * H
-    Rmin = max(0.35 * diag, 3.0)   # 少し緩めた
+    Rmin = max(0.35 * diag, 3.0)
     Rmax = 2.5 * diag
     return (x_min, x_max), (y_min, y_max), (Rmin, Rmax)
 
@@ -54,16 +66,21 @@ with st.sidebar:
     nR = st.slider("Radius samples", 5, 80, 28)
 
     st.subheader("Depth filter (m)")
-    st.caption("※分位点（既定20%）のスライス厚が h_min 以上で採用。端の極薄スライスで弾かれにくい。")
+    st.caption("分位点ベースで極端に薄い円を除外（端部スライスで弾かれにくい）")
     min_depth = st.number_input("h_min (m)", 0.0, 10000.0, 0.2, 0.1)
-    max_depth = st.number_input("h_max (m)", 0.5, 10000.0, 9999.0, 0.5)
+    # ★ 上限は 10000.0、既定値は 1000.0（上限を超えない）
+    max_depth = st.number_input("h_max (m)", 0.5, 10000.0, 1000.0, 0.5)
     depth_percentile = st.slider("Depth percentile (%)", 0, 50, 20)
+
+# guard
+if max_depth <= min_depth:
+    max_depth = float(min_depth) + 0.1
+    st.info("Adjusted h_max to be greater than h_min.")
 
 slope = Slope(H=H, L=L)
 soil  = Soil(gamma=gamma, c=c, phi=phi)
 method_key = "bishop" if method.lower().startswith("bishop") else "fellenius"
 
-# --- First search ---
 with st.spinner("Searching slip circles (2D centers)…"):
     result = grid_search_2d(
         slope, soil,
@@ -80,31 +97,10 @@ with st.spinner("Searching slip circles (2D centers)…"):
 cands = result.get("candidates", [])
 best  = result.get("best", None)
 
-# --- Auto-relax if no candidates ---
-auto_relaxed = False
-if not cands:
-    auto_relaxed = True
-    with st.spinner("No candidates found. Relaxing filters and retrying…"):
-        result = grid_search_2d(
-            slope, soil,
-            x_center_range=(x_left, x_right),
-            y_center_range=(y_bottom, y_top),
-            R_range=(max(0.2*np.hypot(H, L), Rmin*0.8), Rmax*1.2),
-            nx=max(10, nx), ny=max(6, ny), nR=max(16, nR),
-            method=method_key,
-            n_slices=max(30, n_slices),
-            min_depth=0.0,            # 最小厚さフィルタOFF
-            max_depth=1e9,
-            depth_percentile=0.0      # フィルタ実質OFF
-        )
-        cands = result.get("candidates", [])
-        best  = result.get("best", None)
-
 col1, col2 = st.columns([2, 1], gap="large")
 
 with col1:
     fig, ax = plt.subplots(figsize=(8, 5))
-    # slope line
     xg = np.array([0.0, L]); yg = np.array([H, 0.0])
     ax.plot(xg, yg, linewidth=2)
 
@@ -128,13 +124,12 @@ with col1:
             ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
             ax.plot(xs, ys, linewidth=2.6, color="red")
 
-        # centers grid (x–y)
         xs_grid = np.linspace(x_left, x_right, nx)
         ys_grid = np.linspace(y_bottom, y_top, ny)
         XX, YY = np.meshgrid(xs_grid, ys_grid)
         ax.scatter(XX.flatten(), YY.flatten(), s=10, alpha=0.7)
 
-        ax.set_title("Slip circles (gray), Best (red)" + (" — auto-relaxed" if auto_relaxed else ""))
+        ax.set_title("Slip circles (gray), Best (red)")
 
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
@@ -156,25 +151,3 @@ with col2:
             st.dataframe(df.head(300), use_container_width=True)
             csv = df.to_csv(index=False).encode("utf-8")
             st.download_button("Download CSV", data=csv, file_name="candidates.csv", mime="text/csv")
-
-    with st.expander("Diagnostics"):
-        st.write({
-            "auto_relaxed": auto_relaxed,
-            "H": H, "L": L,
-            "gamma": gamma, "c": c, "phi": phi,
-            "x_range": (float(x_left), float(x_right)),
-            "y_range": (float(y_bottom), float(y_top)),
-            "R_range": (float(Rmin), float(Rmax)),
-            "nx_ny_nR": (int(nx), int(ny), int(nR)),
-            "n_slices": int(n_slices),
-            "min_depth": float(min_depth), "max_depth": float(max_depth),
-            "depth_percentile": float(depth_percentile),
-            "candidates": len(cands),
-        })
-
-    with st.expander("Formulas (教育用)"):
-        st.markdown("**Fellenius (Ordinary Method of Slices)**")
-        st.latex(r"FS = \frac{\sum_i \left(c\,b_i + W_i \cos\alpha_i \tan\phi\right)}{\sum_i W_i \sin\alpha_i}")
-        st.markdown("**Bishop (Simplified)**")
-        st.latex(r"FS = \frac{\sum_i \dfrac{c\,b_i + W_i \tan\phi \cos\alpha_i}{1 + \dfrac{\tan\phi\,\tan\alpha_i}{FS}}}{\sum_i W_i \sin\alpha_i}")
-        st.caption("※ 今は u=0 単層。次段で2層化・水圧を導入。")
