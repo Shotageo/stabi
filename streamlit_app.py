@@ -1,5 +1,6 @@
 # streamlit_app.py  --- BOOT STUB ---
 import streamlit as st, sys, platform, os, importlib.util, traceback
+
 st.set_page_config(page_title="Stabi Boot Stub", layout="wide")
 st.title("Stabi Boot Stub ✅")
 st.caption("このページが表示されれば、アプリは起動できています。")
@@ -20,7 +21,8 @@ st.write({"stabi_lem.py_exists": os.path.exists(path)})
 if os.path.exists(path):
     try:
         spec = importlib.util.spec_from_file_location("stabi_lem", path)
-        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)  # type: ignore
+        mod = importlib.util.module_from_spec(spec)  # type: ignore
+        spec.loader.exec_module(mod)                 # type: ignore
         st.success("stabi_lem.py import OK")
         st.write({"members": [k for k in dir(mod) if k in ("Soil","Slope","search_center_grid","search_entry_exit_adaptive")]})
     except Exception as e:
