@@ -4,7 +4,7 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 
-from stabi_lem import Slope, Soil, grid_search, fs_bishop, fs_fellenius
+from stabi_lem import Slope, Soil, grid_search
 
 st.set_page_config(page_title="Stabi LEM (MVP)", layout="wide")
 st.title("Stabi LEM (MVP) : Bishop / Fellenius")
@@ -52,44 +52,63 @@ with st.spinner("Searching slip circles..."):
 col1, col2 = st.columns([2, 1], gap="large")
 
 with col1:
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    # draw slope line
-    xg = np.array([0.0, L])
-    yg = np.array([H, 0.0])
-    ax.plot(xg, yg, linewidth=2)
-
     candidates = result.get("candidates", [])
     best = result.get("best", None)
 
-    # plot candidates
-    show_top = st.slider("Show first N candidates (for speed)", 0, min(300, len(candidates)), min(150, len(candidates)))
-    for i, rec in enumerate(candidates[:show_top]):
-        xc, yc0, R = rec["xc"], rec["yc"], rec["R"]
-        x1, x2 = rec["x1"], rec["x2"]
-        xs = np.linspace(x1, x2, 200)
-        inside = R**2 - (xs - xc)**2
-        ys = yc0 - np.sqrt(np.maximum(0.0, inside))
-        ax.plot(xs, ys, linewidth=0.8, alpha=0.3)
+    if not candidates:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        # draw slope line only
+        xg = np.array([0.0, L])
+        yg = np.array([H, 0.0])
+        ax.plot(xg, yg, linewidth=2)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_title("No valid slip circles. Adjust search ranges.")
+        st.pyplot(fig)
+    else:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        # draw slope line
+        xg = np.array([0.0, L])
+        yg = np.array([H, 0.0])
+        ax.plot(xg, yg, linewidth=2)
 
-    # best in red
-    if best:
-        xc, yc0, R = best["xc"], best["yc"], best["R"]
-        x1, x2 = best["x1"], best["x2"]
-        xs = np.linspace(x1, x2, 400)
-        ys = yc0 - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
-        ax.plot(xs, ys, linewidth=2.5)
+        # slider guarded by candidate count
+        cand_len = len(candidates)
+        max_show = min(300, cand_len)
+        default_show = min(150, cand_len)
+        show_top = st.slider(
+            "Show first N candidates (for speed)",
+            1,
+            max_show,
+            default_show
+        )
 
-    # grid centers
-    xs_centers = np.linspace(x_left, x_right, nx)
-    ax.scatter(xs_centers, np.full_like(xs_centers, yc), s=10)
+        for rec in candidates[:show_top]:
+            xc, yc0, R = rec["xc"], rec["yc"], rec["R"]
+            x1, x2 = rec["x1"], rec["x2"]
+            xs = np.linspace(x1, x2, 200)
+            inside = R**2 - (xs - xc)**2
+            ys = yc0 - np.sqrt(np.maximum(0.0, inside))
+            ax.plot(xs, ys, linewidth=0.8, alpha=0.3)
 
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("y (m)")
-    ax.set_title("Slip circles (gray), Best (red)")
+        # best in red
+        if best:
+            xc, yc0, R = best["xc"], best["yc"], best["R"]
+            x1, x2 = best["x1"], best["x2"]
+            xs = np.linspace(x1, x2, 400)
+            ys = yc0 - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
+            ax.plot(xs, ys, linewidth=2.5, color="red")
 
-    st.pyplot(fig)
+        # grid centers
+        xs_centers = np.linspace(x_left, x_right, nx)
+        ax.scatter(xs_centers, np.full_like(xs_centers, yc), s=10)
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_title("Slip circles (gray), Best (red)")
+        st.pyplot(fig)
 
 with col2:
     st.subheader("Results")
