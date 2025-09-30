@@ -7,6 +7,7 @@ import numpy as np
 DEG = np.pi / 180.0
 EPS = 1e-12
 
+# ----------------------------- Data -----------------------------
 @dataclass
 class Soil:
     gamma: float  # kN/m^3
@@ -26,97 +27,42 @@ class Slope:
     def y_ground(self, x: np.ndarray | float) -> np.ndarray | float:
         return self.m * np.asarray(x) + self.H
 
-    def points_on_surface(self, s: np.ndarray | float) -> Tuple[np.ndarray, np.ndarray]:
-        """s in [0,1] along ground from (0,H) to (L,0)."""
-        s = np.asarray(s)
-        x = s * self.L
-        y = self.y_ground(x)
-        return x, y
-
-# ----------------- geometry -----------------
-def circle_center_from_chord_radius(
-    x1: float, y1: float, x2: float, y2: float, R: float, prefer_lower_arc_below_ground: bool,
-    y_ground_mid: float
-) -> Optional[Tuple[float, float]]:
-    dx, dy = x2 - x1, y2 - y1
-    d = np.hypot(dx, dy)
-    if not np.isfinite(d) or d <= 0.0:
-        return None
-    if R <= 0.5 * d:
-        return None
-
-    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    nx, ny = -dy, dx
-    nlen = np.hypot(nx, ny)
-    if nlen <= 0:
-        return None
-    nx, ny = nx / nlen, ny / nlen
-
-    s = np.sqrt(max(R * R - (0.5 * d) ** 2, 0.0))
-    cx1, cy1 = mx + s * nx, my + s * ny
-    cx2, cy2 = mx - s * nx, my - s * ny
-
-    def y_arc_at(cx, cy):
-        inside = R * R - (mx - cx) ** 2
-        if inside <= 0:
-            return None
-        return cy - np.sqrt(inside)
-
-    ya1 = y_arc_at(cx1, cy1)
-    ya2 = y_arc_at(cx2, cy2)
-    if ya1 is None and ya2 is None:
-        return None
-
-    if prefer_lower_arc_below_ground:
-        cand = []
-        if ya1 is not None:
-            cand.append((abs((y_ground_mid - ya1)), cx1, cy1, ya1 < y_ground_mid))
-        if ya2 is not None:
-            cand.append((abs((y_ground_mid - ya2)), cx2, cy2, ya2 < y_ground_mid))
-        cand.sort(key=lambda t: (not t[3], t[0]))
-        _, cx, cy, _ = cand[0]
-        return (cx, cy)
-    else:
-        if ya1 is None:
-            return (cx2, cy2)
-        if ya2 is None:
-            return (cx1, cy1)
-        return (cx1, cy1) if abs(y_ground_mid - ya1) <= abs(y_ground_mid - ya2) else (cx2, cy2)
-
+# --------------------------- Geometry ---------------------------
 def circle_line_intersections_straight_ground(
     slope: Slope, xc: float, yc: float, R: float
 ) -> Optional[Tuple[float, float]]:
+    """円と地表直線の交点 x（区間[0,L]の中に2点そろって存在するときのみ返す）"""
     m, H = slope.m, slope.H
-    A = 1 + m * m
-    B = 2 * (m * (H - yc) - xc)
-    C = xc * xc + (H - yc) * (H - yc) - R * R
-    disc = B * B - 4 * A * C
+    A = 1 + m*m
+    B = 2*(m*(H - yc) - xc)
+    C = xc*xc + (H - yc)*(H - yc) - R*R
+    disc = B*B - 4*A*C
     if disc <= 0:
         return None
     s = np.sqrt(disc)
-    x1 = (-B - s) / (2 * A)
-    x2 = (-B + s) / (2 * A)
+    x1 = (-B - s)/(2*A)
+    x2 = (-B + s)/(2*A)
     xl, xh = (x1, x2) if x1 < x2 else (x2, x1)
     if xl < -1e-8 or xh > slope.L + 1e-8:
         return None
     return float(xl), float(xh)
 
-# ----------------- slices & FS -----------------
 def _slice_geometry(xmid: np.ndarray, xc: float, yc: float, R: float):
-    inside = R ** 2 - (xmid - xc) ** 2
+    inside = R*R - (xmid - xc)**2
     if np.any(inside <= 0):
         return None, None, None
-    y_arc = yc - np.sqrt(inside)
-    denom = (y_arc - yc)
-    denom = np.where(np.abs(denom) < EPS, np.sign(denom) * EPS, denom)
-    dydx = -(xmid - xc) / denom
-    alpha = np.arctan(dydx)
+    y_arc = yc - np.sqrt(inside)             # 下側分枝（地表の下）
+    denom = y_arc - yc
+    denom = np.where(np.abs(denom) < EPS, np.sign(denom)*EPS, denom)
+    dydx = -(xmid - xc) / denom              # 円の接線勾配
+    alpha = np.arctan(dydx)                  # 底面角
     cos_a = np.cos(alpha)
     if np.any(np.isclose(cos_a, 0.0, atol=1e-10)):
         return None, None, None
     return y_arc, alpha, cos_a
 
-def _depth_filters(h: np.ndarray, h_min: float, h_max: float, pct: float, min_eff_ratio: float) -> bool:
+def _depth_filters(h: np.ndarray, h_min: float, h_max: float,
+                   pct: float, min_eff_ratio: float) -> bool:
     if np.any(~np.isfinite(h)) or np.any(h <= 0):
         return False
     if float(np.max(h)) > h_max:
@@ -128,10 +74,11 @@ def _depth_filters(h: np.ndarray, h_min: float, h_max: float, pct: float, min_ef
         return False
     return True
 
+# ----------------------- Factor of Safety -----------------------
 def fs_fellenius(
     slope: Slope, soil: Soil, xc: float, yc: float, R: float,
-    n_slices: int = 40, h_min: float = 0.1, h_max: float = 1e9, pct: float = 15.0,
-    min_eff_ratio: float = 0.6
+    n_slices: int = 40, h_min: float = 0.0, h_max: float = 1e9, pct: float = 0.0,
+    min_eff_ratio: float = 0.2
 ) -> Optional[float]:
     inter = circle_line_intersections_straight_ground(slope, xc, yc, R)
     if inter is None:
@@ -141,7 +88,7 @@ def fs_fellenius(
         return None
 
     xs = np.linspace(x1, x2, n_slices + 1)
-    xmid = 0.5 * (xs[:-1] + xs[1:])
+    xmid = 0.5*(xs[:-1] + xs[1:])
     dx = (x2 - x1) / n_slices
 
     y_g = slope.y_ground(xmid)
@@ -161,16 +108,16 @@ def fs_fellenius(
     den = np.sum(W * np.sin(alpha))
     if den <= 0:
         return None
-    Fs = float(num / den)
+    Fs = float(num/den)
     if not np.isfinite(Fs) or Fs <= 0:
         return None
     return Fs
 
 def fs_bishop(
     slope: Slope, soil: Soil, xc: float, yc: float, R: float,
-    n_slices: int = 40, max_iter: int = 100, tol: float = 1e-6,
-    h_min: float = 0.1, h_max: float = 1e9, pct: float = 15.0,
-    min_eff_ratio: float = 0.6
+    n_slices: int = 40, max_iter: int = 120, tol: float = 1e-6,
+    h_min: float = 0.0, h_max: float = 1e9, pct: float = 0.0,
+    min_eff_ratio: float = 0.2
 ) -> Optional[float]:
     inter = circle_line_intersections_straight_ground(slope, xc, yc, R)
     if inter is None:
@@ -180,7 +127,7 @@ def fs_bishop(
         return None
 
     xs = np.linspace(x1, x2, n_slices + 1)
-    xmid = 0.5 * (xs[:-1] + xs[1:])
+    xmid = 0.5*(xs[:-1] + xs[1:])
     dx = (x2 - x1) / n_slices
 
     y_g = slope.y_ground(xmid)
@@ -189,7 +136,7 @@ def fs_bishop(
         return None
 
     h = y_g - y_arc
-    if not _depth_filters(h, h_max=h_max, h_min=h_min, pct=pct, min_eff_ratio=min_eff_ratio):
+    if not _depth_filters(h, h_min, h_max, pct, min_eff_ratio):
         return None
 
     b = dx / cos_a
@@ -198,12 +145,12 @@ def fs_bishop(
 
     Fs = 1.3
     for _ in range(max_iter):
-        m_alpha = 1.0 + (tanp * np.tan(alpha)) / max(Fs, EPS)
-        num = np.sum((soil.c * b + W * tanp * np.cos(alpha)) / m_alpha)
+        denom_alpha = 1.0 + (tanp * np.tan(alpha)) / max(Fs, EPS)
+        num = np.sum((soil.c * b + W * tanp * np.cos(alpha)) / denom_alpha)
         den = np.sum(W * np.sin(alpha))
         if den <= 0:
             return None
-        Fs_new = num / den
+        Fs_new = num/den
         if not np.isfinite(Fs_new) or Fs_new <= 0:
             return None
         if abs(Fs_new - Fs) < tol:
@@ -211,47 +158,11 @@ def fs_bishop(
         Fs = Fs_new
     return float(Fs)
 
-# ----------------- candidate generation -----------------
-def gen_candidates_entry_exit(
-    slope: Slope,
-    entry_s_range: Tuple[float, float], exit_s_range: Tuple[float, float],
-    n_entry: int, n_exit: int,
-    Rmin: float, Rmax: float, nR: int,
-) -> List[Dict]:
-    e0, e1 = entry_s_range
-    xE, yE = slope.points_on_surface(np.linspace(e0, e1, n_entry))
-    xX, yX = slope.points_on_surface(np.linspace(exit_s_range[0], exit_s_range[1], n_exit))
-    Rs = np.linspace(Rmin, Rmax, nR)
-
-    recs: List[Dict] = []
-    for xe, ye in zip(xE, yE):
-        for xx, yx in zip(xX, yX):
-            if xx <= xe:
-                continue
-            d = np.hypot(xx - xe, yx - ye)
-            if d <= 1e-6:
-                continue
-            Rmin_local = max(Rs[0], 0.51 * d)
-            ymid_ground = float(slope.y_ground((xe + xx) / 2.0))
-            for R in Rs:
-                if R < Rmin_local:
-                    continue
-                ctr = circle_center_from_chord_radius(
-                    float(xe), float(ye), float(xx), float(yx), float(R),
-                    prefer_lower_arc_below_ground=True, y_ground_mid=ymid_ground
-                )
-                if ctr is None:
-                    continue
-                xc, yc = ctr
-                recs.append({"xc": float(xc), "yc": float(yc), "R": float(R),
-                             "x1": float(xe), "y1": float(ye), "x2": float(xx), "y2": float(yx)})
-    return recs
-
+# ---------------------- Candidate Generation -------------------
 def gen_candidates_center_grid(
     slope: Slope,
     x_center_range: Tuple[float, float], y_center_range: Tuple[float, float],
-    R_range: Tuple[float, float],
-    nx: int, ny: int, nR: int
+    R_range: Tuple[float, float], nx: int, ny: int, nR: int
 ) -> List[Dict]:
     xcs = np.linspace(x_center_range[0], x_center_range[1], nx)
     ycs = np.linspace(y_center_range[0], y_center_range[1], ny)
@@ -264,13 +175,10 @@ def gen_candidates_center_grid(
                 if inter is None:
                     continue
                 x1, x2 = inter
-                y1 = slope.y_ground(x1)
-                y2 = slope.y_ground(x2)
                 recs.append({"xc": float(xc), "yc": float(yc), "R": float(R),
-                             "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2)})
+                             "x1": float(x1), "x2": float(x2)})
     return recs
 
-# ----------------- evaluation & search -----------------
 def evaluate_candidates(
     slope: Slope, soil: Soil, recs: List[Dict], method: str,
     n_slices: int, h_min: float, h_max: float, pct: float, min_eff_ratio: float
@@ -279,102 +187,63 @@ def evaluate_candidates(
     out: List[Dict] = []
     for r in recs:
         fs = fs_fun(slope, soil, r["xc"], r["yc"], r["R"],
-                    n_slices=n_slices, h_min=h_min, h_max=h_max, pct=pct, min_eff_ratio=min_eff_ratio)
+                    n_slices=n_slices, h_min=h_min, h_max=h_max,
+                    pct=pct, min_eff_ratio=min_eff_ratio)
         if fs is None:
             continue
         rr = dict(r); rr["Fs"] = float(fs)
         out.append(rr)
     return out
 
-def _pack_results(evals: List[Dict], rescue_used: bool = False, rescue_stage: str = "") -> Dict:
+def _pack(evals: List[Dict], rescue: str = "") -> Dict:
     if not evals:
-        return {"candidates": [], "best": None, "rescue_used": rescue_used, "rescue_stage": rescue_stage}
+        return {"candidates": [], "best": None, "rescue": rescue}
     best = min(evals, key=lambda r: r["Fs"])
-    evals_sorted = sorted(evals, key=lambda r: r["Fs"])[:1200]
-    return {"candidates": evals_sorted, "best": best, "rescue_used": rescue_used, "rescue_stage": rescue_stage}
+    # UI速度のため上位のみ返す
+    return {"candidates": sorted(evals, key=lambda r: r["Fs"])[:1200], "best": best, "rescue": rescue}
 
-def search_entry_exit_adaptive(
+def search_center_grid(
     slope: Slope, soil: Soil,
-    entry_s_range: Tuple[float, float], exit_s_range: Tuple[float, float],
-    n_entry: int, n_exit: int,
-    Rmin: float, Rmax: float, nR: int,
+    x_center_range: Tuple[float, float], y_center_range: Tuple[float, float],
+    R_range: Tuple[float, float], nx: int, ny: int, nR: int,
     method: str, n_slices: int,
-    h_min: float, h_max: float, pct: float, min_eff_ratio: float,
-    refine_levels: int = 2, top_k: int = 10, shrink: float = 0.45
+    refine_levels: int = 1, top_k: int = 20, shrink: float = 0.5
 ) -> Dict:
-    # 1) 粗探索
-    recs_geo = gen_candidates_entry_exit(slope, entry_s_range, exit_s_range, n_entry, n_exit, Rmin, Rmax, nR)
-    evals = evaluate_candidates(slope, soil, recs_geo, method, n_slices, h_min, h_max, pct, min_eff_ratio)
+    # 既定：フィルタはゆるめ（ベーシックUIで確実に出す）
+    h_min, h_max, pct, min_eff_ratio = 0.0, 1e9, 0.0, 0.2
+
+    # 粗探索
+    recs = gen_candidates_center_grid(slope, x_center_range, y_center_range, R_range, nx, ny, nR)
+    evals = evaluate_candidates(slope, soil, recs, method, n_slices, h_min, h_max, pct, min_eff_ratio)
     if evals and refine_levels > 0:
-        # 2) Refine（上位K周りで帯とRを縮小）
         seeds = sorted(evals, key=lambda r: r["Fs"])[:max(1, top_k)]
-        all_evals = list(evals)
-        e_span = (entry_s_range[1] - entry_s_range[0])
-        x_span = (exit_s_range[1] - exit_s_range[0])
+        xr = x_center_range; yr = y_center_range; rr = R_range
+        all_e = list(evals)
         for lvl in range(refine_levels):
-            factor = (shrink ** (lvl + 1))
-            de = 0.5 * e_span * factor
-            dx = 0.5 * x_span * factor
+            f = shrink ** (lvl + 1)
+            dx = 0.5*(xr[1]-xr[0])*f; dy = 0.5*(yr[1]-yr[0])*f; dR = 0.5*(rr[1]-rr[0])*f
             for s in seeds:
-                se = s["x1"] / slope.L
-                sx = s["x2"] / slope.L
-                e_rng = (max(0.0, se - de), min(1.0, se + de))
-                x_rng = (max(0.0, sx - dx), min(1.0, sx + dx))
-                r_rng = (max(0.5 * s["R"], Rmin), min(1.5 * s["R"], Rmax))
-                recs_geo2 = gen_candidates_entry_exit(slope, e_rng, x_rng, max(5, n_entry//2), max(5, n_exit//2),
-                                                      r_rng[0], r_rng[1], max(5, nR//2))
-                evals2 = evaluate_candidates(slope, soil, recs_geo2, method, n_slices, h_min, h_max, pct, min_eff_ratio)
-                all_evals.extend(evals2)
-            if all_evals:
-                seeds = sorted(all_evals, key=lambda r: r["Fs"])[:max(1, top_k)]
-        return _pack_results(all_evals)
+                x_rng = (s["xc"]-dx, s["xc"]+dx)
+                y_rng = (max(0.1, s["yc"]-dy), s["yc"]+dy)
+                R_rng = (max(0.5*s["R"], rr[0]), min(1.5*s["R"], rr[1]))
+                recs2 = gen_candidates_center_grid(slope, x_rng, y_rng, R_rng,
+                                                   max(6, nx//2), max(6, ny//2), max(8, nR//2))
+                evals2 = evaluate_candidates(slope, soil, recs2, method, n_slices, h_min, h_max, pct, min_eff_ratio)
+                all_e.extend(evals2)
+            seeds = sorted(all_e, key=lambda r: r["Fs"])[:max(1, top_k)]
+        return _pack(all_e)
 
     if evals:
-        return _pack_results(evals)
+        return _pack(evals)
 
-    # ===== ここから救済（rescue） =====
-    # R1: フィルタ全面緩和＋Fellenius固定＋広域R
-    recs1 = gen_candidates_entry_exit(
-        slope, (max(0.0, entry_s_range[0]-0.15), min(1.0, entry_s_range[1]+0.15)),
-        (max(0.0, exit_s_range[0]-0.10),  min(1.0, exit_s_range[1]+0.10)),
-        max(20, n_entry), max(20, n_exit),
-        max(0.2*np.hypot(slope.H, slope.L), 1.0), min(4.0*np.hypot(slope.H, slope.L), 1e6),
-        max(30, nR)
-    )
-    evals1 = evaluate_candidates(slope, soil, recs1, "fellenius", max(30, n_slices//2), 0.0, 1e9, 0.0, 0.25)
-    if evals1:
-        return _pack_results(evals1, rescue_used=True, rescue_stage="R1-entry-exit-loose")
-
-    # R2: Center Grid 補助
-    recs2 = gen_candidates_center_grid(
-        slope,
-        x_center_range=(-slope.L, 0.3*slope.L),
-        y_center_range=(0.4*slope.H, 3.0*slope.H),
-        R_range=(0.25*np.hypot(slope.H, slope.L), 4.0*np.hypot(slope.H, slope.L)),
-        nx=18, ny=12, nR=30
-    )
-    evals2 = evaluate_candidates(slope, soil, recs2, "fellenius", 30, 0.0, 1e9, 0.0, 0.2)
-    if evals2:
-        return _pack_results(evals2, rescue_used=True, rescue_stage="R2-center-grid")
-
-    # R3: 最後の非常口（弦を数本固定半径で）
-    eband = np.linspace(max(0.0, entry_s_range[0]*0.9), min(1.0, entry_s_range[1]*1.1), 8)
-    xband = np.linspace(max(0.0, exit_s_range[0]*0.9),  min(1.0, exit_s_range[1]*1.1), 8)
-    recs3: List[Dict] = []
+    # -------- Rescue（広域＆Felleniusで必ず拾う） --------
     diag = float(np.hypot(slope.H, slope.L))
-    for se in eband:
-        xe, ye = slope.points_on_surface(se)
-        for sx in xband:
-            xx, yx = slope.points_on_surface(sx)
-            if xx <= xe: 
-                continue
-            d = float(np.hypot(xx - xe, yx - ye))
-            R_try = max(0.55*d, 0.25*diag)
-            ctr = circle_center_from_chord_radius(float(xe), float(ye), float(xx), float(yx), R_try, True, float(slope.y_ground(0.5*(xe+xx))))
-            if ctr is None:
-                continue
-            xc, yc = ctr
-            recs3.append({"xc": float(xc), "yc": float(yc), "R": float(R_try),
-                          "x1": float(xe), "y1": float(ye), "x2": float(xx), "y2": float(yx)})
-    evals3 = evaluate_candidates(slope, soil, recs3, "fellenius", 30, 0.0, 1e9, 0.0, 0.2)
-    return _pack_results(evals3, rescue_used=True, rescue_stage="R3-hardcoded-chords")
+    recsR = gen_candidates_center_grid(
+        slope,
+        x_center_range=( -0.8*slope.L, 0.4*slope.L ),
+        y_center_range=( 0.3*slope.H,  3.0*slope.H ),
+        R_range=( max(0.2*diag, 1.0), 4.0*diag ),
+        nx=22, ny=14, nR=40
+    )
+    evalsR = evaluate_candidates(slope, soil, recsR, "fellenius", max(30, n_slices//2), 0.0, 1e9, 0.0, 0.15)
+    return _pack(evalsR, rescue="center-grid-wide-fellenius")
