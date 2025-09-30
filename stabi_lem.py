@@ -30,7 +30,6 @@ class Slope:
 def circle_line_intersections(slope: Slope, xc: float, yc: float, R: float) -> Optional[Tuple[float, float]]:
     """Intersection of circle (xc,yc,R) with slope line y = m x + H, restricted to the segment [0,L]."""
     m, H = slope.m, slope.H
-    # (x-xc)^2 + (mx+H - yc)^2 = R^2 -> A x^2 + B x + C = 0
     A = 1 + m**2
     B = 2*(m*(H - yc) - xc)
     C = xc**2 + (H - yc)**2 - R**2
@@ -41,7 +40,6 @@ def circle_line_intersections(slope: Slope, xc: float, yc: float, R: float) -> O
     x1 = (-B - sqrt_disc) / (2*A)
     x2 = (-B + sqrt_disc) / (2*A)
     x_low, x_high = (x1, x2) if x1 < x2 else (x2, x1)
-    # must cut the ground segment in two points
     y1 = m * x_low + H
     y2 = m * x_high + H
     if slope.on_segment(np.array([x_low, x_high]), np.array([y1, y2])).all():
@@ -49,18 +47,30 @@ def circle_line_intersections(slope: Slope, xc: float, yc: float, R: float) -> O
     return None
 
 def _slice_geometry(xmid: np.ndarray, xc: float, yc: float, R: float):
-    """Return y_arc (lower branch), base angle alpha, and guard arrays."""
+    """Return y_arc (lower branch), base angle alpha; None if invalid."""
     inside = R**2 - (xmid - xc)**2
     if np.any(inside <= 0):
-        return None, None, None
+        return None, None
     y_arc = yc - np.sqrt(inside)  # lower branch
-    # slope of circle at base: dy/dx = -(x - xc)/(y - yc)
+    # dy/dx of circle: -(x - xc)/(y - yc)
     dydx = -(xmid - xc) / (y_arc - yc)
-    alpha = np.arctan(dydx)  # base inclination to horizontal
-    return y_arc, alpha, inside
+    alpha = np.arctan(dydx)
+    return y_arc, alpha
 
-def fs_fellenius(slope: Slope, soil: Soil, xc: float, yc: float, R: float,
-                 n_slices: int = 30, min_depth: float = 0.0, max_depth: float = 1e9) -> Optional[float]:
+def _depth_ok(h: np.ndarray, min_depth: float, max_depth: float, depth_percentile: float) -> bool:
+    """Practical filter: require percentile depth >= min_depth, and max depth <= max_depth."""
+    if max_depth <= 0:
+        return False
+    if np.any(~np.isfinite(h)):
+        return False
+    h_p = float(np.percentile(h, depth_percentile))
+    h_max = float(np.max(h))
+    return (h_p >= min_depth) and (h_max <= max_depth)
+
+def fs_fellenius(
+    slope: Slope, soil: Soil, xc: float, yc: float, R: float,
+    n_slices: int = 30, min_depth: float = 0.0, max_depth: float = 1e9, depth_percentile: float = 15.0
+) -> Optional[float]:
     inter = circle_line_intersections(slope, xc, yc, R)
     if inter is None:
         return None
@@ -70,37 +80,35 @@ def fs_fellenius(slope: Slope, soil: Soil, xc: float, yc: float, R: float,
     dx = (x2 - x1) / n_slices
 
     y_g = slope.y_ground(xmid)
-    y_arc, alpha, inside = _slice_geometry(xmid, xc, yc, R)
-    if y_arc is None:
+    res = _slice_geometry(xmid, xc, yc, R)
+    if res[0] is None:
         return None
+    y_arc, alpha = res
     h = y_g - y_arc
     if np.any(h <= 0):
         return None
-
-    # depth filter to avoid silly very-shallow/very-deep circles
-    h_min = float(np.min(h))
-    h_max = float(np.max(h))
-    if h_min < min_depth or h_max > max_depth:
+    if not _depth_ok(h, min_depth, max_depth, depth_percentile):
         return None
 
-    # base length along arc
     cos_a = np.cos(alpha)
     if np.any(np.isclose(cos_a, 0.0)):
         return None
     b_len = dx / cos_a
 
-    W = soil.gamma * h * dx  # kN per unit thickness
+    W = soil.gamma * h * dx
     c = soil.c
     tanphi = np.tan(soil.phi * DEG)
     num = np.sum(c * b_len + W * np.cos(alpha) * tanphi)
     den = np.sum(W * np.sin(alpha))
     if den <= 0:
         return None
-    return num / den
+    return float(num / den)
 
-def fs_bishop(slope: Slope, soil: Soil, xc: float, yc: float, R: float,
-              n_slices: int = 30, max_iter: int = 100, tol: float = 1e-6,
-              min_depth: float = 0.0, max_depth: float = 1e9) -> Optional[float]:
+def fs_bishop(
+    slope: Slope, soil: Soil, xc: float, yc: float, R: float,
+    n_slices: int = 30, max_iter: int = 100, tol: float = 1e-6,
+    min_depth: float = 0.0, max_depth: float = 1e9, depth_percentile: float = 15.0
+) -> Optional[float]:
     inter = circle_line_intersections(slope, xc, yc, R)
     if inter is None:
         return None
@@ -110,18 +118,14 @@ def fs_bishop(slope: Slope, soil: Soil, xc: float, yc: float, R: float,
     dx = (x2 - x1) / n_slices
 
     y_g = slope.y_ground(xmid)
-    y_arc, alpha, inside = _slice_geometry(xmid, xc, yc, R)
-    if y_arc is None:
+    res = _slice_geometry(xmid, xc, yc, R)
+    if res[0] is None:
         return None
-
+    y_arc, alpha = res
     h = y_g - y_arc
     if np.any(h <= 0):
         return None
-
-    # depth filter
-    h_min = float(np.min(h))
-    h_max = float(np.max(h))
-    if h_min < min_depth or h_max > max_depth:
+    if not _depth_ok(h, min_depth, max_depth, depth_percentile):
         return None
 
     cos_a = np.cos(alpha)
@@ -144,9 +148,9 @@ def fs_bishop(slope: Slope, soil: Soil, xc: float, yc: float, R: float,
         if not np.isfinite(FS_new) or FS_new <= 0:
             return None
         if abs(FS_new - FS) < tol:
-            return FS_new
+            return float(FS_new)
         FS = FS_new
-    return FS
+    return float(FS)
 
 def grid_search_2d(
     slope: Slope,
@@ -159,8 +163,9 @@ def grid_search_2d(
     nR: int = 24,
     method: str = "bishop",
     n_slices: int = 40,
-    min_depth: float = 1.0,
-    max_depth: float = 1e9
+    min_depth: float = 0.2,
+    max_depth: float = 1e9,
+    depth_percentile: float = 15.0
 ) -> Dict:
     """2D grid over (xc, yc) and radius. Return candidates and the min-Fs record."""
     xcs = np.linspace(x_center_range[0], x_center_range[1], nx)
@@ -173,11 +178,15 @@ def grid_search_2d(
     for xc in xcs:
         for yc in ycs:
             for R in Rs:
-                fs = fs_func(slope, soil, xc, yc, R, n_slices=n_slices,
-                             min_depth=min_depth, max_depth=max_depth)
+                fs = fs_func(
+                    slope, soil, float(xc), float(yc), float(R),
+                    n_slices=n_slices,
+                    min_depth=min_depth, max_depth=max_depth,
+                    depth_percentile=depth_percentile
+                )
                 if fs is None:
                     continue
-                inter = circle_line_intersections(slope, xc, yc, R)
+                inter = circle_line_intersections(slope, float(xc), float(yc), float(R))
                 if inter is None:
                     continue
                 x1, x2 = inter
