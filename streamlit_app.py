@@ -17,12 +17,7 @@ def _rerun():
         st.experimental_rerun()
 
 def suggest_search_ranges(H: float, L: float):
-    """
-    Heuristic defaults derived from slope size:
-    - center x: behind crest to a bit inside slope
-    - center y: moderately above ground
-    - radius: scaled by slope size
-    """
+    """Heuristic defaults based on slope size."""
     diag = float(np.hypot(H, L))
     x_min = -1.0 * L
     x_max =  0.3 * L
@@ -57,7 +52,7 @@ with st.sidebar:
         y_bottom = st.number_input("Center y min", -10000.0, 10000.0, 0.6*H, 1.0)
         y_top    = st.number_input("Center y max", -10000.0, 10000.0, 3.0*H, 1.0)
         Rmin     = st.number_input("Radius min", 1.0, 1e5, max(0.5*H, 3.0), 1.0)
-        Rmax     = st.number_input("Radius max", 1.0, 1e6, 2.5*(H**2 + L**2) ** 0.5, 1.0)
+        Rmax     = st.number_input("Radius max", 1.0, 1e6, 2.5*np.hypot(H, L), 1.0)
 
     st.subheader("Grid densities")
     nx = st.slider("Centers in x", 5, 60, 16)
@@ -66,8 +61,14 @@ with st.sidebar:
 
     st.subheader("Depth filter (m)")
     st.caption("極端に浅い/深い候補を除外して現実的な円に絞る")
-    min_depth = st.number_input("Min slice thickness h_min", 0.0, 50.0, 1.0, 0.5)
-    max_depth = st.number_input("Max slice thickness h_max", 0.5, 200.0, 9999.0, 0.5)
+    min_depth = st.number_input("Min slice thickness h_min", 0.0, 10000.0, 1.0, 0.5)
+    # ↓ 上限を 10000.0 に拡大、既定値 9999.0（以前は上限200のまま既定9999でエラー）
+    max_depth = st.number_input("Max slice thickness h_max", 0.5, 10000.0, 9999.0, 0.5)
+
+# guard: ensure min_depth < max_depth
+if max_depth <= min_depth:
+    st.warning("Max depth must be greater than Min depth. Adjusted automatically.")
+    max_depth = float(min_depth) + 0.1
 
 slope = Slope(H=H, L=L)
 soil  = Soil(gamma=gamma, c=c, phi=phi)
@@ -99,12 +100,10 @@ with col1:
     if not cands:
         ax.set_title("No valid slip circles. Adjust ranges or grid density.")
     else:
-        # guard slider
         max_show = min(300, len(cands))
         default_show = min(120, len(cands))
         show_top = st.slider("Show first N candidates (for speed)", 1, max_show, default_show)
 
-        # plot subset of candidates (thin)
         for rec in cands[:show_top]:
             xc, yc, R = rec["xc"], rec["yc"], rec["R"]
             x1, x2 = rec["x1"], rec["x2"]
@@ -112,14 +111,12 @@ with col1:
             ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
             ax.plot(xs, ys, linewidth=0.7, alpha=0.25)
 
-        # best in red
         if best:
             xc, yc, R = best["xc"], best["yc"], best["R"]
             xs = np.linspace(best["x1"], best["x2"], 360)
             ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
             ax.plot(xs, ys, linewidth=2.4, color="red")
 
-        # show centers grid (x–y)
         xs_grid = np.linspace(x_left, x_right, nx)
         ys_grid = np.linspace(y_bottom, y_top, ny)
         XX, YY = np.meshgrid(xs_grid, ys_grid)
@@ -142,12 +139,10 @@ with col2:
             st.metric("Min Fs", f"{best['Fs']:.3f}")
             st.write(f"xc={best['xc']:.2f}, yc={best['yc']:.2f}, R={best['R']:.2f}")
 
-        # table / CSV
         with st.expander("Candidates table / CSV"):
-            df = pd.DataFrame(cands)
-            df_sorted = df.sort_values("Fs", ascending=True).reset_index(drop=True)
-            st.dataframe(df_sorted.head(200), use_container_width=True)
-            csv = df_sorted.to_csv(index=False).encode("utf-8")
+            df = pd.DataFrame(cands).sort_values("Fs").reset_index(drop=True)
+            st.dataframe(df.head(200), use_container_width=True)
+            csv = df.to_csv(index=False).encode("utf-8")
             st.download_button("Download CSV", data=csv, file_name="candidates.csv", mime="text/csv")
 
     with st.expander("Formulas (教育用)"):
