@@ -1,0 +1,30 @@
+name: Apply updates from 'updates/' folder
+on:
+  push:
+    paths:
+      - 'updates/**'
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply updates
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          changed_files=$(git diff --name-only HEAD~1 HEAD | tr '\n' ' ')
+          echo "Changed: $changed_files"
+          # copy every regular file from updates/ to repo root (strip the 'updates/' prefix)
+          for f in updates/**; do
+            [ -f "$f" ] || continue
+            dest="${f#updates/}"
+            mkdir -p "$(dirname "$dest")"
+            cp "$f" "$dest"
+          done
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "Update Bot"
+          git add -A
+          git commit -m "Apply updates from updates/ folder" || echo "No changes to commit"
+          git push
