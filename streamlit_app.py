@@ -1,4 +1,4 @@
-# streamlit_app.py — 水位オフセット・表編集・救済パス付き（安全版）
+# streamlit_app.py — 水位をデフォルトOFF、完全ゲート／安全ガード付き
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random
@@ -10,11 +10,12 @@ from stabi_lem import (
     make_ground_example, make_interface1_example, make_interface2_example,
     clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
+    # 水位モデル（stabi_lem 側にある想定）
     WaterLine, WaterPolyline, WaterOffset,
 )
 
-st.set_page_config(page_title="Stabi LEM｜水位/表編集/救済", layout="wide")
-st.title("Stabi LEM｜水位（オフセット/CSV/直線）・ジオメトリエディタ・救済パス")
+st.set_page_config(page_title="Stabi LEM｜水位ゲート版", layout="wide")
+st.title("Stabi LEM｜水位 OFF デフォルト（オン時のみ反映）")
 
 # ---------------- Quality presets ----------------
 QUALITY = {
@@ -71,7 +72,7 @@ def _mk_table_from_xy(X: np.ndarray, Y: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame({"x": np.asarray(X, dtype=float), "y": np.asarray(Y, dtype=float)})
 
 def _xy_from_table(df: pd.DataFrame, L: float) -> tuple[np.ndarray, np.ndarray] | None:
-    if df is None or not isinstance(df, pd.DataFrame):  # ★ガード強化
+    if df is None or not isinstance(df, pd.DataFrame):
         return None
     if "x" not in df.columns or "y" not in df.columns:
         return None
@@ -103,7 +104,6 @@ with st.form("params"):
         ground_default = make_ground_example(H, L)
 
         st.checkbox("Edit geometry in tables (ground / interfaces)", value=st.session_state["geom_custom"], key="geom_custom")
-        # これらはフォーム内で戻り値を使う（初回Noneを避ける）
         gt_return = None
         iface_returns: dict[str, pd.DataFrame] = {}
 
@@ -132,11 +132,9 @@ with st.form("params"):
                 iface_returns[name] = st.data_editor(
                     iface_tables_local[name], num_rows="dynamic", use_container_width=True, key=f"iface_tbl_{k}"
                 )
-            # フォーム内では参照だけ、保存は submit 後に行う
 
         st.subheader("Layers (for calculation)")
         n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
-        # interfaces は submit 後に確定。ここでは仮置き
         interfaces_input = []
 
         st.subheader("Soils (top→bottom)")
@@ -163,22 +161,27 @@ with st.form("params"):
         st.subheader("Target safety")
         Fs_target = st.number_input("Target FS", 1.00, 2.00, 1.20, 0.05)
 
+        # ---- Water table: デフォルトOFF、オン時のみ計算へ反映 ----
         st.subheader("Water table (Phreatic)")
-        wsrc = st.radio("Source", ["Linear (2-point)", "CSV polyline", "Offset from ground"], horizontal=True)
-        enable_w = st.checkbox("Enable water table", True)
-        gamma_w = st.number_input("γ_w (kN/m³)", 9.00, 10.50, 9.81, 0.01)
-        pore_mode = st.radio("Pore handling", ["u-only (total W)", "buoyancy"], horizontal=True)
+        enable_w = st.checkbox("Enable water table", False)   # ★ デフォルトFalse
+        wsrc = st.radio("Source", ["Linear (2-point)", "CSV polyline", "Offset from ground"],
+                        horizontal=True, disabled=not enable_w)
+        gamma_w = st.number_input("γ_w (kN/m³)", 9.00, 10.50, 9.81, 0.01, disabled=not enable_w)
+        pore_mode = st.radio("Pore handling", ["u-only (total W)", "buoyancy"],
+                             horizontal=True, disabled=not enable_w)
+
         water_csv_file = None
         yWL = yWR = None
         w_offset = None
-        if wsrc.startswith("Linear"):
-            yWL = st.number_input("Water level at x=0 (m)", 0.0, 2.5*H, 0.6*H, 0.1)
-            yWR = st.number_input("Water level at x=L (m)", 0.0, 2.5*H, 0.3*H, 0.1)
-        elif "CSV" in wsrc:
-            water_csv_file = st.file_uploader("Upload water polyline CSV (x,y columns)", type=["csv"])
-        else:
-            w_offset = st.number_input("Offset below ground (m)", 0.0, 50.0, 5.0, 0.5,
-                                       help="地表面と同じ形状で、鉛直にこの距離だけ下げた水位線。")
+        if enable_w:
+            if wsrc.startswith("Linear"):
+                yWL = st.number_input("Water level at x=0 (m)", 0.0, 2.5*H, 0.6*H, 0.1)
+                yWR = st.number_input("Water level at x=L (m)", 0.0, 2.5*H, 0.3*H, 0.1)
+            elif "CSV" in wsrc:
+                water_csv_file = st.file_uploader("Upload water polyline CSV (x,y columns)", type=["csv"])
+            else:
+                w_offset = st.number_input("Offset below ground (m)", 0.0, 50.0, 5.0, 0.5,
+                                           help="地表面と同形状で、鉛直にこの距離だけ下げた水位線。")
 
     with B:
         st.subheader("Center grid")
@@ -207,20 +210,16 @@ with st.form("params"):
         depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5,
                                     help="円弧最深点の地表からの鉛直深さレンジ")
 
-    # ★ここが重要：必ずフォーム内に置く
     run = st.form_submit_button("▶ 計算開始")
 
-# ===== Submit 後に“確定”するパート =====
-# ジオメトリの確定（戻り値優先、無ければ session_state、最後にデフォルト）
+# ===== Submit 後の確定ジオメトリ =====
 ground_default = make_ground_example(H, L)
 if st.session_state.get("geom_custom", False):
-    # ground
     if 'ground_tbl_edit' in st.session_state:
         st.session_state["ground_table"] = st.session_state["ground_tbl_edit"]
     gxy = _xy_from_table(st.session_state.get("ground_tbl_edit", st.session_state.get("ground_table")), L)
     ground = GroundPL(*gxy) if gxy is not None else ground_default
 
-    # interfaces
     iface_tables_local = st.session_state.get("iface_tables", {})
     interfaces = []
     if n_layers >= 2:
@@ -238,49 +237,34 @@ else:
     if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
     if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
 
-# 水位オブジェクト
-def load_water_csv(file) -> tuple[np.ndarray, np.ndarray] | None:
-    try:
-        df = pd.read_csv(file)
-    except Exception:
-        return None
-    cols = [c.lower() for c in df.columns]
-    if "x" in cols and "y" in cols:
-        x = df[df.columns[cols.index("x")]].to_numpy(dtype=float)
-        y = df[df.columns[cols.index("y")]].to_numpy(dtype=float)
-    else:
-        if df.shape[1] < 2: return None
-        x = df.iloc[:,0].to_numpy(dtype=float)
-        y = df.iloc[:,1].to_numpy(dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]; y = y[mask]
-    if len(x) < 2: return None
-    order = np.argsort(x)
-    return x[order], y[order]
-
+# ===== 水位オブジェクト（オン時のみ作成） =====
 water = None
 water_key = None
+pore_tag = None
+water_kwargs = {}  # ← これを **展開 して渡す（OFF時は空）
 if enable_w:
+    pore_tag = "buoyancy" if pore_mode.startswith("buoyancy") else "u-only"
     if wsrc.startswith("Linear"):
-        water = WaterLine(0.0, L, float(yWL), float(yWR)); water_key=("linear", round(float(yWL),3), round(float(yWR),3))
-    elif "CSV" in wsrc:
-        if 'uploaded_file' in st.session_state:  # safety
-            pass
-        if 'file_uploader' in st.session_state:
-            pass
-        # Streamlit Cloud では run を跨ぐと file が消えることがある。警告は出さず water=None にフォールバック。
-        if water_key is None and 'file_uploader' in st.session_state:
-            pass
-        if water is None and 'water_csv_file' in globals():
-            pass
-        if water is None:
-            # ここはアップロードがあれば都度 read する方針に
-            pass
-        # NOTE: ユーザが再アップロードで有効化する想定
+        water = WaterLine(0.0, L, float(yWL), float(yWR))
+        water_key=("linear", round(float(yWL),3), round(float(yWR),3))
+    elif "CSV" in wsrc and water_csv_file is not None:
+        try:
+            dfw = pd.read_csv(water_csv_file)
+            xw = pd.to_numeric(dfw.iloc[:,0], errors="coerce").to_numpy()
+            yw = pd.to_numeric(dfw.iloc[:,1], errors="coerce").to_numpy()
+            m = np.isfinite(xw) & np.isfinite(yw)
+            xw = xw[m]; yw = yw[m]
+            order = np.argsort(xw)
+            water = WaterPolyline(xw[order], yw[order])
+            water_key=("csv", len(xw))
+        except Exception:
+            water = None; water_key=None
     else:
-        water = WaterOffset(float(w_offset)); water_key=("offset", round(float(w_offset),3))
+        water = WaterOffset(float(w_offset))
+        water_key=("offset", round(float(w_offset),3))
 
-pore_tag = "buoyancy" if pore_mode.startswith("buoyancy") else "u-only"
+    if water is not None:
+        water_kwargs = dict(water=water, gamma_w=float(gamma_w), pore_mode=pore_tag)
 
 # -------- Keys --------
 def param_pack():
@@ -290,17 +274,16 @@ def param_pack():
         allow_cross=allow_cross, Fs_target=Fs_target,
         center=[x_min, x_max, y_min, y_max, nx, ny],
         method=method, quality=QUALITY, depth=[depth_min, depth_max],
-        water_key=water_key, gamma_w=gamma_w, pore=pore_tag,
+        water_enabled=bool(enable_w), water_key=water_key,
         ghash=hash_params({"gx":ground.X.tolist(),"gy":ground.Y.tolist(),
                            "if": [ (np.asarray(ix).tolist(), np.asarray(iy).tolist()) for (ix,iy) in interfaces ]})
     )
 param_key = hash_params(param_pack())
 
-# ====== 計算部（run時/初期表示時） ======
+# ====== 計算部 ======
 def compute_once():
-    P = QUALITY[st.session_state.get("quality_sel", "Normal")] if "quality_sel" in st.session_state else QUALITY["Normal"]
+    P = QUALITY.get(st.session_state.get("quality_sel", "Normal"), QUALITY["Normal"])
 
-    # 1) Coarse: pick best center with時間バジェット
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
@@ -324,7 +307,7 @@ def compute_once():
                 quick_mode=True, n_slices_quick=max(8, P["quick_slices"]//2),
                 limit_arcs_per_center=P["coarse_limit_arcs"],
                 probe_n_min=P["coarse_probe_min"],
-                water=water, gamma_w=gamma_w, pore_mode=pore_tag,
+                **water_kwargs,  # ← 水位ONの時だけ効く
             ):
                 cnt+=1
                 if (Fs_min is None) or (Fs < Fs_min): Fs_min = Fs
@@ -339,42 +322,32 @@ def compute_once():
     with st.spinner("Coarse（最有望センター選抜）"):
         center, tested = pick_center(P_loc["budget_coarse_s"])
         if center is None:
-            return dict(error="Coarseで候補なし。枠/深さ/水位を見直してください。")
+            msg = "Coarseで候補なし。枠/深さ"
+            if enable_w: msg += "/水位"
+            msg += "を見直してください。"
+            return dict(error=msg)
     xc, yc = center
 
-    # 端ヒット → 表示グリッド自動拡張（計算枠はそのまま）
     hit, where = near_edge(xc,yc,x_min,x_max,y_min,y_max)
     x_min_a, x_max_a, y_min_a, y_max_a = x_min, x_max, y_min, y_max
-    expand_note=None
     if hit:
         dx=(x_max-x_min); dy=(y_max-y_min)
         if where["left"]:  x_min_a = x_min - 0.20*dx
         if where["right"]: x_max_a = x_max + 0.20*dx
         if where["bottom"]:y_min_a = y_min - 0.20*dy
         if where["top"]:   y_max_a = y_max + 0.20*dy
-        expand_note=f"audit grid auto-extend x[{x_min_a:.1f},{x_max_a:.1f}], y[{y_min_a:.1f},{y_max_a:.1f}]"
 
-    # 2) Quick: R候補抽出（時間バジェット）
-    def quick_R_candidates(xc, yc, budget_s, rescue=False):
-        P_loc = QUALITY[quality]
+    def quick_R_candidates(xc, yc, budget_s):
         heap_R=[]; deadline=time.time()+budget_s
-        n_entries = int(P_loc["n_entries_final"] * (1.2 if rescue else 1.0))
-        probe_min = max(41, int(P_loc["probe_n_min_quick"] * (0.6 if rescue else 1.0)))
-        limit_arcs = int(P_loc["limit_arcs_quick"] * (1.6 if rescue else 1.0))
-        tol_R = 0.10 if rescue else 0.03
-        dmin = max(0.0, depth_min * (0.5 if rescue else 1.0))
-        dmax = max(dmin + 0.5, depth_max * (1.5 if rescue else 1.0))
-
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
             ground, soils, xc, yc,
-            n_entries=n_entries, method="Fellenius",
-            depth_min=dmin, depth_max=dmax,
+            n_entries=P_loc["n_entries_final"], method="Fellenius",
+            depth_min=depth_min, depth_max=depth_max,
             interfaces=interfaces, allow_cross=allow_cross,
             quick_mode=True, n_slices_quick=P_loc["quick_slices"],
-            limit_arcs_per_center=limit_arcs,
-            probe_n_min=probe_min,
-            water=water, gamma_w=gamma_w, pore_mode=pore_tag,
-            tol_R=tol_R,
+            limit_arcs_per_center=P_loc["limit_arcs_quick"],
+            probe_n_min=P_loc["probe_n_min_quick"],
+            **water_kwargs,
         ):
             heapq.heappush(heap_R, (-Fs, R))
             if len(heap_R) > max(P_loc["show_k"], P_loc["top_thick"] + 20): heapq.heappop(heap_R)
@@ -383,45 +356,44 @@ def compute_once():
         return R_candidates
 
     with st.spinner("Quick（R候補抽出）"):
-        R_candidates = quick_R_candidates(xc, yc, QUALITY[quality]["budget_quick_s"], rescue=False)
-        rescue_used = False
+        R_candidates = quick_R_candidates(xc, yc, P_loc["budget_quick_s"])
         if not R_candidates:
-            R_candidates = quick_R_candidates(xc, yc, max(0.6, 0.7*QUALITY[quality]["budget_quick_s"]), rescue=True)
-            rescue_used = bool(R_candidates)
-        if not R_candidates:
-            return dict(error="Quickで円弧候補なし。深さ/水位/Qualityを緩めてください。")
+            msg = "Quickで円弧候補なし。深さ/Quality"
+            if enable_w: msg += "/水位"
+            msg += "を緩めてください。"
+            return dict(error=msg)
 
-    # 3) Refine: 選抜Rで精算
     refined=[]
-    for R in R_candidates[:QUALITY[quality]["show_k"]]:
+    for R in R_candidates[:P_loc["show_k"]]:
         Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method,
-                              xc, yc, R, n_slices=QUALITY[quality]["final_slices"],
-                              water=water, gamma_w=gamma_w, pore_mode=pore_tag)
+                              xc, yc, R, n_slices=P_loc["final_slices"],
+                              **water_kwargs)
         if Fs is None: continue
         s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
         if s is None: continue
         x1,x2 = s
         packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross,
-                                        xc, yc, R, n_slices=QUALITY[quality]["final_slices"])
+                                        xc, yc, R, n_slices=P_loc["final_slices"])
         if packD is None: continue
         D_sum,_,_ = packD
         T_req = max(0.0, (Fs_target - Fs)*D_sum)
         refined.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
     if not refined:
-        return dict(error="Refineで有効弧なし。設定/Quality/水位を見直してください。")
+        msg = "Refineで有効弧なし。設定/Quality"
+        if enable_w: msg += "/水位"
+        msg += "を見直してください。"
+        return dict(error=msg)
+
     refined.sort(key=lambda d:d["Fs"])
     idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
     idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
 
     centers_disp = grid_points(x_min, x_max, y_min, y_max, nx, ny)
-
     return dict(center=(xc,yc), refined=refined, idx_minFs=idx_minFs, idx_maxT=idx_maxT,
-                centers_disp=centers_disp, expand_note=None)
+                centers_disp=centers_disp)
 
-# run or key change
-P_sel = quality  # 保存
-st.session_state["quality_sel"] = P_sel
-
+# run / key change
+st.session_state["quality_sel"] = quality
 if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
     res = compute_once()
     if "error" in res:
@@ -459,16 +431,15 @@ if len(interfaces)>=1:
 if len(interfaces)>=2:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
 
-# water line
-# （CSVはアップローダの都合で run 跨ぎ保持が不安定なため、ここでは offset / linear のみ描画）
-if isinstance(wsrc, str) and enable_w:
+# water line（ON時のみ可視化）
+if enable_w and water is not None:
     try:
-        if 'w_offset' in globals() and wsrc.startswith("Offset"):
-            Yw = np.array([WaterOffset(float(w_offset)).y_at(float(x), ground) for x in Xd], dtype=float)
-            ax.plot(Xd, Yw, color="tab:blue", linestyle="-.", linewidth=1.4, label=f"Water offset {float(w_offset):.2f} m")
+        if isinstance(water, WaterOffset):
+            Yw = np.array([water.y_at(float(x), ground) for x in Xd], dtype=float)
+            ax.plot(Xd, Yw, color="tab:blue", linestyle="-.", linewidth=1.4, label=f"Water offset")
             ax.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
-        elif wsrc.startswith("Linear"):
-            Yw = np.array([WaterLine(0.0, float(L), float(yWL), float(yWR)).y_at(float(x), ground) for x in Xd], dtype=float)
+        elif isinstance(water, WaterLine) or isinstance(water, WaterPolyline):
+            Yw = np.array([water.y_at(float(x), ground) for x in Xd], dtype=float)
             ax.plot(Xd, Yw, color="tab:blue", linestyle="--", linewidth=1.3, label="Water table")
             ax.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
     except Exception:
@@ -484,7 +455,7 @@ xs=[c[0] for c in centers_disp]; ys=[c[1] for c in centers_disp]
 ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
-# refined arcs
+# refined arcs（Fsカラー）
 for d in refined:
     xs=np.linspace(d["x1"], d["x2"], 200)
     ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
@@ -511,7 +482,6 @@ if 0<=idx_maxT<len(refined):
     ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
 
 # axis & legend
-x_upper = max(1.18*(ground.X[-1]-ground.X[0]), (x_max - ground.X[0]) + 0.05*(ground.X[-1]-ground.X[0]), 100.0)
 y_upper = max(2.30*H, y_max + 0.05*H, 100.0)
 ax.set_xlim(min(ground.X[0]-0.05*(ground.X[-1]-ground.X[0]), -2.0), ground.X[-1]+max(0.05*(ground.X[-1]-ground.X[0]), 2.0))
 ax.set_ylim(0.0, y_upper)
@@ -526,6 +496,8 @@ h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
 title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}"]
+if enable_w and water is not None:
+    title_tail.append("Water=ON")
 ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • Method={method} • " + " • ".join(title_tail))
 st.pyplot(fig, use_container_width=True); plt.close(fig)
 
