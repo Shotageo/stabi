@@ -1,4 +1,4 @@
-# streamlit_app.py — フルスパン採用版（Fs/Dともに最外交点どうしで一貫評価）
+# streamlit_app.py — Full-span robust：交点ペア走査＋Quickヒントで区間確定
 from __future__ import annotations
 import streamlit as st
 import numpy as np
@@ -6,17 +6,16 @@ import matplotlib.pyplot as plt
 import heapq, time, json, hashlib, random
 from dataclasses import dataclass
 
-# 既存コアはそのまま利用（候補Rの抽出など）
 from stabi_lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
     clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
 )
 
-st.set_page_config(page_title="Stabi LEM｜Full-span mode", layout="wide")
-st.title("Stabi LEM｜Full-span（最外交点）での一貫評価")
+st.set_page_config(page_title="Stabi LEM｜Full-span (robust)", layout="wide")
+st.title("Stabi LEM｜Full-span（交点ペア走査＋Quickヒント）")
 
-# ---------------- ユーティリティ ----------------
+# ---------- 小物 ----------
 def fs_to_color(fs: float):
     if fs < 1.0: return (0.85, 0.0, 0.0)
     if fs < 1.2:
@@ -28,151 +27,176 @@ def hash_params(obj) -> str:
     s = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=float)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-# ---- 円と折れ線（地表）の交点を全て取り出し、最小x/最大xをフルスパン端点にする ----
-def circle_polyline_full_span(ground: GroundPL, xc: float, yc: float, R: float):
+# ---------- 円×地表：全交点 → 隣接ペアを候補にして評価 ----------
+def circle_polyline_all_hits(ground: GroundPL, xc: float, yc: float, R: float):
     X = np.asarray(ground.X); Y = np.asarray(ground.Y)
     hits = []
     for i in range(len(X) - 1):
         x0, y0 = X[i],   Y[i]
         x1, y1 = X[i+1], Y[i+1]
         vx, vy = x1 - x0, y1 - y0
-        # 線分上の点 P(t) = (x0, y0) + t*(vx,vy), t∈[0,1] と円の交点 |P-C|=R
-        # (vx^2+vy^2) t^2 + 2[(x0-xc)vx + (y0-yc)vy] t + [(x0-xc)^2+(y0-yc)^2 - R^2] = 0
         A = vx*vx + vy*vy
-        B = 2*((x0 - xc)*vx + (y0 - yc)*vy)
-        C = (x0 - xc)**2 + (y0 - yc)**2 - R*R
         if A <= 0: 
             continue
+        B = 2*((x0 - xc)*vx + (y0 - yc)*vy)
+        C = (x0 - xc)**2 + (y0 - yc)**2 - R*R
         D = B*B - 4*A*C
-        if D < 0:
+        if D < 0: 
             continue
-        sqrtD = np.sqrt(D)
-        for sign in (-1.0, 1.0):
-            t = (-B + sign*sqrtD) / (2*A)
+        sD = np.sqrt(D)
+        for sgn in (-1.0, 1.0):
+            t = (-B + sgn*sD) / (2*A)
             if 0.0 <= t <= 1.0:
-                xi = x0 + t*vx
-                yi = y0 + t*vy
-                hits.append((float(xi), float(yi)))
+                hits.append(float(x0 + t*vx))
+    if not hits: 
+        return []
+    # xでソート＋重複除去
+    hits = sorted(hits)
+    dedup = []
+    for x in hits:
+        if not dedup or abs(x - dedup[-1]) > 1e-6:
+            dedup.append(x)
+    return dedup
+
+def arc_base_y(x, xc, yc, R):
+    under = R*R - (x - xc)**2
+    if under <= 0.0: 
+        return None
+    return yc - np.sqrt(under)
+
+def choose_full_span_interval(ground: GroundPL, xc: float, yc: float, R: float,
+                              hits: list[float], hint_pair: tuple[float,float] | None,
+                              min_cov: float = 0.85, n_probe: int = 25):
+    """隣り合う交点ペア [xi, xi+1] を走査。区間内で円弧が終始地表下（h>0）が
+       規定の被覆率(min_cov)以上ある区間を候補に。hintに最も近い区間を優先。"""
     if len(hits) < 2:
         return None
-    # x座標で最外の2点（min/max）を採用
-    xs = [p[0] for p in hits]
-    x1 = min(xs); x2 = max(xs)
-    # 端点yは地表線上にあるが、安定のため再評価
-    y1 = float(ground.y_at(x1)); y2 = float(ground.y_at(x2))
-    return (x1, y1, x2, y2)
+    candidates = []
+    for i in range(len(hits)-1):
+        xL, xR = hits[i], hits[i+1]
+        xs = np.linspace(xL, xR, n_probe)
+        h = []
+        valid_pts = 0
+        sum_h = 0.0
+        for x in xs:
+            y_surf = float(ground.y_at(x))
+            y_base = arc_base_y(x, xc, yc, R)
+            if y_base is None:
+                continue
+            hh = y_surf - y_base
+            if hh > 1e-6:
+                valid_pts += 1
+                sum_h += hh
+            h.append(hh)
+        cov = valid_pts / max(1, len(xs))
+        mean_h = (sum_h / max(1, valid_pts)) if valid_pts>0 else 0.0
+        if cov >= min_cov and mean_h > 1e-4:
+            # ヒント距離
+            if hint_pair is not None:
+                xm_hint = 0.5*(hint_pair[0] + hint_pair[1])
+                xm_this = 0.5*(xL + xR)
+                hint_dist = abs(xm_this - xm_hint)
+            else:
+                hint_dist = 1e9
+            # 厚い方、かつヒントに近い方を優先したいので、(-mean_h, hint_dist)
+            candidates.append((( -mean_h, hint_dist ), (xL, xR)))
+    if not candidates:
+        return None
+    # まず平均厚で降順（-mean_h）、同率ならヒントに近い順
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1]  # (x1, x2)
 
-# ---- 指定した区間 [x1,x2] を“フルスパン”としてスライスし、Fellenius/Bishop でFsを計算 ----
+# ---------- フルスパン・スライス作成＆Fs ----------
 @dataclass
 class SliceGeom:
     xL: float; xR: float; xC: float
     y_top: float; y_base: float
     h: float; dx: float
     sin_a: float; cos_a: float
-    b: float  # 基底長
+    b: float
 
-def make_slices_fullspan(ground: GroundPL, xc: float, yc: float, R: float, x1: float, x2: float, n_slices: int):
+def make_slices_fullspan(ground: GroundPL, xc: float, yc: float, R: float,
+                         x1: float, x2: float, n_slices: int):
     xs = np.linspace(x1, x2, n_slices+1)
     slices: list[SliceGeom] = []
     for i in range(n_slices):
         xL, xR = float(xs[i]), float(xs[i+1])
         xC = 0.5*(xL + xR)
         y_top = float(ground.y_at(xC))
-        under = R*R - (xC - xc)**2
-        if under <= 0.0:
+        y_base = arc_base_y(xC, xc, yc, R)
+        if y_base is None: 
             continue
-        y_base = yc - np.sqrt(under)
         h = y_top - y_base
         if h <= 1e-6:
             continue
         dx = xR - xL
-        # 円弧の接線角 α：sinα = (xC - xc)/R, cosα = +sqrt(1 - sin^2)
         sin_a = (xC - xc)/R
         cos_a = float(np.sqrt(max(1e-12, 1.0 - sin_a*sin_a)))
-        b = dx / max(1e-12, cos_a)  # 基底長
+        b = dx / max(1e-12, cos_a)
         slices.append(SliceGeom(xL, xR, xC, y_top, y_base, h, dx, sin_a, cos_a, b))
     return slices
 
-# ---- 多層の土質パラメータをスライス底面の高さで引き当て（上から順番） ----
 def soil_at_base(x: float, y_base: float, ground: GroundPL, interfaces: list[GroundPL], soils: list[Soil]):
-    # interfaces は上から順に渡されている前提（Interface1の下がLayer2…）
-    # xの位置における境界高をクリップして照会
     if not interfaces:
         return soils[0]
-    # 1本 → 上: Layer1（地表〜I1）、下: Layer2（I1〜0）
-    # 2本 → 上: L1（地表〜I1）, 中: L2（I1〜I2）, 下: L3（I2〜0）
-    # 高い方から判定
-    ys = [float(ifc.y_at(x)) for ifc in interfaces]  # I1, I2, ...
-    if y_base >= ys[0]:
-        return soils[0]
-    if len(interfaces) == 1:
-        return soils[1]
-    # 2本以上
-    if y_base >= ys[1]:
-        return soils[1]
+    yints = [float(ifc.y_at(x)) for ifc in interfaces]  # 上から順に
+    if y_base >= yints[0]: return soils[0]
+    if len(interfaces) == 1: return soils[1]
+    if y_base >= yints[1]: return soils[1]
     return soils[2]
 
-# ---- フルスパンでの Fs と 駆動項D（=ΣW sinα）を計算 ----
 def fs_fullspan(ground, interfaces, soils, method: str,
                 xc: float, yc: float, R: float, x1: float, x2: float, n_slices: int):
     slices = make_slices_fullspan(ground, xc, yc, R, x1, x2, n_slices)
-    if len(slices) < max(6, int(0.4*n_slices)):
-        return None, None  # スライスが足りない → 無効
-    # 各スライスのW, c, φ を評価
+    if len(slices) < max(6, int(0.45*n_slices)):
+        return None, None
     Ws=[]; sinA=[]; cosA=[]; bs=[]; cs=[]; tans=[]
     for s in slices:
         soil = soil_at_base(s.xC, s.y_base, ground, interfaces, soils)
-        gamma = soil.gamma; c = soil.c; phi = soil.phi
-        W = gamma * s.h * s.dx  # 単位奥行き 1m
+        gamma, c, phi = soil.gamma, soil.c, soil.phi
+        W = gamma * s.h * s.dx
         Ws.append(W); sinA.append(s.sin_a); cosA.append(s.cos_a); bs.append(s.b)
         cs.append(c); tans.append(np.tan(np.deg2rad(phi)))
-    Ws = np.array(Ws); sinA = np.array(sinA); cosA = np.array(cosA)
-    bs = np.array(bs); cs = np.array(cs); tans = np.array(tans)
-
-    D = float(np.sum(Ws * sinA))  # 駆動項 = ΣW sinα
+    Ws=np.array(Ws); sinA=np.array(sinA); cosA=np.array(cosA)
+    bs=np.array(bs); cs=np.array(cs); tans=np.array(tans)
+    D = float(np.sum(Ws * sinA))  # ΣW sinα
+    if D <= 1e-9:
+        return None, None
 
     if method.startswith("Fellenius"):
-        # Fellenius (Ordinary) — 有効応力uは今は未導入（別パッチで水位/Ru法を入れる）
         Rnum = np.sum(cs*bs + (Ws * cosA) * tans)
-        FS = float(Rnum / max(1e-12, D))
+        FS = float(Rnum / D)
         return FS, D
 
-    # Bishop (simplified) — 反復解
-    FS = 1.20  # 初期値
-    for _ in range(50):
-        m = 1.0 + (tans * np.sin(np.arcsin(sinA))) * (sinA / np.maximum(1e-12, FS))  # tanφ * tanα / FS
-        # tanα = sinα/cosα
-        m = 1.0 + (tans * (sinA/np.maximum(1e-12, cosA))) / np.maximum(1e-12, FS)
+    # Bishop (simplified) 反復
+    FS = 1.20
+    for _ in range(60):
+        # tanα = sin/cos
+        tanA = sinA/np.maximum(1e-12, cosA)
+        m = 1.0 + (tans * tanA)/max(1e-12, FS)
         Rnum = np.sum((cs*bs + (Ws * cosA) * tans) / np.maximum(1e-12, m))
-        FS_new = float(Rnum / max(1e-12, D))
+        FS_new = float(Rnum / D)
         if abs(FS_new - FS) < 1e-4:
             FS = FS_new; break
         FS = FS_new
     return FS, D
 
-# ---------------- Quality プリセット ----------------
+# ---------- Quality ----------
 QUALITY = {
-    "Normal": dict(quick_slices=12, final_slices=40, n_entries_final=1200,
-                   probe_n_min_quick=101, limit_arcs_quick=120,
-                   budget_coarse_s=0.8, budget_quick_s=1.2,
-                   show_k=120, audit_limit_per_center=12, audit_budget_s=2.8),
-    "Fine": dict(quick_slices=16, final_slices=50, n_entries_final=1600,
-                 probe_n_min_quick=121, limit_arcs_quick=160,
-                 budget_coarse_s=1.2, budget_quick_s=1.8,
-                 show_k=180, audit_limit_per_center=16, audit_budget_s=3.2),
-    "Very-fine": dict(quick_slices=20, final_slices=60, n_entries_final=2200,
-                      probe_n_min_quick=141, limit_arcs_quick=220,
-                      budget_coarse_s=2.6, budget_quick_s=2.6,
-                      show_k=240, audit_limit_per_center=20, audit_budget_s=4.0),
-    "Coarse": dict(quick_slices=10, final_slices=30, n_entries_final=900,
+    "Coarse": dict(quick_slices=10, final_slices=36, n_entries_final=900,
                    probe_n_min_quick=81, limit_arcs_quick=80,
-                   budget_coarse_s=0.6, budget_quick_s=0.9,
-                   show_k=60, audit_limit_per_center=10, audit_budget_s=2.0),
+                   budget_coarse_s=0.6, budget_quick_s=0.9, show_k=80),
+    "Normal": dict(quick_slices=12, final_slices=44, n_entries_final=1300,
+                   probe_n_min_quick=101, limit_arcs_quick=120,
+                   budget_coarse_s=0.8, budget_quick_s=1.2, show_k=140),
+    "Fine": dict(quick_slices=16, final_slices=56, n_entries_final=1700,
+                 probe_n_min_quick=121, limit_arcs_quick=160,
+                 budget_coarse_s=1.2, budget_quick_s=1.8, show_k=200),
 }
 
-# ---------------- 入力フォーム ----------------
+# ---------- 入力 ----------
 with st.form("params"):
-    A, B = st.columns(2)
+    A,B = st.columns(2)
     with A:
         st.subheader("Geometry")
         H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5)
@@ -181,34 +205,30 @@ with st.form("params"):
 
         st.subheader("Layers")
         n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
-        interfaces = []
-        if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
-        if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
+        interfaces=[]
+        if n_layers>=2: interfaces.append(make_interface1_example(H, L))
+        if n_layers>=3: interfaces.append(make_interface2_example(H, L))
 
         st.subheader("Soils (top→bottom)")
-        soils = []
-        gamma1 = st.number_input("γ₁ (kN/m³)", 10.0, 25.0, 18.0, 0.5)
-        c1     = st.number_input("c₁ (kPa)",    0.0, 200.0, 5.0, 0.5)
-        phi1   = st.number_input("φ₁ (deg)",    0.0, 45.0, 30.0, 0.5)
-        soils.append(Soil(gamma=gamma1, c=c1, phi=phi1))
-        if n_layers >= 2:
-            gamma2 = st.number_input("γ₂ (kN/m³)", 10.0, 25.0, 19.0, 0.5)
-            c2     = st.number_input("c₂ (kPa)",    0.0, 200.0, 8.0, 0.5)
-            phi2   = st.number_input("φ₂ (deg)",    0.0, 45.0, 28.0, 0.5)
-            soils.append(Soil(gamma=gamma2, c=c2, phi=phi2))
-        if n_layers >= 3:
-            gamma3 = st.number_input("γ₃ (kN/m³)", 10.0, 25.0, 20.0, 0.5)
-            c3     = st.number_input("c₃ (kPa)",    0.0, 200.0, 12.0, 0.5)
-            phi3   = st.number_input("φ₃ (deg)",    0.0, 45.0, 25.0, 0.5)
-            soils.append(Soil(gamma=gamma3, c=c3, phi=phi3))
+        soils=[Soil(st.number_input("γ₁",10.0,25.0,18.0,0.5),
+                    st.number_input("c₁",0.0,200.0,5.0,0.5),
+                    st.number_input("φ₁",0.0,45.0,30.0,0.5))]
+        if n_layers>=2:
+            soils.append(Soil(st.number_input("γ₂",10.0,25.0,19.0,0.5),
+                              st.number_input("c₂",0.0,200.0,8.0,0.5),
+                              st.number_input("φ₂",0.0,45.0,28.0,0.5)))
+        if n_layers>=3:
+            soils.append(Soil(st.number_input("γ₃",10.0,25.0,20.0,0.5),
+                              st.number_input("c₃",0.0,200.0,12.0,0.5),
+                              st.number_input("φ₃",0.0,45.0,25.0,0.5)))
 
-        st.subheader("Crossing control（下層進入可否）")
+        st.subheader("Crossing control")
         allow_cross=[]
         if n_layers>=2: allow_cross.append(st.checkbox("Allow into Layer 2", True))
         if n_layers>=3: allow_cross.append(st.checkbox("Allow into Layer 3", True))
 
-        st.subheader("Target safety")
-        Fs_target = st.number_input("Target FS (for T_req)", 1.00, 2.00, 1.20, 0.05)
+        st.subheader("Target")
+        Fs_target = st.number_input("Target FS (T_req)", 1.00, 2.00, 1.20, 0.05)
 
     with B:
         st.subheader("Center grid")
@@ -220,7 +240,7 @@ with st.form("params"):
         ny = st.slider("ny", 4, 40, 9)
 
         st.subheader("Method / Quality")
-        method = st.selectbox("Method", ["Bishop (simplified)", "Fellenius"])
+        method = st.selectbox("Method", ["Bishop (simplified)","Fellenius"])
         quality = st.select_slider("Quality", options=list(QUALITY.keys()), value="Normal")
         with st.expander("Advanced", expanded=False):
             override = st.checkbox("Override Quality", value=False)
@@ -232,18 +252,17 @@ with st.form("params"):
             budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 5.0, QUALITY[quality]["budget_coarse_s"], 0.1, disabled=not override)
             budget_quick_in  = st.slider("Budget Quick (s)", 0.1, 5.0, QUALITY[quality]["budget_quick_s"], 0.1, disabled=not override)
 
-        st.subheader("Depth range (vertical)")
+        st.subheader("Depth (vertical)")
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
-        depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5)
+        depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 6.0, 0.5)  # ← 少し広げた既定
 
-        st.subheader("Display pick")
+        st.subheader("Display")
         show_minFs = st.checkbox("Show Min Fs", True)
         show_maxT  = st.checkbox("Show Max required T", True)
         show_all_refined = st.checkbox("Show refined arcs (Fs-colored)", True)
         show_centers = st.checkbox("Show center-grid points", True)
-        audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
 
-    run = st.form_submit_button("▶ 計算開始（Full-span）")
+    run = st.form_submit_button("▶ 計算開始（Full-span robust）")
 
 # Quality適用
 P = QUALITY[quality].copy()
@@ -255,7 +274,7 @@ if 'override' in locals() and override:
         budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
     ))
 
-# キー
+# ---------- キー ----------
 param_key = hash_params(dict(
     H=H, L=L, n_layers=n_layers,
     soils=[(s.gamma, s.c, s.phi) for s in soils],
@@ -264,13 +283,12 @@ param_key = hash_params(dict(
     method=method, quality=P, depth=[depth_min, depth_max],
 ))
 
-# ---------------- 計算本体（フルスパンでFs/D評価） ----------------
+# ---------- 本計算 ----------
 def compute_once():
-    # 1) Coarse: 最有望センター（サブサンプル＋打切り）→ ここは簡略、選抜のみ
+    # 1) Coarse：最有望センター選抜（簡略）
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
-        # 2ステップ間引き（負荷軽減）
         xs = xs[::2] if len(xs)>1 else xs
         ys = ys[::2] if len(ys)>1 else ys
         return [(float(xc), float(yc)) for yc in ys for xc in xs]
@@ -280,7 +298,7 @@ def compute_once():
         best=None; tested=[]
         for (xc,yc) in subsampled_centers():
             cnt=0; Fs_best=None
-            for _x1,_x2,_R,Fs_quick in arcs_from_center_by_entries_multi(
+            for qx1,qx2,_R,Fs_q in arcs_from_center_by_entries_multi(
                 ground, soils, xc, yc,
                 n_entries=min(800, P["n_entries_final"]), method="Fellenius",
                 depth_min=depth_min, depth_max=depth_max,
@@ -289,25 +307,25 @@ def compute_once():
                 limit_arcs_per_center=min(60, P["limit_arcs_quick"]),
                 probe_n_min=max(61, P["probe_n_min_quick"]-40),
             ):
-                cnt += 1
-                if (Fs_best is None) or (Fs_quick < Fs_best): Fs_best = Fs_quick
+                cnt+=1
+                if (Fs_best is None) or (Fs_q < Fs_best): Fs_best = Fs_q
                 if time.time() > deadline: break
             tested.append((xc,yc))
-            score = (cnt, - (Fs_best if Fs_best is not None else 1e9))
-            if (best is None) or (score > best[0]): best = (score, (xc,yc))
+            score=(cnt, -(Fs_best if Fs_best is not None else 1e9))
+            if (best is None) or (score > best[0]): best=(score,(xc,yc))
             if time.time() > deadline: break
         return (best[1] if best else None), tested
 
-    with st.spinner("Coarse（最有望センター選抜）"):
+    with st.spinner("Coarse（センター選抜）"):
         center, tested = pick_center(P["budget_coarse_s"])
-        if center is None:
-            return dict(error="Coarseで候補が見つかりません。枠/深さを広げてください。")
+        if center is None: return dict(error="Coarseでセンターなし。枠/深さを調整。")
     xc, yc = center
 
-    # 2) Quick：選抜センターでR候補抽出
+    # 2) Quick：選抜センターでR候補＋x1,x2ヒント収集
     with st.spinner("Quick（R候補抽出）"):
         heap_R=[]; deadline=time.time()+P["budget_quick_s"]
-        for _x1,_x2,R,Fs_quick in arcs_from_center_by_entries_multi(
+        hints=[]  # (R, (x1,x2))
+        for qx1,qx2,R,Fs_q in arcs_from_center_by_entries_multi(
             ground, soils, xc, yc,
             n_entries=P["n_entries_final"], method="Fellenius",
             depth_min=depth_min, depth_max=depth_max,
@@ -316,50 +334,65 @@ def compute_once():
             limit_arcs_per_center=P["limit_arcs_quick"],
             probe_n_min=P["probe_n_min_quick"],
         ):
-            # Quick段の x1,x2 は使わず、Refineでフルスパンを決め直す
-            heapq.heappush(heap_R, (-Fs_quick, R))
+            heapq.heappush(heap_R, (-Fs_q, R))
+            hints.append((R, (qx1,qx2)))
             if len(heap_R) > P["show_k"]: heapq.heappop(heap_R)
             if time.time() > deadline: break
-        R_candidates = [r for _neg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
-        if not R_candidates:
-            return dict(error="Quickで円弧候補なし。条件を緩和してください。")
+        if not heap_R: 
+            return dict(error="Quickで候補なし。条件を緩めてください。")
+        # Rを低Fs順に
+        tmp = sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])
+        R_candidates = [r for _fs, r in tmp]
+        # R→hint辞書
+        hint_map = {}
+        for R, pair in hints:
+            # 近いRが複数あると上書きされるが問題なし
+            hint_map.setdefault(round(float(R), 6), pair)
 
-    # 3) Refine：各Rについてフルスパン端点を求め、同一区間で Fs と D を評価
+    # 3) Refine（フルスパン確定 → Fs/D）
     refined=[]
     for R in R_candidates:
-        span = circle_polyline_full_span(ground, xc, yc, R)
-        if span is None: 
+        hits = circle_polyline_all_hits(ground, xc, yc, R)
+        if len(hits) < 2: 
             continue
-        x1, y1, x2, y2 = span
-        # 端点の鉛直深さチェック（レンジ外なら棄却）
-        depth1 = y1 - (yc - np.sqrt(max(1e-12, R*R - (x1-xc)**2)))
-        depth2 = y2 - (yc - np.sqrt(max(1e-12, R*R - (x2-xc)**2)))
-        max_depth_on_span = max(depth1, depth2)
-        min_depth_on_span = min(depth1, depth2)
-        # 端点だけでなくスパン中央近辺も含めた深さをざっくり見る
-        xm = 0.5*(x1+x2); ym_surf = float(ground.y_at(xm))
-        ym_base = yc - np.sqrt(max(1e-12, R*R - (xm-xc)**2))
-        max_depth_on_span = max(max_depth_on_span, ym_surf - ym_base)
-        if (max_depth_on_span < depth_min) or (max_depth_on_span > depth_max):
+        # ヒントの近いRを拾う
+        hint_pair = hint_map.get(round(float(R),6))
+        span = choose_full_span_interval(ground, xc, yc, R, hits, hint_pair, min_cov=0.85, n_probe=25)
+        if span is None:
+            # ヒントが遠い等で決まらない→少し緩和して再試行
+            span = choose_full_span_interval(ground, xc, yc, R, hits, hint_pair, min_cov=0.70, n_probe=21)
+            if span is None:
+                continue
+        x1, x2 = span
+        # 深さレンジの適合性（区間全体での最大深さで判定）
+        xs = np.linspace(x1, x2, 31)
+        depths = []
+        for x in xs:
+            y_surf = float(ground.y_at(x))
+            y_base = arc_base_y(x, xc, yc, R)
+            if y_base is None: continue
+            depths.append(y_surf - y_base)
+        if not depths: 
+            continue
+        max_d = float(np.max(depths))
+        if (max_d < depth_min) or (max_d > depth_max):
             continue
 
         FS, D = fs_fullspan(ground, interfaces, soils, method, xc, yc, R, x1, x2, n_slices=P["final_slices"])
-        if FS is None:
+        if FS is None or D is None:
             continue
         T_req = max(0.0, (Fs_target - FS) * D)
         refined.append(dict(R=float(R), x1=float(x1), x2=float(x2), Fs=float(FS), D=float(D), T_req=float(T_req)))
-
     if not refined:
-        return dict(error="Refineで有効弧が得られません（フルスパン）。深さ/枠/Qualityを調整してください。")
+        return dict(error="Refine（フルスパン）で有効弧なし。深さ/枠/Qualityを緩めてください。")
 
-    refined.sort(key=lambda d:d["Fs"])
+    refined.sort(key=lambda d: d["Fs"])
     idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
     idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
 
-    # 監査用：可視化グリッド（センター点表示）
     centers_disp = [(float(xc), float(yc)) for yc in np.linspace(y_min, y_max, ny)
                                       for xc in np.linspace(x_min, x_max, nx)]
-    return dict(center=(xc,yc), tested_centers=tested, refined=refined,
+    return dict(center=(xc,yc), refined=refined,
                 idx_minFs=idx_minFs, idx_maxT=idx_maxT,
                 centers_disp=centers_disp)
 
@@ -375,7 +408,7 @@ xc,yc = res["center"]
 refined = res["refined"]; idx_minFs=res["idx_minFs"]; idx_maxT=res["idx_maxT"]
 centers_disp = res["centers_disp"]
 
-# ---------------- 描画（フルスパン端点で弧を描画） ----------------
+# ---------- 描画 ----------
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
 Xd = np.linspace(0.0, L, 600); Yg = [ground.y_at(x) for x in Xd]
 
@@ -402,26 +435,25 @@ ax.plot([L, L],[0.0, ground.y_at(L)], linewidth=1.0)
 ax.plot([0.0, L],[0.0, 0.0],         linewidth=1.0)
 ax.plot([0.0, 0.0],[0.0, ground.y_at(0.0)], linewidth=1.0)
 
-# センター表示
+# センター
 if show_centers:
     xs=[c[0] for c in centers_disp]; ys=[c[1] for c in centers_disp]
     ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
-# 全Refined弧（フルスパン端点で描画）
+# 全Refined弧（フルスパン）
 if show_all_refined:
     for d in refined:
         xs = np.linspace(d["x1"], d["x2"], 240)
         ys = yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
         ax.plot(xs, ys, linewidth=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
 
-# ピックアップ表示
+# ピックアップ
 if show_minFs and 0 <= idx_minFs < len(refined):
     d = refined[idx_minFs]
     xs = np.linspace(d["x1"], d["x2"], 500)
     ys = yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
     ax.plot(xs, ys, linewidth=3.0, color=(0.9,0.0,0.0), label=f"Min Fs = {d['Fs']:.3f}")
-    # 半径線
     y1 = float(ground.y_at(d["x1"])); y2 = float(ground.y_at(d["x2"]))
     ax.plot([xc, d["x1"]], [yc, y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
     ax.plot([xc, d["x2"]], [yc, y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
@@ -436,7 +468,7 @@ if show_maxT and 0 <= idx_maxT < len(refined):
     ax.plot([xc, d["x1"]], [yc, y1], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
     ax.plot([xc, d["x2"]], [yc, y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
 
-# 軸など
+# 軸・凡例
 ax.set_xlim(min(-2.0, -0.05*L), max(1.18*L, 100.0))
 ax.set_ylim(0.0, max(2.3*H, 100.0))
 ax.set_aspect("equal", adjustable="box")
@@ -449,7 +481,7 @@ legend_patches=[Patch(color=(0.85,0,0),label="Fs<1.0"),
 h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
-ax.set_title(f"Full-span mode • Center=({xc:.2f},{yc:.2f}) • Method={method} • "
+ax.set_title(f"Full-span robust • Center=({xc:.2f},{yc:.2f}) • Method={method} • "
              f"MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={Fs_target:.2f}")
 
 st.pyplot(fig, use_container_width=True); plt.close(fig)
