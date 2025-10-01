@@ -1,4 +1,4 @@
-# streamlit_app.py — Full-span GridMask 版（単純・高速・壊れにくい）
+# streamlit_app.py — Revert：Entry-sweep → Candidate arcs → Refined Fs（No full-span）
 from __future__ import annotations
 import streamlit as st
 import numpy as np
@@ -6,34 +6,36 @@ import matplotlib.pyplot as plt
 import heapq, time, json, hashlib
 from dataclasses import dataclass
 
+# stabi_lem 側の既存APIをそのまま利用（フルスパン系は使わない）
 from stabi_lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
     clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
 )
 
-st.set_page_config(page_title="Stabi LEM｜Full-span GridMask", layout="wide")
-st.title("Stabi LEM｜Full-span（GridMask）")
+st.set_page_config(page_title="Stabi LEM｜Entry-sweep (reverted)", layout="wide")
+st.title("Stabi LEM｜Entry-sweep（復帰版）")
 
-# ---------- utils ----------
+# ==========================
+# 小物
+# ==========================
 def fs_to_color(fs: float):
-    if fs < 1.0: return (0.85, 0.0, 0.0)
-    if fs < 1.2:
+    if fs < 1.0: return (0.85, 0.0, 0.0)   # 赤
+    if fs < 1.2:                           # オレンジ→黄
         t = (fs - 1.0) / 0.2
         return (1.0, 0.50 + 0.50*t, 0.0)
-    return (0.0, 0.55, 0.0)
+    return (0.0, 0.55, 0.0)                # 緑
 
 def hash_params(obj) -> str:
     s = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=float)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-# 円底
-def arc_base_y_vec(X, xc, yc, R):
-    under = R*R - (X - xc)**2
-    Yb = np.full_like(X, np.nan, dtype=float)
-    m = under > 0.0
-    Yb[m] = yc - np.sqrt(under[m])
-    return Yb
+# 円弧下端（中心・半径・x から y）
+def arc_base_y_scalar(x, xc, yc, R):
+    under = R*R - (x - xc)**2
+    if under <= 0.0: 
+        return None
+    return yc - np.sqrt(under)
 
 @dataclass
 class SliceGeom:
@@ -43,18 +45,18 @@ class SliceGeom:
     sin_a: float; cos_a: float
     b: float
 
-def make_slices_fullspan_grid(ground: GroundPL, xc: float, yc: float, R: float,
-                              x1: float, x2: float, n_slices: int):
+def make_slices_on_arc(ground: GroundPL, xc: float, yc: float, R: float,
+                       x1: float, x2: float, n_slices: int):
+    """entry/exitで得た区間 [x1,x2] をそのままスライス化（full-spanではない）。"""
     xs = np.linspace(x1, x2, n_slices+1)
     slices: list[SliceGeom] = []
     for i in range(n_slices):
         xL, xR = float(xs[i]), float(xs[i+1])
         xC = 0.5*(xL + xR)
         y_top = float(ground.y_at(xC))
-        under = R*R - (xC - xc)**2
-        if under <= 0.0: 
+        y_base = arc_base_y_scalar(xC, xc, yc, R)
+        if y_base is None: 
             continue
-        y_base = yc - np.sqrt(under)
         h = y_top - y_base
         if h <= 1e-6:
             continue
@@ -66,6 +68,7 @@ def make_slices_fullspan_grid(ground: GroundPL, xc: float, yc: float, R: float,
     return slices
 
 def soil_at_base(x: float, y_base: float, ground: GroundPL, interfaces, soils):
+    """下端yで層判定（上から順）。"""
     if not interfaces: return soils[0]
     ys = [float(ifc.y_at(x)) for ifc in interfaces]
     if y_base >= ys[0]: return soils[0]
@@ -73,10 +76,12 @@ def soil_at_base(x: float, y_base: float, ground: GroundPL, interfaces, soils):
     if y_base >= ys[1]: return soils[1]
     return soils[2]
 
-def fs_fullspan(ground, interfaces, soils, method: str,
-                xc: float, yc: float, R: float, x1: float, x2: float, n_slices: int):
-    slices = make_slices_fullspan_grid(ground, xc, yc, R, x1, x2, n_slices)
-    if len(slices) < max(6, int(0.45*n_slices)): return None, None
+def fs_on_arc(ground, interfaces, soils, method: str,
+              xc: float, yc: float, R: float, x1: float, x2: float, n_slices: int):
+    """Fellenius/Bishop（簡略）を区間 [x1,x2] で評価。"""
+    slices = make_slices_on_arc(ground, xc, yc, R, x1, x2, n_slices)
+    if len(slices) < max(6, int(0.45*n_slices)):
+        return None, None
     Ws=[]; sinA=[]; cosA=[]; bs=[]; cs=[]; tans=[]
     for s in slices:
         soil = soil_at_base(s.xC, s.y_base, ground, interfaces, soils)
@@ -85,39 +90,42 @@ def fs_fullspan(ground, interfaces, soils, method: str,
         cs.append(soil.c); tans.append(np.tan(np.deg2rad(soil.phi)))
     Ws=np.array(Ws); sinA=np.array(sinA); cosA=np.array(cosA)
     bs=np.array(bs); cs=np.array(cs); tans=np.array(tans)
-    D = float(np.sum(Ws * sinA))
+
+    D = float(np.sum(Ws * sinA))  # ΣW sinα
     if D <= 1e-9: return None, None
+
     if method.startswith("Fellenius"):
         Rnum = np.sum(cs*bs + (Ws * cosA) * tans)
-        return float(Rnum / D), D
-    # Bishop (simplified)
+        FS = float(Rnum / D)
+        return FS, D
+
+    # Bishop (simplified) 反復
     FS = 1.20
     for _ in range(60):
         tanA = sinA/np.maximum(1e-12, cosA)
         m = 1.0 + (tans * tanA)/max(1e-12, FS)
         Rnum = np.sum((cs*bs + (Ws * cosA) * tans) / np.maximum(1e-12, m))
         FS_new = float(Rnum / D)
-        if abs(FS_new - FS) < 1e-4: FS = FS_new; break
+        if abs(FS_new - FS) < 1e-4:
+            FS = FS_new; break
         FS = FS_new
     return FS, D
 
-# ---------- presets ----------
+# ==========================
+# プリセット
+# ==========================
 QUALITY = {
     "Coarse": dict(quick_slices=10, final_slices=36, n_entries_final=900,
-                   probe_n_min_quick=81, limit_arcs_quick=80,
-                   budget_coarse_s=0.6, budget_quick_s=0.9, show_k=80,
-                   NX=801),
+                   probe_n_min_quick=81, limit_arcs_quick=80, show_k=80),
     "Normal": dict(quick_slices=12, final_slices=44, n_entries_final=1300,
-                   probe_n_min_quick=101, limit_arcs_quick=120,
-                   budget_coarse_s=0.8, budget_quick_s=1.2, show_k=140,
-                   NX=1201),
+                   probe_n_min_quick=101, limit_arcs_quick=120, show_k=140),
     "Fine": dict(quick_slices=16, final_slices=56, n_entries_final=1700,
-                 probe_n_min_quick=121, limit_arcs_quick=160,
-                 budget_coarse_s=1.2, budget_quick_s=1.8, show_k=200,
-                 NX=1601),
+                 probe_n_min_quick=121, limit_arcs_quick=160, show_k=200),
 }
 
-# ---------- UI ----------
+# ==========================
+# UI（計算はボタン押下まで走らない）
+# ==========================
 with st.form("params"):
     A,B = st.columns(2)
     with A:
@@ -154,7 +162,7 @@ with st.form("params"):
         Fs_target = st.number_input("Target FS (T_req)", 1.00, 2.00, 1.20, 0.05)
 
     with B:
-        st.subheader("Center grid")
+        st.subheader("Center grid window")
         x_min = st.number_input("x min", 0.20*L, 3.00*L, 0.25*L, 0.05*L)
         x_max = st.number_input("x max", 0.30*L, 4.00*L, 1.15*L, 0.05*L)
         y_min = st.number_input("y min", 0.80*H, 7.00*H, 1.60*H, 0.10*H)
@@ -172,123 +180,59 @@ with st.form("params"):
             n_entries_final_in = st.slider("Final n_entries", 200, 4000, QUALITY[quality]["n_entries_final"], 100, disabled=not override)
             probe_min_q_in   = st.slider("Quick min probe", 41, 221, QUALITY[quality]["probe_n_min_quick"], 10, disabled=not override)
             limit_arcs_q_in  = st.slider("Quick max arcs/center", 20, 400, QUALITY[quality]["limit_arcs_quick"], 10, disabled=not override)
-            budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 5.0, QUALITY[quality]["budget_coarse_s"], 0.1, disabled=not override)
-            budget_quick_in  = st.slider("Budget Quick (s)", 0.1, 5.0, QUALITY[quality]["budget_quick_s"], 0.1, disabled=not override)
-            NX_in = st.slider("Span grid NX", 401, 2001, QUALITY[quality]["NX"], 100, disabled=not override)
+            show_k_in        = st.slider("Show top-k per center", 20, 400, QUALITY[quality]["show_k"], 10, disabled=not override)
 
-        st.subheader("Depth filter (GridMask上)")
-        depth_mode = st.selectbox("Mode", ["By apex (deepest)", "By endpoints", "Off"], index=0)
+        st.subheader("Depth (vertical)")
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
         depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 6.0, 0.5)
+
+        st.subheader("Center picking")
+        pick_mode = st.radio("Choose center by", ["Max arcs (robust)","Min Fs (aggressive)"], index=0)
 
         st.subheader("Display")
         show_minFs = st.checkbox("Show Min Fs", True)
         show_maxT  = st.checkbox("Show Max required T", True)
-        show_all_refined = st.checkbox("Show refined arcs (Fs-colored)", True)
+        show_refined = st.checkbox("Show refined arcs (Fs-colored)", True)
         show_centers = st.checkbox("Show center-grid points", True)
 
-    run = st.form_submit_button("▶ 計算開始（GridMask）")
+    run = st.form_submit_button("▶ 計算開始（Entry-sweep復帰版）")
 
-# Quality適用
+# Quality適用（Override対応）
 P = QUALITY[quality].copy()
 if 'override' in locals() and override:
     P.update(dict(
         quick_slices=quick_slices_in, final_slices=final_slices_in,
         n_entries_final=n_entries_final_in, probe_n_min_quick=probe_min_q_in,
-        limit_arcs_quick=limit_arcs_q_in,
-        budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
-        NX=NX_in,
+        limit_arcs_quick=limit_arcs_q_in, show_k=show_k_in,
     ))
 
-# ---------- key ----------
+# ==========================
+# キー
+# ==========================
 param_key = hash_params(dict(
     H=H, L=L, n_layers=n_layers,
     soils=[(s.gamma, s.c, s.phi) for s in soils],
     allow_cross=allow_cross, Fs_target=Fs_target,
     center=[x_min, x_max, y_min, y_max, nx, ny],
-    method=method, quality=P, depth=[depth_mode, depth_min, depth_max],
+    method=method, quality=P, depth=[depth_min, depth_max],
+    pick_mode=pick_mode,
 ))
 
-# ---------- GridMask: 最長有効スパン抽出 ----------
-def longest_valid_span_grid(Xg, Ys, xc, yc, R, mode, dmin, dmax, min_pts=6):
-    Yb = arc_base_y_vec(Xg, xc, yc, R)
-    good = np.isfinite(Yb)
-    if not np.any(good): return None
-    D = Ys - Yb
-    mask = good & (D > 1e-6)
-
-    if not np.any(mask): return None
-
-    # 連続 True の区間を列挙
-    idx = np.where(mask)[0]
-    breaks = np.where(np.diff(idx) > 1)[0]
-    starts = np.r_[idx[0], idx[breaks+1]]
-    ends   = np.r_[idx[breaks], idx[-1]]
-
-    best = None
-    for s,e in zip(starts, ends):
-        if (e - s + 1) < min_pts: 
-            continue
-        x1, x2 = float(Xg[s]), float(Xg[e])
-        ds = D[s:e+1]
-        if mode == "Off":
-            ok = True
-        elif mode == "By endpoints":
-            ok = (dmin <= ds[0] <= dmax) and (dmin <= ds[-1] <= dmax)
-        else:  # apex
-            ok = (dmin <= float(np.max(ds)) <= dmax)
-        if not ok:
-            continue
-        span_len = x2 - x1
-        if (best is None) or (span_len > best[0]):
-            best = (span_len, x1, x2)
-    if best is None: 
-        return None
-    _, x1, x2 = best
-    return x1, x2
-
-# ---------- 計算 ----------
+# ==========================
+# 本計算（元の流れへ）
+# ==========================
 def compute_once():
-    # 1) Coarse：最有望センター選抜
-    def subsampled_centers():
-        xs = np.linspace(x_min, x_max, nx)
-        ys = np.linspace(y_min, y_max, ny)
-        xs = xs[::2] if len(xs)>1 else xs
-        ys = ys[::2] if len(ys)>1 else ys
-        return [(float(xc), float(yc)) for yc in ys for xc in xs]
+    # センターグリッド作成
+    xs = np.linspace(x_min, x_max, nx)
+    ys = np.linspace(y_min, y_max, ny)
+    centers = [(float(xc), float(yc)) for yc in ys for xc in xs]
 
-    def pick_center(budget_s):
-        deadline = time.time() + budget_s
-        best=None
-        for (xc,yc) in subsampled_centers():
-            cnt=0; Fs_best=None
-            for _x1,_x2,_R,Fs_q in arcs_from_center_by_entries_multi(
-                ground, soils, xc, yc,
-                n_entries=min(800, P["n_entries_final"]), method="Fellenius",
-                depth_min=depth_min, depth_max=depth_max,
-                interfaces=interfaces, allow_cross=allow_cross,
-                quick_mode=True, n_slices_quick=max(8, P["quick_slices"]//2),
-                limit_arcs_per_center=min(60, P["limit_arcs_quick"]),
-                probe_n_min=max(61, P["probe_n_min_quick"]-40),
-            ):
-                cnt += 1
-                if (Fs_best is None) or (Fs_q < Fs_best): Fs_best = Fs_q
-                if time.time() > deadline: break
-            score=(cnt, -(Fs_best if Fs_best is not None else 1e9))
-            if (best is None) or (score > best[0]): best=(score,(xc,yc))
-            if time.time() > deadline: break
-        return best[1] if best else None
-
-    with st.spinner("Coarse（センター選抜）"):
-        center = pick_center(P["budget_coarse_s"])
-        if center is None:
-            return dict(error="Coarseでセンターなし。枠/深さを調整してください。")
-    xc, yc = center
-
-    # 2) Quick：R候補抽出（低Fs順に保持）
-    with st.spinner("Quick（R候補抽出）"):
-        heap_R=[]; deadline=time.time()+P["budget_quick_s"]
-        for _x1,_x2,R,Fs_q in arcs_from_center_by_entries_multi(
+    # 各センターで Quick 候補取得（Felleniusベース）＋統計
+    per_center = []
+    for (xc,yc) in centers:
+        heap_arcs = []  # （Fs_q, x1, x2, R）
+        cnt = 0
+        for x1,x2,R,Fs_q in arcs_from_center_by_entries_multi(
             ground, soils, xc, yc,
             n_entries=P["n_entries_final"], method="Fellenius",
             depth_min=depth_min, depth_max=depth_max,
@@ -297,44 +241,59 @@ def compute_once():
             limit_arcs_per_center=P["limit_arcs_quick"],
             probe_n_min=P["probe_n_min_quick"],
         ):
-            heapq.heappush(heap_R, (-Fs_q, float(R)))
-            if len(heap_R) > P["show_k"]: heapq.heappop(heap_R)
-            if time.time() > deadline: break
-        if not heap_R: 
-            return dict(error="Quickで候補なし。条件を緩めてください。")
-        tmp = sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])
-        R_candidates = [r for _fs, r in tmp]
-
-    # 3) Refine（GridMaskで x1–x2 を確定 → 一貫評価）
-    Xg = np.linspace(0.0, L, P["NX"])
-    Ys = np.array([ground.y_at(x) for x in Xg], dtype=float)
-
-    refined=[]
-    for R in R_candidates:
-        span = longest_valid_span_grid(Xg, Ys, xc, yc, R, depth_mode, depth_min, depth_max, min_pts=8)
-        if span is None: 
+            cnt += 1
+            heapq.heappush(heap_arcs, (float(Fs_q), float(x1), float(x2), float(R)))
+            if len(heap_arcs) > P["show_k"]:
+                heapq._heappop_max(heap_arcs) if hasattr(heapq, "_heappop_max") else heap_arcs.sort(reverse=True) or heap_arcs.pop(0)
+        if not heap_arcs:
+            per_center.append(dict(center=(xc,yc), count=0, minFs=None, arcs=[]))
             continue
-        x1, x2 = span
-        FS, D = fs_fullspan(ground, interfaces, soils, method, xc, yc, R, x1, x2, n_slices=P["final_slices"])
+        heap_arcs.sort(key=lambda t:t[0])  # Fs昇順
+        minFs = heap_arcs[0][0]
+        per_center.append(dict(center=(xc,yc), count=cnt, minFs=minFs, arcs=heap_arcs))
+
+    # センター選抜
+    chosen = None
+    if pick_mode.startswith("Max arcs"):
+        # 候補数が多いセンターを優先、同率なら minFs が小さい方
+        per_center_sorted = sorted(per_center, key=lambda d: (d["count"], -(1e9 if d["minFs"] is None else -d["minFs"])), reverse=True)
+        for d in per_center_sorted:
+            if d["count"] > 0:
+                chosen = d
+                break
+    else:
+        # minFs が最小のセンター
+        per_center_sorted = [d for d in per_center if d["minFs"] is not None]
+        if per_center_sorted:
+            chosen = min(per_center_sorted, key=lambda d: d["minFs"])
+
+    if chosen is None:
+        return dict(error="有効な候補弧が見つかりません。Depth / Center window / Quality を緩めてください。")
+
+    xc, yc = chosen["center"]
+    cand_arcs = chosen["arcs"][:P["show_k"]]  # Fsの低い順に上位K
+
+    # Refine：選ばれたセンターの候補について、指定法で精密Fs評価
+    refined = []
+    for Fs_q, x1, x2, R in cand_arcs:
+        FS, D = fs_on_arc(ground, interfaces, soils, method, xc, yc, R, x1, x2, n_slices=P["final_slices"])
         if FS is None or D is None: 
             continue
         T_req = max(0.0, (Fs_target - FS) * D)
-        refined.append(dict(R=float(R), x1=float(x1), x2=float(x2), Fs=float(FS), D=float(D), T_req=float(T_req)))
-
+        refined.append(dict(R=R, x1=x1, x2=x2, Fs=FS, D=D, T_req=T_req))
     if not refined:
-        return dict(error="Refineで有効弧が得られません（GridMask）。Depthを緩める/NXを増やす/Qualityを上げる。")
+        return dict(error="Refineで有効な円弧が得られません。Final slices を下げる/Depthを緩める等を試してください。")
 
-    refined.sort(key=lambda d:d["Fs"])
+    refined.sort(key=lambda d: d["Fs"])
     idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
     idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
 
-    centers_disp = [(float(xc), float(yc)) for yc in np.linspace(y_min, y_max, ny)
-                                      for xc in np.linspace(x_min, x_max, nx)]
+    centers_disp = centers  # 表示用
     return dict(center=(xc,yc), refined=refined,
                 idx_minFs=idx_minFs, idx_maxT=idx_maxT,
                 centers_disp=centers_disp)
 
-# run
+# 実行
 if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
     res = compute_once()
     if "error" in res: st.error(res["error"]); st.stop()
@@ -346,11 +305,13 @@ xc,yc = res["center"]
 refined = res["refined"]; idx_minFs=res["idx_minFs"]; idx_maxT=res["idx_maxT"]
 centers_disp = res["centers_disp"]
 
-# ---------- plot ----------
+# ==========================
+# 描画（以前の見え方に戻す）
+# ==========================
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
 Xd = np.linspace(0.0, L, 600); Yg = [ground.y_at(x) for x in Xd]
 
-# 塗り
+# 層の塗り（地表からはみ出さないよう clip）
 if n_layers == 1:
     ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
 elif n_layers == 2:
@@ -363,7 +324,7 @@ else:
     ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
     ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
 
-# 地表線＋外周
+# 地表線＋外周（囲い）
 ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if n_layers>=2:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.1)
@@ -373,25 +334,26 @@ ax.plot([L, L],[0.0, ground.y_at(L)], linewidth=1.0)
 ax.plot([0.0, L],[0.0, 0.0],         linewidth=1.0)
 ax.plot([0.0, 0.0],[0.0, ground.y_at(0.0)], linewidth=1.0)
 
-# センター
+# センター表示
 if show_centers:
     xs=[c[0] for c in centers_disp]; ys=[c[1] for c in centers_disp]
     ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
-# 全Refined弧
-if show_all_refined:
+# Refined弧（Fsカラー）
+if show_refined:
     for d in refined:
         xs = np.linspace(d["x1"], d["x2"], 240)
         ys = yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
-        ax.plot(xs, ys, linewidth=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
+        ax.plot(xs, ys, linewidth=0.9, alpha=0.8, color=fs_to_color(d["Fs"]))
 
-# ピックアップ
+# ピックアップ（最小Fs／最大必要抑止力）
 if show_minFs and 0 <= idx_minFs < len(refined):
     d = refined[idx_minFs]
     xs = np.linspace(d["x1"], d["x2"], 500)
     ys = yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
     ax.plot(xs, ys, linewidth=3.0, color=(0.9,0.0,0.0), label=f"Min Fs = {d['Fs']:.3f}")
+    # 中心→弦（どのcenterから出たか視覚的に）
     y1 = float(ground.y_at(d["x1"])); y2 = float(ground.y_at(d["x2"]))
     ax.plot([xc, d["x1"]], [yc, y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
     ax.plot([xc, d["x2"]], [yc, y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
@@ -406,9 +368,9 @@ if show_maxT and 0 <= idx_maxT < len(refined):
     ax.plot([xc, d["x1"]], [yc, y1], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
     ax.plot([xc, d["x2"]], [yc, y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
 
-# 軸・凡例
-ax.set_xlim(min(-2.0, -0.05*L), max(1.18*L, 100.0))
-ax.set_ylim(0.0, max(2.3*H, 100.0))
+# 軸・凡例（座標軸は余裕を持って 100m 超まで）
+ax.set_xlim(min(-2.0, -0.05*L), max(1.20*L, 100.0))
+ax.set_ylim(0.0, max(2.30*H, 100.0))
 ax.set_aspect("equal", adjustable="box")
 ax.grid(True); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
 
@@ -419,11 +381,12 @@ legend_patches=[Patch(color=(0.85,0,0),label="Fs<1.0"),
 h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
-ax.set_title(f"GridMask • Center=({xc:.2f},{yc:.2f}) • Method={method} • "
+ax.set_title(f"Entry-sweep（復帰）• Center=({xc:.2f},{yc:.2f}) • Method={method} • "
              f"MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={Fs_target:.2f}")
+
 st.pyplot(fig, use_container_width=True); plt.close(fig)
 
-# metrics
+# メトリクス
 m1,m2 = st.columns(2)
-with m1: st.metric("Min Fs（Full-span, GridMask）", f"{refined[idx_minFs]['Fs']:.3f}")
+with m1: st.metric("Min Fs（Refined）", f"{refined[idx_minFs]['Fs']:.3f}")
 with m2: st.metric("Max required T", f"{refined[idx_maxT]['T_req']:.1f} kN/m")
