@@ -1,4 +1,4 @@
-# streamlit_app.py — 常時プレビュー＋手動実行（R-sweep堅牢化）
+# streamlit_app.py — Safe baseline without water (preview always on + compute on click)
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json
@@ -12,16 +12,8 @@ from stabi_lem import (
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
 )
 
-# ---- 水位クラスは存在しない環境でも落ちないようにガード ----
-WATER_AVAILABLE = True
-try:
-    from stabi_lem import WaterLine, WaterPolyline, WaterOffset
-except Exception:
-    WATER_AVAILABLE = False
-    WaterLine = WaterPolyline = WaterOffset = None
-
-st.set_page_config(page_title="Stabi LEM｜Preview first, compute on click", layout="wide")
-st.title("Stabi LEM｜プレビュー常時表示 ＆ 計算はボタン押下時のみ")
+st.set_page_config(page_title="Stabi LEM｜Safe baseline (no water)", layout="wide")
+st.title("Stabi LEM｜安全版（まず計算を確実に回す）")
 
 # ---------------- Quality presets ----------------
 QUALITY = {
@@ -90,7 +82,7 @@ def circle_ground_intersections(xc: float, yc: float, R: float, ground: GroundPL
 for k,v in dict(geom_custom=False, ground_table=None, iface_tables={}).items():
     st.session_state.setdefault(k, v)
 
-# ---------------- Controls（フォーム無し：プレビュー反映は即時、計算は手動ボタン） ----------------
+# ---------------- Controls（プレビューは即時、計算は手動） ----------------
 A, B = st.columns(2)
 with A:
     st.subheader("Geometry")
@@ -144,28 +136,6 @@ with A:
     st.subheader("Target safety")
     Fs_target = st.number_input("Target FS", 1.00, 2.00, 1.20, 0.05)
 
-    st.subheader("Water table (Phreatic)")
-    if WATER_AVAILABLE:
-        enable_w = st.checkbox("Enable water table", False)
-        wsrc = st.radio("Source", ["Linear (2-point)", "CSV polyline", "Offset from ground"],
-                        horizontal=True, disabled=not enable_w)
-        gamma_w = st.number_input("γ_w (kN/m³)", 9.00, 10.50, 9.81, 0.01, disabled=not enable_w)
-        pore_mode = st.radio("Pore handling", ["u-only (total W)", "buoyancy"],
-                             horizontal=True, disabled=not enable_w)
-        water_csv_file = None; yWL = yWR = None; w_offset=None
-        if enable_w:
-            if wsrc.startswith("Linear"):
-                yWL = st.number_input("Water level at x=0 (m)", 0.0, 2.5*H, 0.6*H, 0.1)
-                yWR = st.number_input("Water level at x=L (m)", 0.0, 2.5*H, 0.3*H, 0.1)
-            elif "CSV" in wsrc:
-                water_csv_file = st.file_uploader("Upload water polyline CSV (x,y columns)", type=["csv"])
-            else:
-                w_offset = st.number_input("Offset below ground (m)", 0.0, 50.0, 5.0, 0.5,
-                                           help="地表面と同形状で、鉛直にこの距離だけ下げた水位線。")
-    else:
-        enable_w=False
-        st.info("Water options are hidden because Water* classes are not available in stabi_lem.")
-
 with B:
     st.subheader("Center grid")
     x_min = st.number_input("x min", 0.20*L, 3.00*L, 0.25*L, 0.05*L)
@@ -191,7 +161,7 @@ with B:
     depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5,
                                 help="円弧最深点の地表からの鉛直深さレンジ")
 
-# ===== 確定ジオメトリ（プレビュー用。フォームじゃないので即時反映） =====
+# ===== 確定ジオメトリ（プレビュー用） =====
 ground_default = make_ground_example(H, L)
 if st.session_state.get("geom_custom", False):
     if 'ground_tbl_edit' in st.session_state:
@@ -214,30 +184,7 @@ else:
     if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
     if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
 
-# ===== 水位オブジェクト（プレビューにも反映／ON時のみ） =====
-water = None; water_kwargs={}
-if WATER_AVAILABLE and enable_w:
-    pore_tag = "buoyancy" if pore_mode.startswith("buoyancy") else "u-only"
-    if 'wsrc' in locals():
-        if wsrc.startswith("Linear"):
-            water = WaterLine(0.0, L, float(yWL), float(yWR))
-        elif "CSV" in wsrc and 'water_csv_file' in locals() and water_csv_file is not None:
-            try:
-                dfw = pd.read_csv(water_csv_file)
-                xw = pd.to_numeric(dfw.iloc[:,0], errors="coerce").to_numpy()
-                yw = pd.to_numeric(dfw.iloc[:,1], errors="coerce").to_numpy()
-                m = np.isfinite(xw) & np.isfinite(yw)
-                xw = xw[m]; yw = yw[m]
-                order = np.argsort(xw)
-                water = WaterPolyline(xw[order], yw[order])
-            except Exception:
-                water = None
-        else:
-            water = WaterOffset(float(w_offset))
-    if water is not None:
-        water_kwargs = dict(water=water, gamma_w=float(gamma_w), pore_mode=pore_tag)
-
-# ===== プレビュー描画（計算前でも常に表示） =====
+# ===== プレビュー描画（計算前でも常時表示） =====
 st.subheader("Preview（計算前ビュー）")
 figp, axp = plt.subplots(figsize=(10.5, 6.0))
 Xd = np.linspace(ground.X[0], ground.X[-1], 600)
@@ -256,19 +203,12 @@ else:
     axp.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
     axp.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
 
-# 地表・境界・水位
+# 地表・境界
 axp.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if len(interfaces)>=1:
     axp.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
 if len(interfaces)>=2:
     axp.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
-if WATER_AVAILABLE and enable_w and water is not None:
-    try:
-        Yw = np.array([water.y_at(float(x), ground) for x in Xd], dtype=float)
-        axp.plot(Xd, Yw, color="tab:blue", linestyle="--", linewidth=1.3, label="Water table")
-        axp.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
-    except Exception:
-        pass
 
 # 外周
 axp.plot([Xd[-1], Xd[-1]],[0.0, Yg[-1]], linewidth=1.0, color="k", alpha=0.7)
@@ -309,7 +249,7 @@ def r_range_from_depth(xc: float, yc: float, dmin: float, dmax: float) -> tuple[
     if R_high - R_low < 1e-6: return None
     return R_low, R_high
 
-def quick_candidates_by_Rs(xc, yc, R_list, quick_slices, method, allow_cross, interfaces, water_kwargs, L, sampleN):
+def quick_candidates_by_Rs(xc, yc, R_list, quick_slices, method, allow_cross, interfaces, L, sampleN):
     heap=[]; diag=dict(tried=len(R_list), sampled_hit=0, fallback_hit=0, fs_ok=0)
     for R in R_list:
         xpair=None
@@ -322,15 +262,14 @@ def quick_candidates_by_Rs(xc, yc, R_list, quick_slices, method, allow_cross, in
                 xpair=(float(s2[0]), float(s2[1])); diag["fallback_hit"] += 1
         if xpair is None: continue
         Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method,
-                              xc, yc, float(R), n_slices=int(quick_slices),
-                              **water_kwargs)
+                              xc, yc, float(R), n_slices=int(quick_slices))
         if Fs is None or not np.isfinite(Fs): continue
         diag["fs_ok"] += 1
         heapq.heappush(heap, (-float(Fs), float(R), xpair[0], xpair[1]))
     return heap, diag
 
 def compute_once():
-    # 1) Coarse：全格子を軽く走査し、「候補>0」の中心を必ず拾う
+    # 1) Coarse：全格子を軽く走査し、「候補>0」の中心を拾う
     best_center=None; best_score=None; tested_centers=[]
     xs = np.linspace(x_min, x_max, nx); ys = np.linspace(y_min, y_max, ny)
     for cy in ys:
@@ -341,7 +280,7 @@ def compute_once():
             R_low, R_high = rng
             Rs = np.linspace(R_low, R_high, int(P["R_coarse"]))
             heap, diag = quick_candidates_by_Rs(cx, cy, Rs, max(8, P["quick_slices"]//2),
-                                                "Fellenius", allow_cross, interfaces, water_kwargs,
+                                                "Fellenius", allow_cross, interfaces,
                                                 L, P["sample_N"])
             cnt=len(heap); Fs_min=(-heap[0][0]) if cnt>0 else None
             tested_centers.append((cx,cy,cnt,Fs_min))
@@ -351,7 +290,7 @@ def compute_once():
                     best_score=score; best_center=(cx,cy)
 
     if best_center is None:
-        return dict(error="Coarseで候補なし。センター/深さ/水位/層跨ぎの整合を確認してください。")
+        return dict(error="Coarseで候補なし。センター/深さ/層跨ぎの整合を確認してください。")
 
     xc, yc = best_center
     rng = r_range_from_depth(xc, yc, depth_min, depth_max)
@@ -359,7 +298,7 @@ def compute_once():
         return dict(error="選抜センターで半径レンジが成立しません。深さレンジ/センター枠を調整してください。")
     R_low, R_high = rng
     Rs = np.linspace(R_low, R_high, int(P["R_quick"]))
-    heap, diag_q = quick_candidates_by_Rs(xc, yc, Rs, P["quick_slices"], method, allow_cross, interfaces, water_kwargs,
+    heap, diag_q = quick_candidates_by_Rs(xc, yc, Rs, P["quick_slices"], method, allow_cross, interfaces,
                                           L, P["sample_N"])
     if not heap:
         return dict(error="Quickで円弧候補なし（交点検出の両系とも不成立）。")
@@ -371,7 +310,7 @@ def compute_once():
         fsneg, R, x1, x2 = heapq.heappop(heap)
         Fs_q = -fsneg
         Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method,
-                              xc, yc, R, n_slices=P["final_slices"], **water_kwargs)
+                              xc, yc, R, n_slices=P["final_slices"])
         if Fs is None or not np.isfinite(Fs): continue
         packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross,
                                         xc, yc, R, n_slices=P["final_slices"])
@@ -381,7 +320,7 @@ def compute_once():
         refined.append(dict(Fs=float(Fs), Fs_q=float(Fs_q), R=float(R),
                             x1=float(x1), x2=float(x2), T_req=float(T_req)))
     if not refined:
-        return dict(error="Refineで有効弧なし。設定/Quality/水位を再確認してください。")
+        return dict(error="Refineで有効弧なし。設定/Qualityを再確認してください。")
 
     refined.sort(key=lambda d:d["Fs"])
     idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
@@ -409,7 +348,8 @@ if "res" in st.session_state:
         refined = res["refined"]; idx_minFs = res["idx_minFs"]; idx_maxT=res["idx_maxT"]
         # 描画
         fig, ax = plt.subplots(figsize=(10.5, 7.5))
-        # 地形はプレビューと同様に
+        Xd = np.linspace(ground.X[0], ground.X[-1], 600)
+        Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
         ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
         if len(interfaces)==0:
             ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
@@ -425,40 +365,35 @@ if "res" in st.session_state:
             ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
             ax.plot(Xd, Y1, linestyle="--", linewidth=1.2, label="Interface 1")
             ax.plot(Xd, Y2, linestyle="--", linewidth=1.2, label="Interface 2")
-        if WATER_AVAILABLE and enable_w and water is not None:
-            try:
-                Yw = np.array([water.y_at(float(x), ground) for x in Xd], dtype=float)
-                ax.plot(Xd, Yw, color="tab:blue", linestyle="--", linewidth=1.3, label="Water table")
-                ax.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
-            except Exception:
-                pass
+
         # 外周
         ax.plot([Xd[-1], Xd[-1]],[0.0, Yg[-1]], linewidth=1.0, color="k", alpha=0.7)
         ax.plot([Xd[0],  Xd[-1]],[0.0, 0.0],     linewidth=1.0, color="k", alpha=0.7)
         ax.plot([Xd[0],  Xd[0]], [0.0, Yg[0]],   linewidth=1.0, color="k", alpha=0.7)
+
         # グリッド/選抜センター
         ax.scatter([c[0] for c in res["centers_disp"]], [c[1] for c in res["centers_disp"]], s=12, c="k", alpha=0.25, marker=".", label="Center grid")
         ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
+
         # 全精算弧
         for d in refined:
             xs=np.linspace(d["x1"], d["x2"], 240)
             ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
             ax.plot(xs, ys, linewidth=0.9, alpha=0.80, color=fs_to_color(d["Fs"]))
-        # 特記事項
+
+        # ハイライト
         if 0<=idx_minFs<len(refined):
             d=refined[idx_minFs]
             xs=np.linspace(d["x1"], d["x2"], 400)
             ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
             ax.plot(xs, ys, linewidth=3.0, color=(0.9,0.0,0.0), label=f"Min Fs = {d['Fs']:.3f}")
-            y1=float(ground.y_at(d["x1"])); y2=float(ground.y_at(d["x2"]))
-            ax.plot([xc,d["x1"]],[yc,y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
-            ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
         if 0<=idx_maxT<len(refined):
             d=refined[idx_maxT]
             xs=np.linspace(d["x1"], d["x2"], 400)
             ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
             ax.plot(xs, ys, linewidth=3.0, linestyle="--", color=(0.2,0.0,0.8),
                     label=f"Max required T = {d['T_req']:.1f} kN/m (Fs={d['Fs']:.3f})")
+
         # 軸
         x_span = ground.X[-1]-ground.X[0]
         ax.set_xlim(min(ground.X[0]-0.05*x_span, -2.0), ground.X[-1]+max(0.05*x_span, 2.0))
