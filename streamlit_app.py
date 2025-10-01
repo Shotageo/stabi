@@ -338,30 +338,47 @@ def compute_once():
         if where["top"]:   y_max_a = y_max + 0.20*dy
 
     def quick_R_candidates(xc, yc, budget_s):
-        heap_R=[]; deadline=time.time()+budget_s
+    P_loc = QUALITY[quality]
+    # ① 通常トライ
+    def run_once(relax=False):
+        heap_R=[]; deadline=time.time()+budget_s*(1.0 if not relax else 0.8)
+
+        # 深さ・探索緩和
+        dmin = depth_min if not relax else max(0.0, 0.5*depth_min)
+        dmax = depth_max if not relax else max(depth_max*1.7, 8.0)
+
+        probe_min = P_loc["probe_n_min_quick"] if not relax else max(41, int(0.7*P_loc["probe_n_min_quick"]))
+        limit_arcs = P_loc["limit_arcs_quick"] if not relax else int(1.5*P_loc["limit_arcs_quick"])
+        tol_R = 0.05 if not relax else 0.15
+
+        # 一時的な層・水設定
+        allow_tmp = allow_cross if not relax else [True]*max(0, len(interfaces))
+        water_kwargs_local = water_kwargs if (not relax) else {}  # レスキュー時は水位無視
+
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
             ground, soils, xc, yc,
             n_entries=P_loc["n_entries_final"], method="Fellenius",
-            depth_min=depth_min, depth_max=depth_max,
-            interfaces=interfaces, allow_cross=allow_cross,
+            depth_min=dmin, depth_max=dmax,
+            interfaces=interfaces, allow_cross=allow_tmp,
             quick_mode=True, n_slices_quick=P_loc["quick_slices"],
-            limit_arcs_per_center=P_loc["limit_arcs_quick"],
-            probe_n_min=P_loc["probe_n_min_quick"],
-            **water_kwargs,
+            limit_arcs_per_center=limit_arcs,
+            probe_n_min=probe_min, tol_R=tol_R,
+            **water_kwargs_local,
         ):
             heapq.heappush(heap_R, (-Fs, R))
-            if len(heap_R) > max(P_loc["show_k"], P_loc["top_thick"] + 20): heapq.heappop(heap_R)
-            if time.time() > deadline: break
-        R_candidates = [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
-        return R_candidates
+            if len(heap_R) > max(P_loc["show_k"], P_loc["top_thick"] + 20):
+                heapq.heappop(heap_R)
+            if time.time() > deadline:
+                break
 
-    with st.spinner("Quick（R候補抽出）"):
-        R_candidates = quick_R_candidates(xc, yc, P_loc["budget_quick_s"])
-        if not R_candidates:
-            msg = "Quickで円弧候補なし。深さ/Quality"
-            if enable_w: msg += "/水位"
-            msg += "を緩めてください。"
-            return dict(error=msg)
+        return [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
+
+    out = run_once(relax=False)
+    if not out:
+        # ② レスキュー
+        out = run_once(relax=True)
+    return out
+
 
     refined=[]
     for R in R_candidates[:P_loc["show_k"]]:
