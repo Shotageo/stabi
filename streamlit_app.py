@@ -1,4 +1,4 @@
-# streamlit_app.py — 確定実行モード：スライダー変更では再計算せず、ボタン押下でだけ計算
+# streamlit_app.py — 確定実行モード（手入力しても計算しない／ボタン押下でだけ確定・計算）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random
@@ -12,7 +12,7 @@ from stabi_lem import (
 )
 
 st.set_page_config(page_title="Stabi LEM｜確定実行モード", layout="wide")
-st.title("Stabi LEM｜確定実行（パラメータは［計算開始］で反映）")
+st.title("Stabi LEM｜確定実行（パラメータは［計算開始］でだけ反映）")
 
 # ---------------- Quality ----------------
 QUALITY = {
@@ -66,119 +66,152 @@ def near_edge(xc, yc, x_min, x_max, y_min, y_max, tol=1e-9):
     at_top   = abs(yc - y_max) < tol
     return at_left or at_right or at_bottom or at_top, dict(left=at_left,right=at_right,bottom=at_bottom,top=at_top)
 
-# ---------------- Params form (UI現在値) ----------------
-with st.form("params"):
-    A, B = st.columns(2)
-    with A:
-        st.subheader("Geometry")
-        H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5)
-        L = st.number_input("L (m)", 5.0, 400.0, 60.0, 0.5)
+# ===================== UI（キー付き） =====================
+# ※ フォームを使わず、外部の［計算開始］ボタンだけで確定・計算する
 
-        st.subheader("Layers")
-        n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
+# ---- 初期値のセット（一度だけ） ----
+def _init_once():
+    ss = st.session_state
+    ss.setdefault("ui_H", 25.0)
+    ss.setdefault("ui_L", 60.0)
+    ss.setdefault("ui_layers", 3)
+    ss.setdefault("ui_soils", [(18.0,5.0,30.0),(19.0,8.0,28.0),(20.0,12.0,25.0)])  # (γ,c,φ)
+    ss.setdefault("ui_allow_cross", [True, True])  # into layer2, into layer3
+    ss.setdefault("ui_Fs_target", 1.20)
+    ss.setdefault("ui_xmin_ratio", 0.25)
+    ss.setdefault("ui_xmax_ratio", 1.15)
+    ss.setdefault("ui_ymin_ratio", 1.60)
+    ss.setdefault("ui_ymax_ratio", 2.20)
+    ss.setdefault("ui_nx", 14)
+    ss.setdefault("ui_ny", 9)
+    ss.setdefault("ui_method", "Fellenius")
+    ss.setdefault("ui_quality_label", "Normal")
+    ss.setdefault("ui_override", False)
+    ss.setdefault("ui_depth_min", 0.5)
+    ss.setdefault("ui_depth_max", 4.0)
+    # overrideの値
+    P0 = QUALITY[ss["ui_quality_label"]]
+    ss.setdefault("ui_quick_slices", P0["quick_slices"])
+    ss.setdefault("ui_final_slices", P0["final_slices"])
+    ss.setdefault("ui_n_entries_final", P0["n_entries_final"])
+    ss.setdefault("ui_probe_min_q", P0["probe_n_min_quick"])
+    ss.setdefault("ui_limit_arcs_q", P0["limit_arcs_quick"])
+    ss.setdefault("ui_budget_coarse", P0["budget_coarse_s"])
+    ss.setdefault("ui_budget_quick", P0["budget_quick_s"])
+    # 実行フラグ・確定値
+    ss.setdefault("compute_request", False)
+    if "committed_params" not in ss:
+        # 初回はデフォルトで確定しておく（初期表示のため）
+        params = build_params_from_ui()
+        ss["committed_params"] = params
+        ss["last_ui_hash"] = hash_params(params)
 
-        st.subheader("Soils (top→bottom)")
-        s1 = Soil(st.number_input("γ₁", 10.0, 25.0, 18.0, 0.5),
-                  st.number_input("c₁", 0.0, 200.0, 5.0, 0.5),
-                  st.number_input("φ₁", 0.0, 45.0, 30.0, 0.5))
-        soils_list = [s1]
-        if n_layers >= 2:
-            s2 = Soil(st.number_input("γ₂", 10.0, 25.0, 19.0, 0.5),
-                      st.number_input("c₂", 0.0, 200.0, 8.0, 0.5),
-                      st.number_input("φ₂", 0.0, 45.0, 28.0, 0.5))
-            soils_list.append(s2)
-        if n_layers >= 3:
-            s3 = Soil(st.number_input("γ３", 10.0, 25.0, 20.0, 0.5),
-                      st.number_input("c３", 0.0, 200.0, 12.0, 0.5),
-                      st.number_input("φ３", 0.0, 45.0, 25.0, 0.5))
-            soils_list.append(s3)
-
-        st.subheader("Crossing control")
-        allow_cross=[]
-        if n_layers>=2: allow_cross.append(st.checkbox("Allow into Layer 2", True))
-        if n_layers>=3: allow_cross.append(st.checkbox("Allow into Layer 3", True))
-
-        st.subheader("Target safety")
-        Fs_target = st.number_input("Target FS", 1.00, 2.00, 1.20, 0.05)
-
-    with B:
-        st.subheader("Center grid")
-        x_min = st.number_input("x min", 0.20*L, 3.00*L, 0.25*L, 0.05*L)
-        x_max = st.number_input("x max", 0.30*L, 4.00*L, 1.15*L, 0.05*L)
-        y_min = st.number_input("y min", 0.80*H, 7.00*H, 1.60*H, 0.10*H)
-        y_max = st.number_input("y max", 1.00*H, 8.00*H, 2.20*H, 0.10*H)
-        nx = st.slider("nx", 6, 60, 14)
-        ny = st.slider("ny", 4, 40, 9)
-
-        st.subheader("Method / Quality")
-        method = st.selectbox("Method", ["Bishop (simplified)","Fellenius"])
-        quality_label = st.select_slider("Quality", options=list(QUALITY.keys()), value="Normal")
-        P_current = QUALITY[quality_label].copy()  # UI現在値ベース
-        with st.expander("Advanced", expanded=False):
-            override = st.checkbox("Override Quality", value=False)
-            quick_slices_in  = st.slider("Quick slices", 6, 40, P_current["quick_slices"], 1, disabled=not override)
-            final_slices_in  = st.slider("Final slices", 20, 80, P_current["final_slices"], 2, disabled=not override)
-            n_entries_final_in = st.slider("Final n_entries", 200, 4000, P_current["n_entries_final"], 100, disabled=not override)
-            probe_min_q_in   = st.slider("Quick min probe", 41, 221, P_current["probe_n_min_quick"], 10, disabled=not override)
-            limit_arcs_q_in  = st.slider("Quick max arcs/center", 20, 400, P_current["limit_arcs_quick"], 10, disabled=not override)
-            budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 5.0, P_current["budget_coarse_s"], 0.1, disabled=not override)
-            budget_quick_in  = st.slider("Budget Quick (s)", 0.1, 5.0, P_current["budget_quick_s"], 0.1, disabled=not override)
-            if override:
-                P_current.update(dict(
-                    quick_slices=quick_slices_in, final_slices=final_slices_in,
-                    n_entries_final=n_entries_final_in, probe_n_min_quick=probe_min_q_in,
-                    limit_arcs_quick=limit_arcs_q_in,
-                    budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
-                ))
-
-        st.subheader("Depth range (vertical)")
-        depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
-        depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5)
-
-    run = st.form_submit_button("▶ 計算開始")
-
-# ---- 現在UI→辞書（未確定） ----
-def pack_params(H,L,n_layers,soils_list,allow_cross,Fs_target,
-                x_min,x_max,y_min,y_max,nx,ny,method,P_current,depth_min,depth_max):
+def build_params_from_ui():
+    ss = st.session_state
+    H = float(ss["ui_H"]); L = float(ss["ui_L"])
+    n_layers = int(ss["ui_layers"])
+    soils_tuple = ss["ui_soils"][:n_layers]
+    soils = [Soil(*t) for t in soils_tuple]
+    allow_cross = []
+    if n_layers>=2: allow_cross.append(bool(ss["ui_allow_cross"][0]))
+    if n_layers>=3: allow_cross.append(bool(ss["ui_allow_cross"][1]))
+    quality_label = ss["ui_quality_label"]
+    P = QUALITY[quality_label].copy()
+    if ss["ui_override"]:
+        P.update(dict(
+            quick_slices=int(ss["ui_quick_slices"]),
+            final_slices=int(ss["ui_final_slices"]),
+            n_entries_final=int(ss["ui_n_entries_final"]),
+            probe_n_min_quick=int(ss["ui_probe_min_q"]),
+            limit_arcs_quick=int(ss["ui_limit_arcs_q"]),
+            budget_coarse_s=float(ss["ui_budget_coarse"]),
+            budget_quick_s=float(ss["ui_budget_quick"]),
+        ))
+    x_min = float(ss["ui_xmin_ratio"] * L)
+    x_max = float(ss["ui_xmax_ratio"] * L)
+    y_min = float(ss["ui_ymin_ratio"] * H)
+    y_max = float(ss["ui_ymax_ratio"] * H)
     return dict(
-        H=float(H), L=float(L), n_layers=int(n_layers),
-        soils=[(s.gamma, s.c, s.phi) for s in soils_list],
-        allow_cross=list(allow_cross), Fs_target=float(Fs_target),
-        center=[float(x_min), float(x_max), float(y_min), float(y_max), int(nx), int(ny)],
-        method=str(method), quality=P_current, depth=[float(depth_min), float(depth_max)],
-        quality_label=str(quality_label),
+        H=H, L=L, n_layers=n_layers,
+        soils=[(s.gamma, s.c, s.phi) for s in soils],
+        allow_cross=allow_cross, Fs_target=float(ss["ui_Fs_target"]),
+        center=[x_min, x_max, y_min, y_max, int(ss["ui_nx"]), int(ss["ui_ny"])],
+        method=str(ss["ui_method"]), quality=P, depth=[float(ss["ui_depth_min"]), float(ss["ui_depth_max"])],
+        quality_label=quality_label,
     )
 
-params_ui = pack_params(H,L,n_layers,soils_list,allow_cross,Fs_target,
-                        x_min,x_max,y_min,y_max,nx,ny,method,P_current,depth_min,depth_max)
-key_ui = hash_params(params_ui)
+_init_once()
 
-# ---- 確定パラメータ管理（ボタン押下でだけ更新） ----
-if "committed_params" not in st.session_state:
-    st.session_state["committed_params"] = params_ui
-    st.session_state["last_key"] = key_ui
-    first_time = True
-else:
-    first_time = False
-    if run:
-        st.session_state["committed_params"] = params_ui
-        st.session_state["last_key"] = key_ui
+# ---- UI レイアウト（数値入力は全部 key=... でセッション管理） ----
+A, B = st.columns(2)
+with A:
+    st.subheader("Geometry")
+    st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="ui_H")
+    st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="ui_L")
 
-params = st.session_state["committed_params"]          # ← 以降は常にこれを使う
-P = params["quality"]
-Fs_target = params["Fs_target"]
-method = params["method"]
-x_min, x_max, y_min, y_max, nx, ny = params["center"]
-H = params["H"]; L = params["L"]; n_layers = params["n_layers"]
-depth_min, depth_max = params["depth"]
-allow_cross = params["allow_cross"]
-soils = [Soil(*t) for t in params["soils"]]
+    st.subheader("Layers")
+    st.selectbox("Number of layers", [1,2,3], key="ui_layers")
 
-# 未反映通知
-if not run and not first_time and key_ui != st.session_state["last_key"]:
-    st.info("パラメータは変更されていますが、**まだ計算に反映されていません**。［▶ 計算開始］で再計算します。")
+    st.subheader("Soils (top→bottom)")
+    # γ, c, φ を列挙
+    for i in range(st.session_state["ui_layers"]):
+        g,c,phi = st.session_state["ui_soils"][i]
+        cols = st.columns(3)
+        st.session_state["ui_soils"][i] = (
+            cols[0].number_input(f"γ{i+1}", 10.0, 25.0, g, 0.5, key=f"ui_gamma_{i+1}"),
+            cols[1].number_input(f"c{i+1}", 0.0, 200.0, c, 0.5, key=f"ui_c_{i+1}"),
+            cols[2].number_input(f"φ{i+1}", 0.0, 45.0, phi, 0.5, key=f"ui_phi_{i+1}")
+        )
 
-# ---- シーン構築（確定パラメータで統一） ----
+    st.subheader("Crossing control")
+    if st.session_state["ui_layers"] >= 2:
+        st.session_state["ui_allow_cross"][0] = st.checkbox("Allow into Layer 2", st.session_state["ui_allow_cross"][0], key="ui_allow2")
+    if st.session_state["ui_layers"] >= 3:
+        st.session_state["ui_allow_cross"][1] = st.checkbox("Allow into Layer 3", st.session_state["ui_allow_cross"][1], key="ui_allow3")
+
+    st.subheader("Target safety")
+    st.number_input("Target FS", min_value=1.00, max_value=2.00, step=0.05, key="ui_Fs_target")
+
+with B:
+    st.subheader("Center grid（比率指定）")
+    st.number_input("x min / L", 0.20, 3.00, key="ui_xmin_ratio", step=0.05, format="%.2f")
+    st.number_input("x max / L", 0.30, 4.00, key="ui_xmax_ratio", step=0.05, format="%.2f")
+    st.number_input("y min / H", 0.80, 7.00, key="ui_ymin_ratio", step=0.10, format="%.2f")
+    st.number_input("y max / H", 1.00, 8.00, key="ui_ymax_ratio", step=0.10, format="%.2f")
+    st.slider("nx", 6, 60, key="ui_nx")
+    st.slider("ny", 4, 40, key="ui_ny")
+
+    st.subheader("Method / Quality")
+    st.selectbox("Method", ["Bishop (simplified)","Fellenius"], key="ui_method")
+    st.select_slider("Quality", options=list(QUALITY.keys()), key="ui_quality_label")
+    with st.expander("Advanced", expanded=False):
+        st.checkbox("Override Quality", key="ui_override")
+        Ptmp = QUALITY[st.session_state["ui_quality_label"]]
+        if st.session_state["ui_override"]:
+            st.slider("Quick slices", 6, 40, Ptmp["quick_slices"], 1, key="ui_quick_slices")
+            st.slider("Final slices", 20, 80, Ptmp["final_slices"], 2, key="ui_final_slices")
+            st.slider("Final n_entries", 200, 4000, Ptmp["n_entries_final"], 100, key="ui_n_entries_final")
+            st.slider("Quick min probe", 41, 221, Ptmp["probe_n_min_quick"], 10, key="ui_probe_min_q")
+            st.slider("Quick max arcs/center", 20, 400, Ptmp["limit_arcs_quick"], 10, key="ui_limit_arcs_q")
+            st.slider("Budget Coarse (s)", 0.1, 5.0, Ptmp["budget_coarse_s"], 0.1, key="ui_budget_coarse")
+            st.slider("Budget Quick (s)", 0.1, 5.0, Ptmp["budget_quick_s"], 0.1, key="ui_budget_quick")
+
+    st.subheader("Depth range (vertical)")
+    st.number_input("Depth min (m)", min_value=0.0, max_value=50.0, step=0.5, key="ui_depth_min")
+    st.number_input("Depth max (m)", min_value=0.5, max_value=50.0, step=0.5, key="ui_depth_max")
+
+# ---- 計算開始ボタン（外部・on_clickでフラグだけ立てる） ----
+def _request_compute():
+    st.session_state["compute_request"] = True
+st.button("▶ 計算開始", type="primary", on_click=_request_compute)
+
+# ---- UI変更と確定値の差分通知 ----
+ui_params = build_params_from_ui()
+ui_hash = hash_params(ui_params)
+if ui_hash != st.session_state.get("last_ui_hash", ""):
+    st.info("パラメータは変更されていますが、**まだ計算に反映されていません**。［▶ 計算開始］で確定します。")
+
+# ===================== 以降は「確定パラメータ」だけを使用 =====================
 def build_scene(H,L,n_layers):
     ground = make_ground_example(H, L)
     interfaces=[]
@@ -186,10 +219,14 @@ def build_scene(H,L,n_layers):
     if n_layers>=3: interfaces.append(make_interface2_example(H, L))
     return ground, interfaces
 
-ground, interfaces = build_scene(H,L,n_layers)
+def compute_once(params):
+    H=params["H"]; L=params["L"]; n_layers=params["n_layers"]
+    ground, interfaces = build_scene(H,L,n_layers)
+    allow_cross=params["allow_cross"]; Fs_target=params["Fs_target"]
+    method=params["method"]; P=params["quality"]
+    x_min, x_max, y_min, y_max, nx, ny = params["center"]
+    depth_min, depth_max = params["depth"]
 
-# ---------------- 計算本体（確定パラメータのみ使用） ----------------
-def compute_once():
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
@@ -208,7 +245,7 @@ def compute_once():
         for (xc,yc) in subsampled_centers():
             cnt=0; Fs_min=None
             for _x1,_x2,_R,Fs in arcs_from_center_by_entries_multi(
-                ground, soils, xc, yc,
+                ground, [Soil(*t) for t in params["soils"]], xc, yc,
                 n_entries=P["coarse_entries"], method="Fellenius",
                 depth_min=depth_min, depth_max=depth_max,
                 interfaces=interfaces, allow_cross=allow_cross,
@@ -231,10 +268,10 @@ def compute_once():
             return dict(error="Coarseで候補なし。枠/深さを広げてください。")
     xc, yc = center
 
-    # 端ヒットなら監査用に外側へ一段拡張
+    # 端ヒット時に監査枠だけ拡張
     hit, where = near_edge(xc,yc,x_min,x_max,y_min,y_max)
-    expand_note = None
     x_min_a, x_max_a, y_min_a, y_max_a = x_min, x_max, y_min, y_max
+    expand_note=None
     if hit:
         dx = (x_max - x_min); dy = (y_max - y_min)
         if where["left"]:  x_min_a = x_min - 0.20*dx
@@ -247,7 +284,7 @@ def compute_once():
     with st.spinner("Quick（R候補抽出）"):
         heap_R=[]; deadline=time.time()+P["budget_quick_s"]
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
-            ground, soils, xc, yc,
+            ground, [Soil(*t) for t in params["soils"]], xc, yc,
             n_entries=P["n_entries_final"], method="Fellenius",
             depth_min=depth_min, depth_max=depth_max,
             interfaces=interfaces, allow_cross=allow_cross,
@@ -265,15 +302,15 @@ def compute_once():
     # Refine
     refined=[]
     for R in R_candidates[:P["show_k"]]:
-        Fs_val = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
+        Fs_val = fs_given_R_multi(ground, [], [Soil(*t) for t in params["soils"]], allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
         if Fs_val is None: continue
         s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
         if s is None: continue
         x1,x2,*_ = s
-        packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
+        packD = driving_sum_for_R_multi(ground, [], [Soil(*t) for t in params["soils"]], allow_cross, xc, yc, R, n_slices=P["final_slices"])
         if packD is None: continue
         D_sum,_,_ = packD
-        T_req = max(0.0, (Fs_target - Fs_val)*D_sum)
+        T_req = max(0.0, (params["Fs_target"] - Fs_val)*D_sum)
         refined.append(dict(Fs=float(Fs_val), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
     if not refined:
         return dict(error="Refineで有効弧なし。設定/Qualityを見直してください。")
@@ -284,21 +321,34 @@ def compute_once():
     centers_disp = grid_points(x_min, x_max, y_min, y_max, nx, ny)
     centers_audit= grid_points(x_min_a, x_max_a, y_min_a, y_max_a, nx, ny)
 
-    return dict(center=(xc,yc), refined=refined,
-                idx_minFs=idx_minFs, idx_maxT=idx_maxT,
-                centers_disp=centers_disp, centers_audit=centers_audit,
-                expand_note=expand_note)
+    return dict(
+        params=params, ground=ground, interfaces=interfaces,
+        center=(xc,yc), refined=refined,
+        idx_minFs=idx_minFs, idx_maxT=idx_maxT,
+        centers_disp=centers_disp, centers_audit=centers_audit,
+        expand_note=expand_note
+    )
 
-# ---- 計算のトリガー条件：初回 or ボタン押下時のみ ----
-if ("res" not in st.session_state) or run:
-    res = compute_once()
+# ---- 実行条件：初回 or compute_request=True のときだけ計算 ----
+if ("res" not in st.session_state) or st.session_state.get("compute_request", False):
+    # ボタン押下時：UIを確定→計算
+    if st.session_state.get("compute_request", False):
+        st.session_state["committed_params"] = ui_params
+        st.session_state["last_ui_hash"] = ui_hash
+        st.session_state["compute_request"] = False
+    res = compute_once(st.session_state["committed_params"])
     if "error" in res: st.error(res["error"]); st.stop()
     st.session_state["res"] = res
 
 res = st.session_state["res"]
+params = res["params"]
+ground = res["ground"]; interfaces = res["interfaces"]
 xc,yc = res["center"]
 refined = res["refined"]; idx_minFs = res["idx_minFs"]; idx_maxT=res["idx_maxT"]
 centers_disp = res["centers_disp"]; centers_audit = res["centers_audit"]
+Fs_target = params["Fs_target"]; method=params["method"]; n_layers=params["n_layers"]
+L=params["L"]; H=params["H"]
+quality_label = params["quality_label"]
 
 # ---------------- 表示オプション（表示だけ。計算は走らない） ----------------
 st.subheader("表示オプション")
@@ -312,8 +362,8 @@ with c3:
     show_maxT  = st.checkbox("Show Max required T", True)
 with c4:
     audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
-    audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[params['quality_label']]["audit_limit_per_center"], 1, disabled=not audit_show)
-    audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[params['quality_label']]["audit_budget_s"], 0.1, disabled=not audit_show)
+    audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality_label]["audit_limit_per_center"], 1, disabled=not audit_show)
+    audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality_label]["audit_budget_s"], 0.1, disabled=not audit_show)
     audit_seed   = st.number_input("Audit seed", 0, 9999, 0, disabled=not audit_show)
 
 # ---------------- Audit computation（可視化だけ。確定Pで） ----------------
@@ -328,13 +378,13 @@ def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
         cx,cy = centers[idx]
         count=0
         for a_x1,a_x2,R,Fs in arcs_from_center_by_entries_multi(
-            ground, soils, cx, cy,
-            n_entries=min(P["n_entries_final"], 1200), method="Fellenius",
-            depth_min=depth_min, depth_max=depth_max,
-            interfaces=interfaces, allow_cross=allow_cross,
-            quick_mode=True, n_slices_quick=max(10, P["quick_slices"]),
+            ground, [Soil(*t) for t in params["soils"]], cx, cy,
+            n_entries=min(params["quality"]["n_entries_final"], 1200), method="Fellenius",
+            depth_min=params["depth"][0], depth_max=params["depth"][1],
+            interfaces=interfaces, allow_cross=params["allow_cross"],
+            quick_mode=True, n_slices_quick=max(10, params["quality"]["quick_slices"]),
             limit_arcs_per_center=per_center_limit,
-            probe_n_min=max(81, P["probe_n_min_quick"]),
+            probe_n_min=max(81, params["quality"]["probe_n_min_quick"]),
         ):
             arcs.append(dict(x1=a_x1,x2=a_x2,R=R,Fs=Fs,xc=cx,yc=cy))
             count+=1
@@ -345,7 +395,7 @@ def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
 
 audit_arcs=[]; covered=0; total=0
 if audit_show:
-    akey = hash_params(dict(K=st.session_state["last_key"], limit=audit_limit, budget=round(audit_budget,2), seed=int(audit_seed)))
+    akey = hash_params(dict(K=st.session_state["last_ui_hash"], limit=audit_limit, budget=round(audit_budget,2), seed=int(audit_seed)))
     cache = st.session_state.get("audit_cache", {})
     if cache.get("key")==akey and "arcs" in cache:
         audit_arcs=cache["arcs"]; covered=cache["covered"]; total=cache["total"]
@@ -427,6 +477,7 @@ if show_maxT and 0<=idx_maxT<len(refined):
     ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
 
 # axis & legend
+x_min, x_max, y_min, y_max, nx, ny = params["center"]
 x_upper = max(1.18*L, x_max + 0.05*L, 100.0)
 y_upper = max(2.30*H, y_max + 0.05*H, 100.0)
 ax.set_xlim(min(0.0 - 0.05*L, -2.0), x_upper)
