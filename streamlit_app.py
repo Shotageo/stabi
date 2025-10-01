@@ -67,9 +67,6 @@ def near_edge(xc, yc, x_min, x_max, y_min, y_max, tol=1e-9):
     return at_left or at_right or at_bottom or at_top, dict(left=at_left,right=at_right,bottom=at_bottom,top=at_top)
 
 # ===================== UI（キー付き） =====================
-# ※ フォームを使わず、外部の［計算開始］ボタンだけで確定・計算する
-
-# ---- 初期値のセット（一度だけ） ----
 def _init_once():
     ss = st.session_state
     ss.setdefault("ui_H", 25.0)
@@ -89,7 +86,6 @@ def _init_once():
     ss.setdefault("ui_override", False)
     ss.setdefault("ui_depth_min", 0.5)
     ss.setdefault("ui_depth_max", 4.0)
-    # overrideの値
     P0 = QUALITY[ss["ui_quality_label"]]
     ss.setdefault("ui_quick_slices", P0["quick_slices"])
     ss.setdefault("ui_final_slices", P0["final_slices"])
@@ -98,10 +94,8 @@ def _init_once():
     ss.setdefault("ui_limit_arcs_q", P0["limit_arcs_quick"])
     ss.setdefault("ui_budget_coarse", P0["budget_coarse_s"])
     ss.setdefault("ui_budget_quick", P0["budget_quick_s"])
-    # 実行フラグ・確定値
     ss.setdefault("compute_request", False)
     if "committed_params" not in ss:
-        # 初回はデフォルトで確定しておく（初期表示のため）
         params = build_params_from_ui()
         ss["committed_params"] = params
         ss["last_ui_hash"] = hash_params(params)
@@ -142,7 +136,7 @@ def build_params_from_ui():
 
 _init_once()
 
-# ---- UI レイアウト（数値入力は全部 key=... でセッション管理） ----
+# ---- UI ----
 A, B = st.columns(2)
 with A:
     st.subheader("Geometry")
@@ -153,7 +147,6 @@ with A:
     st.selectbox("Number of layers", [1,2,3], key="ui_layers")
 
     st.subheader("Soils (top→bottom)")
-    # γ, c, φ を列挙
     for i in range(st.session_state["ui_layers"]):
         g,c,phi = st.session_state["ui_soils"][i]
         cols = st.columns(3)
@@ -200,18 +193,18 @@ with B:
     st.number_input("Depth min (m)", min_value=0.0, max_value=50.0, step=0.5, key="ui_depth_min")
     st.number_input("Depth max (m)", min_value=0.5, max_value=50.0, step=0.5, key="ui_depth_max")
 
-# ---- 計算開始ボタン（外部・on_clickでフラグだけ立てる） ----
+# ---- 計算開始ボタン（on_clickでフラグだけ立てる） ----
 def _request_compute():
     st.session_state["compute_request"] = True
 st.button("▶ 計算開始", type="primary", on_click=_request_compute)
 
-# ---- UI変更と確定値の差分通知 ----
+# ---- UI変更と未反映通知 ----
 ui_params = build_params_from_ui()
 ui_hash = hash_params(ui_params)
 if ui_hash != st.session_state.get("last_ui_hash", ""):
     st.info("パラメータは変更されていますが、**まだ計算に反映されていません**。［▶ 計算開始］で確定します。")
 
-# ===================== 以降は「確定パラメータ」だけを使用 =====================
+# ===================== 確定パラメータだけで計算 =====================
 def build_scene(H,L,n_layers):
     ground = make_ground_example(H, L)
     interfaces=[]
@@ -299,15 +292,21 @@ def compute_once(params):
         if not R_candidates:
             return dict(error="Quickで円弧候補なし。深さ/進入可/Qualityを緩めてください。")
 
-    # Refine
+    # -------- Refine（★修正：interfaces を正しく渡す） --------
     refined=[]
     for R in R_candidates[:P["show_k"]]:
-        Fs_val = fs_given_R_multi(ground, [], [Soil(*t) for t in params["soils"]], allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
+        Fs_val = fs_given_R_multi(
+            ground, interfaces, [Soil(*t) for t in params["soils"]],
+            allow_cross, method, xc, yc, R, n_slices=P["final_slices"]
+        )
         if Fs_val is None: continue
         s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
         if s is None: continue
         x1,x2,*_ = s
-        packD = driving_sum_for_R_multi(ground, [], [Soil(*t) for t in params["soils"]], allow_cross, xc, yc, R, n_slices=P["final_slices"])
+        packD = driving_sum_for_R_multi(
+            ground, interfaces, [Soil(*t) for t in params["soils"]],
+            allow_cross, xc, yc, R, n_slices=P["final_slices"]
+        )
         if packD is None: continue
         D_sum,_,_ = packD
         T_req = max(0.0, (params["Fs_target"] - Fs_val)*D_sum)
@@ -331,7 +330,6 @@ def compute_once(params):
 
 # ---- 実行条件：初回 or compute_request=True のときだけ計算 ----
 if ("res" not in st.session_state) or st.session_state.get("compute_request", False):
-    # ボタン押下時：UIを確定→計算
     if st.session_state.get("compute_request", False):
         st.session_state["committed_params"] = ui_params
         st.session_state["last_ui_hash"] = ui_hash
@@ -350,7 +348,7 @@ Fs_target = params["Fs_target"]; method=params["method"]; n_layers=params["n_lay
 L=params["L"]; H=params["H"]
 quality_label = params["quality_label"]
 
-# ---------------- 表示オプション（表示だけ。計算は走らない） ----------------
+# ---------------- 表示オプション ----------------
 st.subheader("表示オプション")
 c1,c2,c3,c4 = st.columns([1,1,1,2])
 with c1:
@@ -366,7 +364,7 @@ with c4:
     audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality_label]["audit_budget_s"], 0.1, disabled=not audit_show)
     audit_seed   = st.number_input("Audit seed", 0, 9999, 0, disabled=not audit_show)
 
-# ---------------- Audit computation（可視化だけ。確定Pで） ----------------
+# ---------------- Audit computation ----------------
 def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
     rng = random.Random(int(seed))
     order = list(range(len(centers)))
@@ -413,20 +411,20 @@ Yg = ground.y_at(Xd)
 if n_layers==1:
     ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
 elif n_layers==2:
-    Y1 = clip_interfaces_to_ground(ground, [make_interface1_example(H,L)], Xd)[0]
+    Y1 = clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
     ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
     ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
 else:
-    Y1,Y2 = clip_interfaces_to_ground(ground, [make_interface1_example(H,L), make_interface2_example(H,L)], Xd)
+    Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0], interfaces[1]], Xd)
     ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
     ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
     ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
 
 ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if n_layers>=2:
-    ax.plot(Xd, clip_interfaces_to_ground(ground, [make_interface1_example(H,L)], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
+    ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
 if n_layers>=3:
-    ax.plot(Xd, clip_interfaces_to_ground(ground, [make_interface1_example(H,L), make_interface2_example(H,L)], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
+    ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0], interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
 
 # 外周
 ax.plot([ground.X[-1], ground.X[-1]],[0.0, ground.y_at(ground.X[-1])], linewidth=1.0)
