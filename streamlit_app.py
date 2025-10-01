@@ -1,4 +1,4 @@
-# streamlit_app.py — Turbo v2: Coarse center pass → Quick pass (time budgeted), cached R-candidates
+# streamlit_app.py — Turbo v2 (FIX): Coarse→Quick（二段選定）＋タイムバジェット＋堅牢キャッシュ
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time
@@ -7,7 +7,9 @@ import matplotlib.pyplot as plt
 from stabi_lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
-    arcs_from_center_by_entries_multi, clip_interfaces_to_ground, fs_given_R_multi
+    arcs_from_center_by_entries_multi, clip_interfaces_to_ground, fs_given_R_multi,
+    # 表示用: 端点取得
+    arc_sample_poly_best_pair,
 )
 
 st.set_page_config(page_title="Stabi LEM（Turbo v2）", layout="wide")
@@ -93,7 +95,6 @@ with st.form("params"):
         budget_coarse_s  = st.slider("Budget: Coarse (sec)", 0.1, 5.0, 0.6, 0.1)
         budget_quick_s   = st.slider("Budget: Quick (sec)", 0.1, 5.0, 0.8, 0.1)
 
-        # Center picking（保持）
         if "pick_mode" not in st.session_state:
             st.session_state["pick_mode"] = "Max arcs (robust)"
         mode = st.radio("Center picking", ["Max arcs (robust)", "Min Fs (aggressive)"],
@@ -105,13 +106,16 @@ if not run:
     st.info("パラメータを調整して **[▶ 計算開始]** を押してね。実行まで再計算しません。")
     st.stop()
 
-# =============== 便利：Quick候補Rのキャッシュ（地形×層×進入×中央座標×Quick設定） ===============
+# =============== キャッシュ：辞書（堅牢） ===============
+@st.cache_resource(show_spinner=False)
+def _quick_R_cache():
+    return {}  # dict[key_tuple] = list_of_R
+
 def _hash_key_for_Rcache(ground, interfaces, soils, allow_cross, xc, yc,
                          n_entries_final, n_slices_quick, limit_arcs_quick, probe_n_min_quick,
                          depth_min, depth_max):
-    # 簡易ハッシュ（十分一意になるように丸め）
-    def arr(a): return tuple(np.round(a, 6).tolist())
-    def soil_pack(s): return (round(s.gamma,6), round(s.c,6), round(s.phi,6))
+    def arr(a): return tuple(np.round(np.asarray(a), 6).tolist())
+    def soil_pack(s: Soil): return (round(s.gamma,6), round(s.c,6), round(s.phi,6))
     key = (
         arr(ground.X), arr(ground.Y),
         tuple((arr(i.X), arr(i.Y)) for i in interfaces),
@@ -123,14 +127,8 @@ def _hash_key_for_Rcache(ground, interfaces, soils, allow_cross, xc, yc,
     )
     return key
 
-@st.cache_data(show_spinner=False, max_entries=128)
-def cached_quick_R_candidates(key):
-    # dummy body — 実際の評価は呼び出し側で渡す
-    return None
-
-# =============== Coarse：疎グリッド×超軽量×時間打切りでセンター当て ===============
-def coarse_centers(x_min, x_max, y_min, y_max, nx, ny, mode):
-    # 疎化
+# =============== Coarse：疎グリッド×超軽量×時間打切り ===============
+def coarse_centers(x_min, x_max, y_min, y_max, nx, ny):
     xs = np.linspace(x_min, x_max, nx)
     ys = np.linspace(y_min, y_max, ny)
     if coarse_subsample == "every 2nd":
@@ -142,7 +140,6 @@ def coarse_centers(x_min, x_max, y_min, y_max, nx, ny, mode):
     return [(float(xc), float(yc)) for yc in ys for xc in xs]
 
 def coarse_score(center, deadline):
-    """戻り値：(score, Fs_min, cnt) / scoreはモード依存"""
     xc, yc = center
     cnt = 0
     Fs_min = None
@@ -164,10 +161,10 @@ def coarse_score(center, deadline):
     score = cnt if mode=="Max arcs (robust)" else -Fs_min
     return score, Fs_min, cnt
 
-def pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, mode, budget_s):
+def pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, budget_s):
     deadline = time.time() + budget_s
     best = None
-    for c in coarse_centers(x_min, x_max, y_min, y_max, nx, ny, mode):
+    for c in coarse_centers(x_min, x_max, y_min, y_max, nx, ny):
         score, Fs_min, cnt = coarse_score(c, deadline)
         if best is None:
             best = (score, Fs_min, cnt, c)
@@ -182,15 +179,17 @@ def pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, mode, budget_s):
             break
     return best[3] if best else None
 
-# =============== Quick：選ばれたセンター1〜数個だけ詳細Quick ===============
+# =============== Quick：候補Rをキャッシュつきで取得（時間打切り） ===============
 def quick_R_candidates_for_center(center):
     xc, yc = center
-    key = _hash_key_for_Rcache(ground, interfaces, soils, allow_cross, xc, yc,
-                               n_entries_final, n_slices_quick, limit_arcs_quick, probe_n_min_quick,
-                               depth_min, depth_max)
-    cached = cached_quick_R_candidates(key)
-    if cached is not None:
-        return cached
+    key = _hash_key_for_Rcache(
+        ground, interfaces, soils, allow_cross, xc, yc,
+        n_entries_final, n_slices_quick, limit_arcs_quick, probe_n_min_quick,
+        depth_min, depth_max
+    )
+    cache = _quick_R_cache()
+    if key in cache:
+        return cache[key]
 
     heap_R = []  # (-Fs, R)
     q_deadline = time.time() + budget_quick_s
@@ -210,15 +209,12 @@ def quick_R_candidates_for_center(center):
             break
 
     R_list = [r for _fsneg, r in sorted([(-fsneg, R) for fsneg, R in heap_R], key=lambda t:t[0])]
-    cached_quick_R_candidates(key, ttl=600)  # set cache
-    st.cache_data.clear()  # ensure function decorated; above call sets return None, so:
-    @st.cache_data(show_spinner=False, max_entries=128)
-    def _set(key, val): return val
-    return _set(key, R_list)
+    cache[key] = R_list  # set
+    return R_list
 
 # =============== 1) Coarse でセンター当て ===============
 with st.spinner("Coarse pass（超軽量・時間打切り）..."):
-    center_coarse = pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, mode, budget_coarse_s)
+    center_coarse = pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, budget_coarse_s)
 if center_coarse is None:
     st.error("Coarse段でセンターが見つかりません。範囲や制約を見直してください。")
     st.stop()
@@ -233,16 +229,14 @@ if len(R_candidates) == 0:
     st.error("Quick段で有効な円弧候補がありません。条件を緩めてください。")
     st.stop()
 
-# =============== 3) 精密再評価（Bishop/Fellenius、ベクタっぽく） ===============
+# =============== 3) 精密再評価（Bishop/Fellenius） ===============
 refined = []
 for R in R_candidates[:show_k]:
     Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=n_slices_final)
-    if Fs is None: 
+    if Fs is None:
         continue
-    # 表示用端点を得る（軽量）
-    from stabi_lem import arc_sample_poly_best_pair
     s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
-    if s is None: 
+    if s is None:
         continue
     x1, x2, xs, ys, h = s
     refined.append((Fs, (x1, x2, R)))
@@ -310,12 +304,12 @@ ax.grid(True); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
 ax.legend(loc="upper right", fontsize=9)
 ax.set_title(
     f"[{mode}] Center=({xc:.2f},{yc:.2f}) • Method={method} • "
-    f"Shown={len(thin_all)} arcs (refined), top {min(top_thick,len(thin_all))} thick"
+    f"Shown={len(thin_all)} arcs (refined), top {min(top_thick,len(refined))} thick • MinFs={minFs_val:.3f}"
 )
 st.pyplot(fig, use_container_width=True)
 plt.close(fig)
 
 # メトリクス
 c1, c2 = st.columns(2)
-with c1: st.metric("Min Fs（精密）", f"{min(thin_all, key=lambda t:t[0])[0]:.3f}")
-with c2: st.caption("Coarse→Quick の二段でセンターを決定（時間打切りあり）")
+with c1: st.metric("Min Fs（精密）", f"{minFs_val:.3f}")
+with c2: st.caption("Coarse→Quick の二段でセンターを決定（時間打切り＋キャッシュ）")
