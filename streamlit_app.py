@@ -199,13 +199,6 @@ def compute_once():
     xc, yc = center
 
     # 端ヒットなら監査用に外側へ一段拡張（計算枠はそのまま）
-    def near_edge(xc, yc, x_min, x_max, y_min, y_max, tol=1e-9):
-        at_left  = abs(xc - x_min) < tol
-        at_right = abs(xc - x_max) < tol
-        at_bottom= abs(yc - y_min) < tol
-        at_top   = abs(yc - y_max) < tol
-        return at_left or at_right or at_bottom or at_top, dict(left=at_left,right=at_right,bottom=at_bottom,top=at_top)
-
     hit, where = near_edge(xc,yc,x_min,x_max,y_min,y_max)
     expand_note = None
     x_min_a, x_max_a, y_min_a, y_max_a = x_min, x_max, y_min, y_max
@@ -287,7 +280,7 @@ with c3:
     show_minFs = st.checkbox("Show Min Fs", True)
     show_maxT  = st.checkbox("Show Max required T", True)
 with c4:
-    # 既定OFFに変更（重さの主犯を封じる）
+    # 既定OFF（重さの主犯を封じる）
     audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
     audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality]["audit_limit_per_center"], 1, disabled=not audit_show)
     audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality]["audit_budget_s"], 0.1, disabled=not audit_show)
@@ -296,7 +289,7 @@ with c4:
 # ---------------- Audit computation (round-robin-ish) ----------------
 def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
     rng = random.Random(int(seed))
-    order = list(range(len(centers))))
+    order = list(range(len(centers)))  # ← 余計な ) を削除
     rng.shuffle(order)  # 偏り防止
     deadline = time.time() + total_budget_s
     arcs=[]; covered=set()
@@ -420,7 +413,9 @@ ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="uppe
 
 title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}"]
 if "expand_note" in res and res["expand_note"]: title_tail.append(res["expand_note"])
-if audit_show: title_tail.append(f"audit cover {covered}/{total} centers, arcs={len(audit_arcs)}")
+# covered/total は audit_show True のときだけ追加
+if 'audit_arcs' in locals() and audit_show:
+    title_tail.append(f"audit cover {covered}/{total} centers, arcs={len(audit_arcs)}")
 ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • Method={method} • " + " • ".join(title_tail))
 
 st.pyplot(fig, use_container_width=True); plt.close(fig)
