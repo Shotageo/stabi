@@ -1,4 +1,4 @@
-# streamlit_app.py — audit改善・端ヒット時の自動拡張・被覆率表示
+　# streamlit_app.py — audit改善・端ヒット時の自動拡張・被覆率表示
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random
