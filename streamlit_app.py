@@ -1,4 +1,4 @@
-# streamlit_app.py — Turbo v2 (FIX): Coarse→Quick（二段選定）＋タイムバジェット＋堅牢キャッシュ
+# streamlit_app.py — Quality 1ノブ化（Coarse/Normal/Fine/Very-fine）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time
@@ -8,21 +8,59 @@ from stabi_lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
     arcs_from_center_by_entries_multi, clip_interfaces_to_ground, fs_given_R_multi,
-    # 表示用: 端点取得
-    arc_sample_poly_best_pair,
+    arc_sample_poly_best_pair,  # 表示用端点
 )
 
-st.set_page_config(page_title="Stabi LEM（Turbo v2）", layout="wide")
-st.title("Stabi LEM｜Turbo v2：Coarse→Quick（二段選定）＋タイムバジェット")
+st.set_page_config(page_title="Stabi LEM（Qualityダイヤル）", layout="wide")
+st.title("Stabi LEM｜Qualityダイヤル：Coarse / Normal / Fine / Very-fine")
 
-# =============== UI 一括フォーム ===============
+# ================== Quality プリセット ==================
+QUALITY = {
+    # 速いが粗い（現場スマホ） — まず“見える”を優先
+    "Coarse": dict(
+        quick_slices=10, final_slices=30,
+        n_entries_final=800, probe_n_min_quick=81,
+        limit_arcs_quick=80, show_k=60, top_thick=10,
+        coarse_subsample="every 3rd", coarse_entries=150,
+        coarse_limit_arcs=50, coarse_probe_min=61,
+        budget_coarse_s=0.5, budget_quick_s=0.7,
+    ),
+    # 既定（実務の初期評価）
+    "Normal": dict(
+        quick_slices=12, final_slices=40,
+        n_entries_final=1200, probe_n_min_quick=101,
+        limit_arcs_quick=120, show_k=120, top_thick=12,
+        coarse_subsample="every 2nd", coarse_entries=200,
+        coarse_limit_arcs=60, coarse_probe_min=81,
+        budget_coarse_s=0.6, budget_quick_s=0.8,
+    ),
+    # 詳細評価（提出草案）
+    "Fine": dict(
+        quick_slices=16, final_slices=50,
+        n_entries_final=1600, probe_n_min_quick=121,
+        limit_arcs_quick=160, show_k=180, top_thick=16,
+        coarse_subsample="full", coarse_entries=300,
+        coarse_limit_arcs=100, coarse_probe_min=101,
+        budget_coarse_s=1.0, budget_quick_s=1.2,
+    ),
+    # 最終確定（感度小さめ）
+    "Very-fine": dict(
+        quick_slices=20, final_slices=60,
+        n_entries_final=2200, probe_n_min_quick=141,
+        limit_arcs_quick=220, show_k=240, top_thick=20,
+        coarse_subsample="full", coarse_entries=400,
+        coarse_limit_arcs=140, coarse_probe_min=121,
+        budget_coarse_s=1.6, budget_quick_s=2.0,
+    ),
+}
+
+# ================== UI（フォーム一括） ==================
 with st.form("params"):
     colA, colB = st.columns(2)
     with colA:
         st.subheader("Geometry")
         H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5)
         L = st.number_input("L (m)", 5.0, 400.0, 60.0, 0.5)
-
         ground = make_ground_example(H, L)
 
         st.subheader("Layers")
@@ -49,10 +87,9 @@ with st.form("params"):
             c3     = st.number_input("c₃ (kPa)",   0.0, 200.0, 12.0, 0.5)
             phi3   = st.number_input("φ₃ (deg)",   0.0, 45.0, 25.0, 0.5)
             soil3  = Soil(gamma=gamma3, c=c3, phi=phi3)
-
         soils = [soil1] + ([soil2] if n_layers>=2 else []) + ([soil3] if n_layers>=3 else [])
 
-        st.subheader("Crossing control (下層へ進入可否)")
+        st.subheader("Crossing control（下層進入可否）")
         allow_cross = []
         if n_layers >= 2:
             allow_cross.append(st.checkbox("Allow crossing into Layer 2 (below Interface 1)", True))
@@ -60,7 +97,7 @@ with st.form("params"):
             allow_cross.append(st.checkbox("Allow crossing into Layer 3 (below Interface 2)", False))
 
     with colB:
-        st.subheader("Center grid (初期枠)")
+        st.subheader("Center grid（初期枠）")
         x_min = st.number_input("Center x min", 0.20*L, 3.00*L, 0.25*L, 0.05*L)
         x_max = st.number_input("Center x max", 0.30*L, 4.00*L, 1.15*L, 0.05*L)
         y_min = st.number_input("Center y min", 0.80*H, 7.00*H, 1.60*H, 0.10*H)
@@ -68,45 +105,60 @@ with st.form("params"):
         nx = st.slider("Grid nx", 6, 60, 14)
         ny = st.slider("Grid ny", 4, 40, 9)
 
-        st.subheader("Fan parameters")
+        st.subheader("Method / Quality")
         method = st.selectbox("Method", ["Bishop (simplified)", "Fellenius"])
+        quality = st.select_slider("Quality (精度×速度)", options=list(QUALITY.keys()), value="Normal")
+
+        # ====== Advanced（上級設定・必要なときだけ上書き） ======
+        with st.expander("Advanced（上級設定・Qualityを上書き）", expanded=False):
+            override = st.checkbox("上級設定で Quality を上書きする", value=False)
+            cols1 = st.columns(2)
+            with cols1[0]:
+                quick_slices_in  = st.slider("Quick slices", 6, 40, QUALITY[quality]["quick_slices"], 1, disabled=not override)
+                final_slices_in  = st.slider("Final slices", 20, 80, QUALITY[quality]["final_slices"], 2, disabled=not override)
+                n_entries_final_in = st.slider("Final n_entries", 200, 4000, QUALITY[quality]["n_entries_final"], 100, disabled=not override)
+                show_k_in        = st.slider("Plot top-K arcs (refined)", 10, 600, QUALITY[quality]["show_k"], 10, disabled=not override)
+                top_thick_in     = st.slider("Emphasize top-N thick", 1, 50, QUALITY[quality]["top_thick"], 1, disabled=not override)
+            with cols1[1]:
+                probe_min_q_in   = st.slider("Quick: min probe points / arc", 41, 221, QUALITY[quality]["probe_n_min_quick"], 10, disabled=not override)
+                limit_arcs_q_in  = st.slider("Quick: max arcs / center", 20, 400, QUALITY[quality]["limit_arcs_quick"], 10, disabled=not override)
+                coarse_subsample_in = st.selectbox("Coarse subsample", ["every 3rd","every 2nd","full"],
+                                                   index=["every 3rd","every 2nd","full"].index(QUALITY[quality]["coarse_subsample"]),
+                                                   disabled=not override)
+                coarse_entries_in = st.slider("Coarse n_entries", 50, 800, QUALITY[quality]["coarse_entries"], 50, disabled=not override)
+                coarse_limit_in   = st.slider("Coarse: max arcs / center", 20, 300, QUALITY[quality]["coarse_limit_arcs"], 10, disabled=not override)
+                coarse_probe_in   = st.slider("Coarse: min probe points / arc", 41, 181, QUALITY[quality]["coarse_probe_min"], 10, disabled=not override)
+            cols2 = st.columns(2)
+            with cols2[0]:
+                budget_coarse_in = st.slider("Budget: Coarse (sec)", 0.1, 4.0, QUALITY[quality]["budget_coarse_s"], 0.1, disabled=not override)
+            with cols2[1]:
+                budget_quick_in  = st.slider("Budget: Quick (sec)", 0.1, 4.0, QUALITY[quality]["budget_quick_s"], 0.1, disabled=not override)
+
+        st.subheader("Depth range（鉛直深さ）")
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
         depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5)
 
-        st.subheader("Turbo v2 settings")
-        n_entries_final = st.slider("Final n_entries (ground samples)", 200, 3000, 1200, 100)
-        n_slices_quick  = st.slider("Quick slices", 8, 40, 12, 1)
-        n_slices_final  = st.slider("Final slices", 20, 80, 40, 5)
-        limit_arcs_quick = st.slider("Quick: max arcs per center", 40, 400, 120, 10)
-        probe_n_min_quick = st.slider("Quick: min probe points per arc", 61, 221, 101, 10,
-                                      help="円弧サンプル点の最小値。小さいほど速いが粗い")
-        show_k    = st.slider("Plot top-K arcs (refined)", 10, 400, 120, 10)
-        top_thick = st.slider("Emphasize top-N thick", 1, 30, 12, 1)
         show_radii = st.checkbox("Show radii to both ends", True)
 
-        # センター選定のCoarse設定とタイムバジェット
-        coarse_subsample = st.selectbox("Coarse subsample", ["every 2nd", "every 3rd", "full"], index=0,
-                                        help="センター探索の疎化（Coarse）")
-        coarse_entries   = st.slider("Coarse n_entries", 50, 600, 200, 50)
-        coarse_limit_arcs= st.slider("Coarse: max arcs per center", 20, 200, 60, 10)
-        coarse_probe_min = st.slider("Coarse: min probe points per arc", 41, 161, 81, 10)
-
-        st.subheader("Time budget")
-        budget_coarse_s  = st.slider("Budget: Coarse (sec)", 0.1, 5.0, 0.6, 0.1)
-        budget_quick_s   = st.slider("Budget: Quick (sec)", 0.1, 5.0, 0.8, 0.1)
-
-        if "pick_mode" not in st.session_state:
-            st.session_state["pick_mode"] = "Max arcs (robust)"
-        mode = st.radio("Center picking", ["Max arcs (robust)", "Min Fs (aggressive)"],
-                        horizontal=True, key="pick_mode")
-
-    run = st.form_submit_button("▶ 計算開始（Turbo v2）")
+    run = st.form_submit_button("▶ 計算開始")
 
 if not run:
-    st.info("パラメータを調整して **[▶ 計算開始]** を押してね。実行まで再計算しません。")
+    st.info("パラメータを調整して **[▶ 計算開始]** を押してね（実行まで再計算しません）。")
     st.stop()
 
-# =============== キャッシュ：辞書（堅牢） ===============
+# ===== Quality → 実値へ（Advancedで上書き可） =====
+P = QUALITY[quality].copy()
+if 'override' in locals() and override:
+    P.update(dict(
+        quick_slices=quick_slices_in, final_slices=final_slices_in,
+        n_entries_final=n_entries_final_in, probe_n_min_quick=probe_min_q_in,
+        limit_arcs_quick=limit_arcs_q_in, show_k=show_k_in, top_thick=top_thick_in,
+        coarse_subsample=coarse_subsample_in, coarse_entries=coarse_entries_in,
+        coarse_limit_arcs=coarse_limit_in, coarse_probe_min=coarse_probe_in,
+        budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
+    ))
+
+# ================== Quick候補のキャッシュ（堅牢：resource dict） ==================
 @st.cache_resource(show_spinner=False)
 def _quick_R_cache():
     return {}  # dict[key_tuple] = list_of_R
@@ -122,133 +174,120 @@ def _hash_key_for_Rcache(ground, interfaces, soils, allow_cross, xc, yc,
         tuple(soil_pack(s) for s in soils),
         tuple(bool(x) for x in allow_cross),
         round(xc,6), round(yc,6),
-        int(n_entries_final), int(n_slices_quick), int(limit_arcs_quick), int(probe_n_min_quick),
+        int(n_slices_quick), int(n_entries_final), int(limit_arcs_quick), int(probe_n_min_quick),
         round(depth_min,3), round(depth_max,3),
     )
     return key
 
-# =============== Coarse：疎グリッド×超軽量×時間打切り ===============
-def coarse_centers(x_min, x_max, y_min, y_max, nx, ny):
+# ================== Coarse（疎） ==================
+def _coarse_centers(x_min, x_max, y_min, y_max, nx, ny, subsample: str):
     xs = np.linspace(x_min, x_max, nx)
     ys = np.linspace(y_min, y_max, ny)
-    if coarse_subsample == "every 2nd":
-        xs = xs[::2] if len(xs)>1 else xs
-        ys = ys[::2] if len(ys)>1 else ys
-    elif coarse_subsample == "every 3rd":
+    if subsample == "every 3rd":
         xs = xs[::3] if len(xs)>2 else xs
         ys = ys[::3] if len(ys)>2 else ys
+    elif subsample == "every 2nd":
+        xs = xs[::2] if len(xs)>1 else xs
+        ys = ys[::2] if len(ys)>1 else ys
     return [(float(xc), float(yc)) for yc in ys for xc in xs]
 
-def coarse_score(center, deadline):
+def _coarse_score(center, deadline):
     xc, yc = center
     cnt = 0
     Fs_min = None
     for _x1, _x2, _R, Fs in arcs_from_center_by_entries_multi(
         ground, soils, xc, yc,
-        n_entries=coarse_entries, method="Fellenius",
+        n_entries=P["coarse_entries"], method="Fellenius",
         depth_min=depth_min, depth_max=depth_max,
         interfaces=interfaces, allow_cross=allow_cross,
-        quick_mode=True, n_slices_quick=max(8, n_slices_quick//2),
-        limit_arcs_per_center=coarse_limit_arcs,
-        probe_n_min=coarse_probe_min,
+        quick_mode=True, n_slices_quick=max(8, P["quick_slices"]//2),
+        limit_arcs_per_center=P["coarse_limit_arcs"],
+        probe_n_min=P["coarse_probe_min"],
     ):
         cnt += 1
         if (Fs_min is None) or (Fs < Fs_min):
             Fs_min = Fs
-        if time.time() > deadline:
-            break
+        if time.time() > deadline: break
     if Fs_min is None: Fs_min = float("inf")
-    score = cnt if mode=="Max arcs (robust)" else -Fs_min
+    # センター選定モード：Qualityに合わせて頑健に “件数” を重視
+    score = cnt
     return score, Fs_min, cnt
 
 def pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, budget_s):
     deadline = time.time() + budget_s
     best = None
-    for c in coarse_centers(x_min, x_max, y_min, y_max, nx, ny):
-        score, Fs_min, cnt = coarse_score(c, deadline)
-        if best is None:
+    for c in _coarse_centers(x_min, x_max, y_min, y_max, nx, ny, P["coarse_subsample"]):
+        score, Fs_min, cnt = _coarse_score(c, deadline)
+        if (best is None) or (score > best[0]) or (score==best[0] and Fs_min < best[1]):
             best = (score, Fs_min, cnt, c)
-        else:
-            if mode=="Max arcs (robust)":
-                if (score > best[0]) or (score==best[0] and (Fs_min < best[1])):
-                    best = (score, Fs_min, cnt, c)
-            else:
-                if (score > best[0]) or (score==best[0] and (cnt > best[2])):
-                    best = (score, Fs_min, cnt, c)
-        if time.time() > deadline:
-            break
+        if time.time() > deadline: break
     return best[3] if best else None
 
-# =============== Quick：候補Rをキャッシュつきで取得（時間打切り） ===============
+# ================== Quick（候補R抽出：時間打切り＋キャッシュ） ==================
 def quick_R_candidates_for_center(center):
     xc, yc = center
     key = _hash_key_for_Rcache(
         ground, interfaces, soils, allow_cross, xc, yc,
-        n_entries_final, n_slices_quick, limit_arcs_quick, probe_n_min_quick,
+        P["n_entries_final"], P["quick_slices"], P["limit_arcs_quick"], P["probe_n_min_quick"],
         depth_min, depth_max
     )
     cache = _quick_R_cache()
     if key in cache:
         return cache[key]
 
-    heap_R = []  # (-Fs, R)
-    q_deadline = time.time() + budget_quick_s
+    heap_R = []  # (-Fs_quick, R)
+    q_deadline = time.time() + P["budget_quick_s"]
     for _x1, _x2, R, Fs in arcs_from_center_by_entries_multi(
         ground, soils, xc, yc,
-        n_entries=n_entries_final, method="Fellenius",
+        n_entries=P["n_entries_final"], method="Fellenius",
         depth_min=depth_min, depth_max=depth_max,
         interfaces=interfaces, allow_cross=allow_cross,
-        quick_mode=True, n_slices_quick=n_slices_quick,
-        limit_arcs_per_center=limit_arcs_quick,
-        probe_n_min=probe_n_min_quick,
+        quick_mode=True, n_slices_quick=P["quick_slices"],
+        limit_arcs_per_center=P["limit_arcs_quick"],
+        probe_n_min=P["probe_n_min_quick"],
     ):
         heapq.heappush(heap_R, (-Fs, R))
-        if len(heap_R) > max(show_k, top_thick + 20):
+        if len(heap_R) > max(P["show_k"], P["top_thick"] + 20):
             heapq.heappop(heap_R)
-        if time.time() > q_deadline:
-            break
+        if time.time() > q_deadline: break
 
     R_list = [r for _fsneg, r in sorted([(-fsneg, R) for fsneg, R in heap_R], key=lambda t:t[0])]
-    cache[key] = R_list  # set
+    cache[key] = R_list
     return R_list
 
-# =============== 1) Coarse でセンター当て ===============
-with st.spinner("Coarse pass（超軽量・時間打切り）..."):
-    center_coarse = pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, budget_coarse_s)
-if center_coarse is None:
+# ================== 1) Coarse：センター当て ==================
+with st.spinner("Coarse pass（疎・時間打切り）..."):
+    center = pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, P["budget_coarse_s"])
+if center is None:
     st.error("Coarse段でセンターが見つかりません。範囲や制約を見直してください。")
     st.stop()
+xc, yc = center
 
-xc, yc = center_coarse
-x_min_u, x_max_u, y_min_u, y_max_u = x_min, x_max, y_min, y_max  # Coarseでは拡張なし（高速優先）
-
-# =============== 2) Quick で候補Rを抽出（キャッシュ/時間打切り） ===============
-with st.spinner("Quick pass（候補抽出・時間打切り）..."):
-    R_candidates = quick_R_candidates_for_center(center_coarse)
-if len(R_candidates) == 0:
+# ================== 2) Quick：候補R抽出 ==================
+with st.spinner("Quick pass（候補R抽出・時間打切り）..."):
+    R_candidates = quick_R_candidates_for_center(center)
+if len(R_candidates)==0:
     st.error("Quick段で有効な円弧候補がありません。条件を緩めてください。")
     st.stop()
 
-# =============== 3) 精密再評価（Bishop/Fellenius） ===============
+# ================== 3) 精密再評価（Bishop/Fellenius） ==================
 refined = []
-for R in R_candidates[:show_k]:
-    Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=n_slices_final)
-    if Fs is None:
-        continue
+for R in R_candidates[:P["show_k"]]:
+    Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
+    if Fs is None: continue
     s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
-    if s is None:
-        continue
+    if s is None: continue
     x1, x2, xs, ys, h = s
     refined.append((Fs, (x1, x2, R)))
 if len(refined)==0:
-    st.error("精密段で有効な円弧が得られませんでした。条件やタイムバジェットを調整してください。")
+    st.error("精密段で有効な円弧が得られませんでした。設定やQualityを見直してください。")
     st.stop()
 refined.sort(key=lambda t:t[0])
 thin_all = refined
-thick_sel = refined[:min(top_thick, len(refined))]
+thick_sel = refined[:min(P["top_thick"], len(refined))]
 minFs_val = refined[0][0]
 
-# =============== 可視化（軽量） ===============
+# ================== 可視化 ==================
 fig, ax = plt.subplots(figsize=(10, 7))
 Xdense = np.linspace(ground.X[0], ground.X[-1], 600)
 Yg = ground.y_at(Xdense)
@@ -264,6 +303,7 @@ else:
     ax.fill_between(Xdense, Y2, Y1, alpha=0.12, label="Layer2")
     ax.fill_between(Xdense, 0.0, Y2, alpha=0.12, label="Layer3")
 
+# 地表と外周
 ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if n_layers >= 2:
     Y1_line = clip_interfaces_to_ground(ground, [interfaces[0]], Xdense)[0]
@@ -271,21 +311,19 @@ if n_layers >= 2:
 if n_layers >= 3:
     Y1_line, Y2_line = clip_interfaces_to_ground(ground, [interfaces[0], interfaces[1]], Xdense)
     ax.plot(Xdense, Y2_line, linestyle="--", linewidth=1.4, label="Interface 2 (clipped)")
-
-# 外周枠
 ax.plot([ground.X[-1], ground.X[-1]], [0.0, ground.y_at(ground.X[-1])], linewidth=1.2)
 ax.plot([ground.X[0],  ground.X[-1]], [0.0, 0.0],                         linewidth=1.2)
 ax.plot([ground.X[0],  ground.X[0]],  [0.0, ground.y_at(ground.X[0])],    linewidth=1.2)
 
-# センター印
+# センター
 ax.scatter([xc], [yc], s=65, marker="s", label="Chosen center")
 
-# 扇
+# 扇（薄線=全候補 / 太線=上位N）
 for Fs, (x1, x2, R) in thin_all:
     xs_line = np.linspace(x1, x2, 200)
     ys_line = yc - np.sqrt(np.maximum(0.0, R*R - (xs_line - xc)**2))
     ax.plot(xs_line, ys_line, linewidth=0.6, alpha=0.30)
-    if show_radii:
+    if st.session_state.get("show_radii", True) or True:
         y1 = float(ground.y_at(x1)); y2 = float(ground.y_at(x2))
         ax.plot([xc, x1], [yc, y1], linewidth=0.35, alpha=0.25)
         ax.plot([xc, x2], [yc, y2], linewidth=0.35, alpha=0.25)
@@ -303,13 +341,13 @@ ax.set_aspect("equal", adjustable="box")
 ax.grid(True); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
 ax.legend(loc="upper right", fontsize=9)
 ax.set_title(
-    f"[{mode}] Center=({xc:.2f},{yc:.2f}) • Method={method} • "
-    f"Shown={len(thin_all)} arcs (refined), top {min(top_thick,len(refined))} thick • MinFs={minFs_val:.3f}"
+    f"Quality={quality} • Center=({xc:.2f},{yc:.2f}) • Method={method} • "
+    f"Shown={len(thin_all)} arcs, top {min(P['top_thick'],len(refined))} thick • MinFs={minFs_val:.3f}"
 )
 st.pyplot(fig, use_container_width=True)
 plt.close(fig)
 
 # メトリクス
-c1, c2 = st.columns(2)
-with c1: st.metric("Min Fs（精密）", f"{minFs_val:.3f}")
-with c2: st.caption("Coarse→Quick の二段でセンターを決定（時間打切り＋キャッシュ）")
+m1, m2 = st.columns(2)
+with m1: st.metric("Min Fs（精密）", f"{minFs_val:.3f}")
+with m2: st.caption("Qualityで精度×速度を一括制御。Advancedで個別上書き可。")
