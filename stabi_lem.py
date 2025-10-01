@@ -1,4 +1,4 @@
-# stabi_lem.py — LEM core with phreatic line (linear or polyline CSV)
+# stabi_lem.py — LEM core with phreatic line: linear / CSV polyline / ground-offset
 from __future__ import annotations
 import math
 import numpy as np
@@ -14,9 +14,11 @@ class Soil:
 class GroundPL:
     """Piecewise-linear ground surface. X, Y are 1D numpy arrays (monotonic in X)."""
     def __init__(self, X: np.ndarray, Y: np.ndarray):
-        self.X = np.asarray(X, dtype=float)
-        self.Y = np.asarray(Y, dtype=float)
-        assert len(self.X) >= 2 and self.X.shape == self.Y.shape
+        X = np.asarray(X, dtype=float); Y = np.asarray(Y, dtype=float)
+        assert len(X) >= 2 and X.shape == Y.shape
+        # enforce monotonic increasing X
+        order = np.argsort(X)
+        self.X = X[order]; self.Y = Y[order]
 
     def y_at(self, x: float) -> float:
         X, Y = self.X, self.Y
@@ -24,13 +26,13 @@ class GroundPL:
         if x >= X[-1]: return float(Y[-1])
         i = np.searchsorted(X, x) - 1
         i = max(0, min(i, len(X)-2))
-        t = (x - X[i]) / (X[i+1]-X[i])
+        t = (x - X[i]) / (X[i+1]-X[i] + 1e-12)
         return float((1-t)*Y[i] + t*Y[i+1])
 
 # ---------------- Example geometry ----------------
 def make_ground_example(H: float, L: float) -> GroundPL:
-    # やや折れた2段勾配（教育・検証用途の標準形）
-    X = np.array([0.0, 0.4*L, L])
+    # 2段勾配の標準形
+    X = np.array([0.0, 0.40*L, L])
     Y = np.array([H,   0.65*H, 0.0])
     return GroundPL(X, Y)
 
@@ -62,7 +64,7 @@ def clip_interfaces_to_ground(ground: GroundPL, interfaces: list[tuple[np.ndarra
 # ---------------- Water line (phreatic) ----------------
 @dataclass
 class WaterLine:
-    """Simple 2-point phreatic line (x=0->y0, x=L->y1), clipped to ground."""
+    """2点直線の水位線（x=0->y0, x=L->y1）、常に地表以下にクリップ。"""
     x0: float
     x1: float
     y0: float
@@ -71,18 +73,25 @@ class WaterLine:
         if x <= self.x0: y = self.y0
         elif x >= self.x1: y = self.y1
         else:
-            t = (x - self.x0) / (self.x1 - self.x0)
+            t = (x - self.x0) / (self.x1 - self.x0 + 1e-12)
             y = (1-t)*self.y0 + t*self.y1
-        return min(float(y), float(ground.y_at(x)))  # never above ground
+        return min(float(y), float(ground.y_at(x)))
 
 @dataclass
 class WaterPolyline:
-    """Phreatic line defined by arbitrary polyline (from CSV), clipped to ground."""
+    """CSV等で与える任意折れ線の水位線、常に地表以下にクリップ。"""
     X: np.ndarray  # sorted
     Y: np.ndarray
     def y_at(self, x: float, ground: GroundPL) -> float:
         y = float(np.interp(x, self.X, self.Y, left=self.Y[0], right=self.Y[-1]))
         return min(y, float(ground.y_at(x)))
+
+@dataclass
+class WaterOffset:
+    """地表面から一定オフセット（下向きが正：offset>0で地表−offset）。"""
+    offset: float
+    def y_at(self, x: float, ground: GroundPL) -> float:
+        return max(0.0, float(ground.y_at(x)) - float(self.offset))
 
 # ---------------- Helpers: circle/arc ----------------
 def _circle_y(x: np.ndarray, xc: float, yc: float, R: float) -> np.ndarray:
@@ -236,6 +245,7 @@ def arcs_from_center_by_entries_multi(
     quick_mode: bool=True, n_slices_quick: int=12,
     limit_arcs_per_center: int=120, probe_n_min: int=81,
     water=None, gamma_w: float=9.81, pore_mode: str="u-only",
+    tol_R: float=0.03,   # ← R一致の許容（救済で広げる）
 ):
     """Generate slip circles for a fixed center by pairing entry/exit points along ground."""
     L0, L1 = float(ground.X[0]), float(ground.X[-1])
@@ -244,7 +254,7 @@ def arcs_from_center_by_entries_multi(
 
     out = 0
     min_span = max(0.04*(L1-L0), 0.8)
-    step = max(1, len(Xs)//probe_n_min)
+    step = max(1, len(Xs)//max(1, int(probe_n_min)))
     for i in range(0, len(Xs)-2, step):
         x1 = float(Xs[i]); y1 = float(Yg[i])
         R1 = math.hypot(x1 - xc, y1 - yc)
@@ -252,7 +262,7 @@ def arcs_from_center_by_entries_multi(
             x2 = float(Xs[j]); y2 = float(Yg[j])
             if x2 - x1 < min_span: continue
             R2 = math.hypot(x2 - xc, y2 - yc)
-            if abs(R2 - R1) > 0.03*R1:  # 同一円近似
+            if abs(R2 - R1) > tol_R*max(R1,1e-6):
                 continue
             R = 0.5*(R1 + R2)
 
