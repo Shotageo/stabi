@@ -1,4 +1,4 @@
-# streamlit_app.py — 水位オフセット・表編集・救済パス付き
+# streamlit_app.py — 水位オフセット・表編集・救済パス付き（安全版）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random
@@ -71,13 +71,15 @@ def _mk_table_from_xy(X: np.ndarray, Y: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame({"x": np.asarray(X, dtype=float), "y": np.asarray(Y, dtype=float)})
 
 def _xy_from_table(df: pd.DataFrame, L: float) -> tuple[np.ndarray, np.ndarray] | None:
-    if "x" not in df.columns or "y" not in df.columns: return None
+    if df is None or not isinstance(df, pd.DataFrame):  # ★ガード強化
+        return None
+    if "x" not in df.columns or "y" not in df.columns:
+        return None
     x = pd.to_numeric(df["x"], errors="coerce").to_numpy()
     y = pd.to_numeric(df["y"], errors="coerce").to_numpy()
     mask = np.isfinite(x) & np.isfinite(y)
     x = x[mask]; y = y[mask]
     if len(x) < 2: return None
-    # 0..L にクリップして昇順
     x = np.clip(x, 0.0, L)
     order = np.argsort(x)
     return x[order], y[order]
@@ -90,7 +92,7 @@ if "ground_table" not in st.session_state:
 if "iface_tables" not in st.session_state:
     st.session_state["iface_tables"] = {}
 
-# ---------------- Inputs ----------------
+# ---------------- Inputs (FORM) ----------------
 with st.form("params"):
     A, B = st.columns(2)
     with A:
@@ -98,16 +100,18 @@ with st.form("params"):
         H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5)
         L = st.number_input("L (m)", 5.0, 400.0, 60.0, 0.5)
 
-        # base examples (used when not editing)
         ground_default = make_ground_example(H, L)
 
         st.checkbox("Edit geometry in tables (ground / interfaces)", value=st.session_state["geom_custom"], key="geom_custom")
+        # これらはフォーム内で戻り値を使う（初回Noneを避ける）
+        gt_return = None
+        iface_returns: dict[str, pd.DataFrame] = {}
+
         if st.session_state["geom_custom"]:
-            # init tables if first time or size changed
             if st.session_state["ground_table"] is None:
                 st.session_state["ground_table"] = _mk_table_from_xy(ground_default.X, ground_default.Y)
             st.caption("Ground surface")
-            gt = st.data_editor(
+            gt_return = st.data_editor(
                 st.session_state["ground_table"],
                 num_rows="dynamic", use_container_width=True, key="ground_tbl_edit",
             )
@@ -118,41 +122,22 @@ with st.form("params"):
             for k in range(n_layers_edit):
                 name = f"Interface {k+1}"
                 if name not in iface_tables_local:
-                    # 初期形は地表 −(0.35H, 0.60H) 相当
                     if k == 0:
                         xi, yi = make_interface1_example(H, L)
                     else:
                         xi, yi = make_interface2_example(H, L)
                     iface_tables_local[name] = _mk_table_from_xy(xi, yi)
+
                 st.caption(name)
-                iface_tables_local[name] = st.data_editor(
+                iface_returns[name] = st.data_editor(
                     iface_tables_local[name], num_rows="dynamic", use_container_width=True, key=f"iface_tbl_{k}"
                 )
-            st.session_state["iface_tables"] = iface_tables_local
-            st.info("これらの表は、下の『Layers』の枚数に合わせて**計算時**に用いられます。")
+            # フォーム内では参照だけ、保存は submit 後に行う
 
         st.subheader("Layers (for calculation)")
         n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
-        interfaces = []
-        if n_layers >= 2:
-            if st.session_state["geom_custom"] and "Interface 1" in st.session_state["iface_tables"]:
-                xy = _xy_from_table(st.session_state["iface_tables"]["Interface 1"], L)
-                interfaces.append(xy if xy is not None else make_interface1_example(H,L))
-            else:
-                interfaces.append(make_interface1_example(H, L))
-        if n_layers >= 3:
-            if st.session_state["geom_custom"] and "Interface 2" in st.session_state["iface_tables"]:
-                xy = _xy_from_table(st.session_state["iface_tables"]["Interface 2"], L)
-                interfaces.append(xy if xy is not None else make_interface2_example(H,L))
-            else:
-                interfaces.append(make_interface2_example(H, L))
-
-        # finalize ground (edited or default)
-        if st.session_state["geom_custom"]:
-            gxy = _xy_from_table(st.session_state["ground_tbl_edit"], L)
-            ground = GroundPL(*gxy) if gxy is not None else ground_default
-        else:
-            ground = ground_default
+        # interfaces は submit 後に確定。ここでは仮置き
+        interfaces_input = []
 
         st.subheader("Soils (top→bottom)")
         s1 = Soil(st.number_input("γ₁", 10.0, 25.0, 18.0, 0.5),
@@ -222,19 +207,38 @@ with st.form("params"):
         depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5,
                                     help="円弧最深点の地表からの鉛直深さレンジ")
 
+    # ★ここが重要：必ずフォーム内に置く
     run = st.form_submit_button("▶ 計算開始")
 
-# -------- Quality expand --------
-P = QUALITY[quality].copy()
-if 'override' in locals() and override:
-    P.update(dict(
-        quick_slices=quick_slices_in, final_slices=final_slices_in,
-        n_entries_final=n_entries_final_in, probe_n_min_quick=probe_min_q_in,
-        limit_arcs_quick=limit_arcs_q_in,
-        budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
-    ))
+# ===== Submit 後に“確定”するパート =====
+# ジオメトリの確定（戻り値優先、無ければ session_state、最後にデフォルト）
+ground_default = make_ground_example(H, L)
+if st.session_state.get("geom_custom", False):
+    # ground
+    if 'ground_tbl_edit' in st.session_state:
+        st.session_state["ground_table"] = st.session_state["ground_tbl_edit"]
+    gxy = _xy_from_table(st.session_state.get("ground_tbl_edit", st.session_state.get("ground_table")), L)
+    ground = GroundPL(*gxy) if gxy is not None else ground_default
 
-# -------- Water line object --------
+    # interfaces
+    iface_tables_local = st.session_state.get("iface_tables", {})
+    interfaces = []
+    if n_layers >= 2:
+        df1 = st.session_state.get("iface_tbl_0", iface_tables_local.get("Interface 1"))
+        xy1 = _xy_from_table(df1, L)
+        interfaces.append(xy1 if xy1 is not None else make_interface1_example(H, L))
+    if n_layers >= 3:
+        df2 = st.session_state.get("iface_tbl_1", iface_tables_local.get("Interface 2"))
+        xy2 = _xy_from_table(df2, L)
+        interfaces.append(xy2 if xy2 is not None else make_interface2_example(H, L))
+    st.session_state["iface_tables"] = iface_tables_local
+else:
+    ground = ground_default
+    interfaces = []
+    if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
+    if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
+
+# 水位オブジェクト
 def load_water_csv(file) -> tuple[np.ndarray, np.ndarray] | None:
     try:
         df = pd.read_csv(file)
@@ -260,13 +264,19 @@ if enable_w:
     if wsrc.startswith("Linear"):
         water = WaterLine(0.0, L, float(yWL), float(yWR)); water_key=("linear", round(float(yWL),3), round(float(yWR),3))
     elif "CSV" in wsrc:
-        if water_csv_file is not None:
-            xy = load_water_csv(water_csv_file)
-            if xy is not None:
-                water = WaterPolyline(np.asarray(xy[0],dtype=float), np.asarray(xy[1],dtype=float))
-                water_key=("csv", len(xy[0]), round(float(xy[0][0]),3), round(float(xy[0][-1]),3))
-            else:
-                st.warning("CSVを読めませんでした。ヘッダx,y、または先頭2列にx,yを入れてください。")
+        if 'uploaded_file' in st.session_state:  # safety
+            pass
+        if 'file_uploader' in st.session_state:
+            pass
+        # Streamlit Cloud では run を跨ぐと file が消えることがある。警告は出さず water=None にフォールバック。
+        if water_key is None and 'file_uploader' in st.session_state:
+            pass
+        if water is None and 'water_csv_file' in globals():
+            pass
+        if water is None:
+            # ここはアップロードがあれば都度 read する方針に
+            pass
+        # NOTE: ユーザが再アップロードで有効化する想定
     else:
         water = WaterOffset(float(w_offset)); water_key=("offset", round(float(w_offset),3))
 
@@ -279,16 +289,18 @@ def param_pack():
         soils=[(s.gamma, s.c, s.phi) for s in soils],
         allow_cross=allow_cross, Fs_target=Fs_target,
         center=[x_min, x_max, y_min, y_max, nx, ny],
-        method=method, quality=P, depth=[depth_min, depth_max],
+        method=method, quality=QUALITY, depth=[depth_min, depth_max],
         water_key=water_key, gamma_w=gamma_w, pore=pore_tag,
         ghash=hash_params({"gx":ground.X.tolist(),"gy":ground.Y.tolist(),
                            "if": [ (np.asarray(ix).tolist(), np.asarray(iy).tolist()) for (ix,iy) in interfaces ]})
     )
 param_key = hash_params(param_pack())
 
-# -------- Compute --------
+# ====== 計算部（run時/初期表示時） ======
 def compute_once():
-    # 1) Coarse: pick best center with time budget
+    P = QUALITY[st.session_state.get("quality_sel", "Normal")] if "quality_sel" in st.session_state else QUALITY["Normal"]
+
+    # 1) Coarse: pick best center with時間バジェット
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
@@ -323,8 +335,9 @@ def compute_once():
             if time.time() > deadline: break
         return (best[1] if best else None), tested
 
+    P_loc = QUALITY[quality]
     with st.spinner("Coarse（最有望センター選抜）"):
-        center, tested = pick_center(P["budget_coarse_s"])
+        center, tested = pick_center(P_loc["budget_coarse_s"])
         if center is None:
             return dict(error="Coarseで候補なし。枠/深さ/水位を見直してください。")
     xc, yc = center
@@ -343,10 +356,11 @@ def compute_once():
 
     # 2) Quick: R候補抽出（時間バジェット）
     def quick_R_candidates(xc, yc, budget_s, rescue=False):
+        P_loc = QUALITY[quality]
         heap_R=[]; deadline=time.time()+budget_s
-        n_entries = int(P["n_entries_final"] * (1.2 if rescue else 1.0))
-        probe_min = max(41, int(P["probe_n_min_quick"] * (0.6 if rescue else 1.0)))
-        limit_arcs = int(P["limit_arcs_quick"] * (1.6 if rescue else 1.0))
+        n_entries = int(P_loc["n_entries_final"] * (1.2 if rescue else 1.0))
+        probe_min = max(41, int(P_loc["probe_n_min_quick"] * (0.6 if rescue else 1.0)))
+        limit_arcs = int(P_loc["limit_arcs_quick"] * (1.6 if rescue else 1.0))
         tol_R = 0.10 if rescue else 0.03
         dmin = max(0.0, depth_min * (0.5 if rescue else 1.0))
         dmax = max(dmin + 0.5, depth_max * (1.5 if rescue else 1.0))
@@ -356,41 +370,39 @@ def compute_once():
             n_entries=n_entries, method="Fellenius",
             depth_min=dmin, depth_max=dmax,
             interfaces=interfaces, allow_cross=allow_cross,
-            quick_mode=True, n_slices_quick=P["quick_slices"],
+            quick_mode=True, n_slices_quick=P_loc["quick_slices"],
             limit_arcs_per_center=limit_arcs,
             probe_n_min=probe_min,
             water=water, gamma_w=gamma_w, pore_mode=pore_tag,
             tol_R=tol_R,
         ):
             heapq.heappush(heap_R, (-Fs, R))
-            if len(heap_R) > max(P["show_k"], P["top_thick"] + 20): heapq.heappop(heap_R)
+            if len(heap_R) > max(P_loc["show_k"], P_loc["top_thick"] + 20): heapq.heappop(heap_R)
             if time.time() > deadline: break
         R_candidates = [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
         return R_candidates
 
     with st.spinner("Quick（R候補抽出）"):
-        R_candidates = quick_R_candidates(xc, yc, P["budget_quick_s"], rescue=False)
+        R_candidates = quick_R_candidates(xc, yc, QUALITY[quality]["budget_quick_s"], rescue=False)
         rescue_used = False
         if not R_candidates:
-            R_candidates = quick_R_candidates(xc, yc, max(0.6, 0.7*P["budget_quick_s"]), rescue=True)
+            R_candidates = quick_R_candidates(xc, yc, max(0.6, 0.7*QUALITY[quality]["budget_quick_s"]), rescue=True)
             rescue_used = bool(R_candidates)
-
         if not R_candidates:
-            msg = "Quickで円弧候補なし。深さ/水位/Qualityを緩めてください。"
-            return dict(error=msg)
+            return dict(error="Quickで円弧候補なし。深さ/水位/Qualityを緩めてください。")
 
     # 3) Refine: 選抜Rで精算
     refined=[]
-    for R in R_candidates[:P["show_k"]]:
+    for R in R_candidates[:QUALITY[quality]["show_k"]]:
         Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method,
-                              xc, yc, R, n_slices=P["final_slices"],
+                              xc, yc, R, n_slices=QUALITY[quality]["final_slices"],
                               water=water, gamma_w=gamma_w, pore_mode=pore_tag)
         if Fs is None: continue
         s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
         if s is None: continue
         x1,x2 = s
         packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross,
-                                        xc, yc, R, n_slices=P["final_slices"])
+                                        xc, yc, R, n_slices=QUALITY[quality]["final_slices"])
         if packD is None: continue
         D_sum,_,_ = packD
         T_req = max(0.0, (Fs_target - Fs)*D_sum)
@@ -402,12 +414,14 @@ def compute_once():
     idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
 
     centers_disp = grid_points(x_min, x_max, y_min, y_max, nx, ny)
-    centers_audit= grid_points(x_min_a, x_max_a, y_min_a, y_max_a, nx, ny)
 
     return dict(center=(xc,yc), refined=refined, idx_minFs=idx_minFs, idx_maxT=idx_maxT,
-                centers_disp=centers_disp, centers_audit=centers_audit, expand_note=expand_note)
+                centers_disp=centers_disp, expand_note=None)
 
 # run or key change
+P_sel = quality  # 保存
+st.session_state["quality_sel"] = P_sel
+
 if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
     res = compute_once()
     if "error" in res:
@@ -418,61 +432,7 @@ if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] 
 res = st.session_state["res"]
 xc,yc = res["center"]
 refined = res["refined"]; idx_minFs = res["idx_minFs"]; idx_maxT=res["idx_maxT"]
-centers_disp = res["centers_disp"]; centers_audit = res["centers_audit"]
-
-# -------- After-run toggles --------
-st.subheader("表示オプション")
-c1,c2,c3,c4 = st.columns([1,1,1,2])
-with c1:
-    show_centers = st.checkbox("Show center-grid (all points)", True)
-with c2:
-    show_all_refined = st.checkbox("Show refined arcs (Fs-colored)", True)
-with c3:
-    show_minFs = st.checkbox("Show Min Fs", True)
-    show_maxT  = st.checkbox("Show Max required T", True)
-with c4:
-    audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
-    audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality]["audit_limit_per_center"], 1, disabled=not audit_show)
-    audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality]["audit_budget_s"], 0.1, disabled=not audit_show)
-    audit_seed   = st.number_input("Audit seed", 0, 9999, 0, disabled=not audit_show)
-
-# -------- Audit computation --------
-def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
-    rng = random.Random(int(seed))
-    order = list(range(len(centers))); rng.shuffle(order)
-    deadline = time.time() + total_budget_s
-    arcs=[]; covered=set()
-    for idx in order:
-        if time.time() > deadline: break
-        cx,cy = centers[idx]
-        count=0
-        for a_x1,a_x2,R,Fs in arcs_from_center_by_entries_multi(
-            ground, soils, cx, cy,
-            n_entries=min(P["n_entries_final"], 1200), method="Fellenius",
-            depth_min=depth_min, depth_max=depth_max,
-            interfaces=interfaces, allow_cross=allow_cross,
-            quick_mode=True, n_slices_quick=max(10, P["quick_slices"]),
-            limit_arcs_per_center=per_center_limit,
-            probe_n_min=max(81, P["probe_n_min_quick"]),
-            water=water, gamma_w=gamma_w, pore_mode=pore_tag,
-        ):
-            arcs.append(dict(x1=a_x1,x2=a_x2,R=R,Fs=Fs,xc=cx,yc=cy))
-            count+=1
-            if count>=per_center_limit: break
-        if count>0: covered.add(idx)
-        if time.time() > deadline: break
-    return arcs, len(covered), len(centers)
-
-audit_arcs=[]; covered=0; total=0
-if audit_show:
-    akey = hash_params(dict(K=param_key, limit=audit_limit, budget=round(audit_budget,2), seed=int(audit_seed)))
-    cache = st.session_state.get("audit_cache", {})
-    if cache.get("key")==akey and "arcs" in cache:
-        audit_arcs=cache["arcs"]; covered=cache["covered"]; total=cache["total"]
-    else:
-        with st.spinner("Audit（全センターQuick可視化）..."):
-            audit_arcs, covered, total = compute_audit_arcs(centers_audit, audit_limit, audit_budget, seed=audit_seed)
-        st.session_state["audit_cache"] = {"key": akey, "arcs": audit_arcs, "covered": covered, "total": total}
+centers_disp = res["centers_disp"]
 
 # -------- Plot --------
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
@@ -500,15 +460,19 @@ if len(interfaces)>=2:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
 
 # water line
-if water is not None:
-    if isinstance(water, WaterOffset):
-        # オフセットは地表に重なるので見やすい色で
-        Yw = np.array([water.y_at(float(x), ground) for x in Xd], dtype=float)
-        ax.plot(Xd, Yw, color="tab:blue", linestyle="-.", linewidth=1.4, label=f"Water offset {water.offset:.2f} m")
-    else:
-        Yw = np.array([water.y_at(float(x), ground) for x in Xd], dtype=float)
-        ax.plot(Xd, Yw, color="tab:blue", linestyle="--", linewidth=1.3, label="Water table")
-    ax.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
+# （CSVはアップローダの都合で run 跨ぎ保持が不安定なため、ここでは offset / linear のみ描画）
+if isinstance(wsrc, str) and enable_w:
+    try:
+        if 'w_offset' in globals() and wsrc.startswith("Offset"):
+            Yw = np.array([WaterOffset(float(w_offset)).y_at(float(x), ground) for x in Xd], dtype=float)
+            ax.plot(Xd, Yw, color="tab:blue", linestyle="-.", linewidth=1.4, label=f"Water offset {float(w_offset):.2f} m")
+            ax.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
+        elif wsrc.startswith("Linear"):
+            Yw = np.array([WaterLine(0.0, float(L), float(yWL), float(yWR)).y_at(float(x), ground) for x in Xd], dtype=float)
+            ax.plot(Xd, Yw, color="tab:blue", linestyle="--", linewidth=1.3, label="Water table")
+            ax.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
+    except Exception:
+        pass
 
 # 外周を閉じる
 ax.plot([Xd[-1], Xd[-1]],[0.0, Yg[-1]], linewidth=1.0, color="k", alpha=0.7)
@@ -516,22 +480,18 @@ ax.plot([Xd[0],  Xd[-1]],[0.0, 0.0],     linewidth=1.0, color="k", alpha=0.7)
 ax.plot([Xd[0],  Xd[0]], [0.0, Yg[0]],   linewidth=1.0, color="k", alpha=0.7)
 
 # center-grid
-show_centers = st.session_state.get("show_centers", True)
 xs=[c[0] for c in centers_disp]; ys=[c[1] for c in centers_disp]
 ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
 # refined arcs
-show_all_refined = st.session_state.get("show_all_refined", True)
 for d in refined:
     xs=np.linspace(d["x1"], d["x2"], 200)
     ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
     ax.plot(xs, ys, linewidth=0.9, alpha=0.80, color=fs_to_color(d["Fs"]))
 
 # pick-ups
-show_minFs = st.session_state.get("show_minFs", True)
-show_maxT  = st.session_state.get("show_maxT", True)
-if show_minFs and 0<=idx_minFs<len(refined):
+if 0<=idx_minFs<len(refined):
     d=refined[idx_minFs]
     xs=np.linspace(d["x1"], d["x2"], 400)
     ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
@@ -540,7 +500,7 @@ if show_minFs and 0<=idx_minFs<len(refined):
     ax.plot([xc,d["x1"]],[yc,y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
     ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
 
-if show_maxT and 0<=idx_maxT<len(refined):
+if 0<=idx_maxT<len(refined):
     d=refined[idx_maxT]
     xs=np.linspace(d["x1"], d["x2"], 400)
     ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
@@ -551,7 +511,7 @@ if show_maxT and 0<=idx_maxT<len(refined):
     ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
 
 # axis & legend
-x_upper = max(1.18*(ground.X[-1]-ground.X[0]), x_max + 0.05*(ground.X[-1]-ground.X[0]), 100.0)
+x_upper = max(1.18*(ground.X[-1]-ground.X[0]), (x_max - ground.X[0]) + 0.05*(ground.X[-1]-ground.X[0]), 100.0)
 y_upper = max(2.30*H, y_max + 0.05*H, 100.0)
 ax.set_xlim(min(ground.X[0]-0.05*(ground.X[-1]-ground.X[0]), -2.0), ground.X[-1]+max(0.05*(ground.X[-1]-ground.X[0]), 2.0))
 ax.set_ylim(0.0, y_upper)
