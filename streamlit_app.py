@@ -1,4 +1,4 @@
-# streamlit_app.py — Quality 1ノブ化（Coarse/Normal/Fine/Very-fine）
+# streamlit_app.py — Fsグラデーション＆必要抑止力（ターゲットFs）対応
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time
@@ -8,53 +8,37 @@ from stabi_lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
     arcs_from_center_by_entries_multi, clip_interfaces_to_ground, fs_given_R_multi,
-    arc_sample_poly_best_pair,  # 表示用端点
+    arc_sample_poly_best_pair, driving_sum_for_R_multi,
 )
 
-st.set_page_config(page_title="Stabi LEM（Qualityダイヤル）", layout="wide")
-st.title("Stabi LEM｜Qualityダイヤル：Coarse / Normal / Fine / Very-fine")
+st.set_page_config(page_title="Stabi LEM（Fs色分け＋抑止力）", layout="wide")
+st.title("Stabi LEM｜Fsカラーグラデーション ＋ 必要抑止力ピックアップ")
 
-# ================== Quality プリセット ==================
+# ===== Quality presets（前回と同じ） =====
 QUALITY = {
-    # 速いが粗い（現場スマホ） — まず“見える”を優先
-    "Coarse": dict(
-        quick_slices=10, final_slices=30,
-        n_entries_final=800, probe_n_min_quick=81,
-        limit_arcs_quick=80, show_k=60, top_thick=10,
-        coarse_subsample="every 3rd", coarse_entries=150,
-        coarse_limit_arcs=50, coarse_probe_min=61,
-        budget_coarse_s=0.5, budget_quick_s=0.7,
-    ),
-    # 既定（実務の初期評価）
-    "Normal": dict(
-        quick_slices=12, final_slices=40,
-        n_entries_final=1200, probe_n_min_quick=101,
-        limit_arcs_quick=120, show_k=120, top_thick=12,
-        coarse_subsample="every 2nd", coarse_entries=200,
-        coarse_limit_arcs=60, coarse_probe_min=81,
-        budget_coarse_s=0.6, budget_quick_s=0.8,
-    ),
-    # 詳細評価（提出草案）
-    "Fine": dict(
-        quick_slices=16, final_slices=50,
-        n_entries_final=1600, probe_n_min_quick=121,
-        limit_arcs_quick=160, show_k=180, top_thick=16,
-        coarse_subsample="full", coarse_entries=300,
-        coarse_limit_arcs=100, coarse_probe_min=101,
-        budget_coarse_s=1.0, budget_quick_s=1.2,
-    ),
-    # 最終確定（感度小さめ）
-    "Very-fine": dict(
-        quick_slices=20, final_slices=60,
-        n_entries_final=2200, probe_n_min_quick=141,
-        limit_arcs_quick=220, show_k=240, top_thick=20,
-        coarse_subsample="full", coarse_entries=400,
-        coarse_limit_arcs=140, coarse_probe_min=121,
-        budget_coarse_s=1.6, budget_quick_s=2.0,
-    ),
+    "Coarse": dict(quick_slices=10, final_slices=30, n_entries_final=800,  probe_n_min_quick=81,
+                   limit_arcs_quick=80,  show_k=60,  top_thick=10,
+                   coarse_subsample="every 3rd", coarse_entries=150,
+                   coarse_limit_arcs=50, coarse_probe_min=61,
+                   budget_coarse_s=0.5, budget_quick_s=0.7),
+    "Normal": dict(quick_slices=12, final_slices=40, n_entries_final=1200, probe_n_min_quick=101,
+                   limit_arcs_quick=120, show_k=120, top_thick=12,
+                   coarse_subsample="every 2nd", coarse_entries=200,
+                   coarse_limit_arcs=60, coarse_probe_min=81,
+                   budget_coarse_s=0.6, budget_quick_s=0.8),
+    "Fine": dict(quick_slices=16, final_slices=50, n_entries_final=1600, probe_n_min_quick=121,
+                 limit_arcs_quick=160, show_k=180, top_thick=16,
+                 coarse_subsample="full", coarse_entries=300,
+                 coarse_limit_arcs=100, coarse_probe_min=101,
+                 budget_coarse_s=1.0, budget_quick_s=1.2),
+    "Very-fine": dict(quick_slices=20, final_slices=60, n_entries_final=2200, probe_n_min_quick=141,
+                      limit_arcs_quick=220, show_k=240, top_thick=20,
+                      coarse_subsample="full", coarse_entries=400,
+                      coarse_limit_arcs=140, coarse_probe_min=121,
+                      budget_coarse_s=1.6, budget_quick_s=2.0),
 }
 
-# ================== UI（フォーム一括） ==================
+# ================== UI（フォーム） ==================
 with st.form("params"):
     colA, colB = st.columns(2)
     with colA:
@@ -96,6 +80,9 @@ with st.form("params"):
         if n_layers >= 3:
             allow_cross.append(st.checkbox("Allow crossing into Layer 3 (below Interface 2)", False))
 
+        st.subheader("Reinforcement target")
+        Fs_target = st.number_input("Target safety factor (for required stabilizing force)", 1.00, 2.00, 1.20, 0.05)
+
     with colB:
         st.subheader("Center grid（初期枠）")
         x_min = st.number_input("Center x min", 0.20*L, 3.00*L, 0.25*L, 0.05*L)
@@ -109,9 +96,8 @@ with st.form("params"):
         method = st.selectbox("Method", ["Bishop (simplified)", "Fellenius"])
         quality = st.select_slider("Quality (精度×速度)", options=list(QUALITY.keys()), value="Normal")
 
-        # ====== Advanced（上級設定・必要なときだけ上書き） ======
-        with st.expander("Advanced（上級設定・Qualityを上書き）", expanded=False):
-            override = st.checkbox("上級設定で Quality を上書きする", value=False)
+        with st.expander("Advanced（Qualityを上書き）", expanded=False):
+            override = st.checkbox("上級設定で Quality を上書き", value=False)
             cols1 = st.columns(2)
             with cols1[0]:
                 quick_slices_in  = st.slider("Quick slices", 6, 40, QUALITY[quality]["quick_slices"], 1, disabled=not override)
@@ -139,14 +125,15 @@ with st.form("params"):
         depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5)
 
         show_radii = st.checkbox("Show radii to both ends", True)
+        picks_mode = st.multiselect("Highlight picks", ["Min Fs", "Max required T"], default=["Min Fs","Max required T"])
 
     run = st.form_submit_button("▶ 計算開始")
 
 if not run:
-    st.info("パラメータを調整して **[▶ 計算開始]** を押してね（実行まで再計算しません）。")
+    st.info("パラメータを調整して **[▶ 計算開始]** を押してね。")
     st.stop()
 
-# ===== Quality → 実値へ（Advancedで上書き可） =====
+# ===== Quality → 実値へ =====
 P = QUALITY[quality].copy()
 if 'override' in locals() and override:
     P.update(dict(
@@ -158,7 +145,7 @@ if 'override' in locals() and override:
         budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
     ))
 
-# ================== Quick候補のキャッシュ（堅牢：resource dict） ==================
+# ===== Quick候補キャッシュ =====
 @st.cache_resource(show_spinner=False)
 def _quick_R_cache():
     return {}  # dict[key_tuple] = list_of_R
@@ -179,7 +166,6 @@ def _hash_key_for_Rcache(ground, interfaces, soils, allow_cross, xc, yc,
     )
     return key
 
-# ================== Coarse（疎） ==================
 def _coarse_centers(x_min, x_max, y_min, y_max, nx, ny, subsample: str):
     xs = np.linspace(x_min, x_max, nx)
     ys = np.linspace(y_min, y_max, ny)
@@ -209,9 +195,7 @@ def _coarse_score(center, deadline):
             Fs_min = Fs
         if time.time() > deadline: break
     if Fs_min is None: Fs_min = float("inf")
-    # センター選定モード：Qualityに合わせて頑健に “件数” を重視
-    score = cnt
-    return score, Fs_min, cnt
+    return cnt, Fs_min, cnt
 
 def pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, budget_s):
     deadline = time.time() + budget_s
@@ -223,7 +207,6 @@ def pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, budget_s):
         if time.time() > deadline: break
     return best[3] if best else None
 
-# ================== Quick（候補R抽出：時間打切り＋キャッシュ） ==================
 def quick_R_candidates_for_center(center):
     xc, yc = center
     key = _hash_key_for_Rcache(
@@ -234,8 +217,7 @@ def quick_R_candidates_for_center(center):
     cache = _quick_R_cache()
     if key in cache:
         return cache[key]
-
-    heap_R = []  # (-Fs_quick, R)
+    heap_R = []
     q_deadline = time.time() + P["budget_quick_s"]
     for _x1, _x2, R, Fs in arcs_from_center_by_entries_multi(
         ground, soils, xc, yc,
@@ -250,12 +232,11 @@ def quick_R_candidates_for_center(center):
         if len(heap_R) > max(P["show_k"], P["top_thick"] + 20):
             heapq.heappop(heap_R)
         if time.time() > q_deadline: break
-
     R_list = [r for _fsneg, r in sorted([(-fsneg, R) for fsneg, R in heap_R], key=lambda t:t[0])]
     cache[key] = R_list
     return R_list
 
-# ================== 1) Coarse：センター当て ==================
+# ===== 1) Coarse → center =====
 with st.spinner("Coarse pass（疎・時間打切り）..."):
     center = pick_center_coarse(x_min, x_max, y_min, y_max, nx, ny, P["budget_coarse_s"])
 if center is None:
@@ -263,31 +244,58 @@ if center is None:
     st.stop()
 xc, yc = center
 
-# ================== 2) Quick：候補R抽出 ==================
+# ===== 2) Quick → R candidates =====
 with st.spinner("Quick pass（候補R抽出・時間打切り）..."):
     R_candidates = quick_R_candidates_for_center(center)
 if len(R_candidates)==0:
     st.error("Quick段で有効な円弧候補がありません。条件を緩めてください。")
     st.stop()
 
-# ================== 3) 精密再評価（Bishop/Fellenius） ==================
+# ===== 3) Refine（Fs精密）＋ 必要抑止力T_req算出 =====
 refined = []
 for R in R_candidates[:P["show_k"]]:
     Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
-    if Fs is None: continue
+    if Fs is None: 
+        continue
     s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
-    if s is None: continue
+    if s is None:
+        continue
     x1, x2, xs, ys, h = s
-    refined.append((Fs, (x1, x2, R)))
-if len(refined)==0:
+    # 駆動項 D = Σ(W sinα) を取得（Felleniusの分母）。T_req = max(0, (Fs_target - Fs)*D)
+    D_pack = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
+    if D_pack is None:
+        continue
+    D_sum, x1_d, x2_d = D_pack
+    T_req = max(0.0, (Fs_target - Fs) * D_sum)   # 単位 kN/m（2D）
+    refined.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
+if not refined:
     st.error("精密段で有効な円弧が得られませんでした。設定やQualityを見直してください。")
     st.stop()
-refined.sort(key=lambda t:t[0])
-thin_all = refined
-thick_sel = refined[:min(P["top_thick"], len(refined))]
-minFs_val = refined[0][0]
+refined.sort(key=lambda d: d["Fs"])  # 昇順
 
-# ================== 可視化 ==================
+# ===== ピックアップ =====
+idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
+idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
+minFs_val = refined[idx_minFs]["Fs"]
+maxT_val  = refined[idx_maxT]["T_req"]
+minFs_R   = refined[idx_minFs]["R"]
+maxT_R    = refined[idx_maxT]["R"]
+
+# ===== Fs → 色（<1.0=赤 / 1.0-1.2=オレンジ~黄 / ≥1.2=緑） =====
+def fs_to_color(fs: float):
+    # RGB (0-1)
+    if fs < 1.0:
+        return (0.85, 0.0, 0.0)                 # 赤
+    elif fs < 1.2:
+        t = (fs - 1.0) / 0.2                    # 0→オレンジ, 1→黄
+        r = 1.0
+        g = 0.50 + 0.50*t
+        b = 0.0
+        return (r, g, b)
+    else:
+        return (0.0, 0.55, 0.0)                 # 緑
+
+# ===== 可視化 =====
 fig, ax = plt.subplots(figsize=(10, 7))
 Xdense = np.linspace(ground.X[0], ground.X[-1], 600)
 Yg = ground.y_at(Xdense)
@@ -318,36 +326,77 @@ ax.plot([ground.X[0],  ground.X[0]],  [0.0, ground.y_at(ground.X[0])],    linewi
 # センター
 ax.scatter([xc], [yc], s=65, marker="s", label="Chosen center")
 
-# 扇（薄線=全候補 / 太線=上位N）
-for Fs, (x1, x2, R) in thin_all:
-    xs_line = np.linspace(x1, x2, 200)
+# 薄線：すべての円弧をFs色で描画
+for d in refined:
+    x1, x2, R, Fs = d["x1"], d["x2"], d["R"], d["Fs"]
+    xs_line = np.linspace(x1, x2, 220)
     ys_line = yc - np.sqrt(np.maximum(0.0, R*R - (xs_line - xc)**2))
-    ax.plot(xs_line, ys_line, linewidth=0.6, alpha=0.30)
-    if st.session_state.get("show_radii", True) or True:
+    ax.plot(xs_line, ys_line, linewidth=0.8, alpha=0.65, color=fs_to_color(Fs))
+    if show_radii:
         y1 = float(ground.y_at(x1)); y2 = float(ground.y_at(x2))
-        ax.plot([xc, x1], [yc, y1], linewidth=0.35, alpha=0.25)
-        ax.plot([xc, x2], [yc, y2], linewidth=0.35, alpha=0.25)
-for Fs, (x1, x2, R) in thick_sel:
-    xs_line = np.linspace(x1, x2, 400)
-    ys_line = yc - np.sqrt(np.maximum(0.0, R**2 - (xs_line - xc)**2))
-    ax.plot(xs_line, ys_line, linewidth=2.6)
+        ax.plot([xc, x1], [yc, y1], linewidth=0.35, alpha=0.25, color=fs_to_color(Fs))
+        ax.plot([xc, x2], [yc, y2], linewidth=0.35, alpha=0.25, color=fs_to_color(Fs))
 
-# 軸
+# 強調：上位N本（低Fs側）を少し太く
+for d in refined[:min(P["top_thick"], len(refined))]:
+    x1, x2, R, Fs = d["x1"], d["x2"], d["R"], d["Fs"]
+    xs_line = np.linspace(x1, x2, 420)
+    ys_line = yc - np.sqrt(np.maximum(0.0, R**2 - (xs_line - xc)**2))
+    ax.plot(xs_line, ys_line, linewidth=2.2, alpha=0.9, color=fs_to_color(Fs))
+
+# ピックアップ：Min Fs / Max required T
+if "Min Fs" in picks_mode and 0 <= idx_minFs < len(refined):
+    d = refined[idx_minFs]
+    xs = np.linspace(d["x1"], d["x2"], 500)
+    ys = yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
+    ax.plot(xs, ys, linewidth=3.4, color=(0.9,0.0,0.0), label=f"Min Fs = {d['Fs']:.3f}")
+    if show_radii:
+        y1 = float(ground.y_at(d["x1"])); y2 = float(ground.y_at(d["x2"]))
+        ax.plot([xc, d["x1"]], [yc, y1], linewidth=1.2, color=(0.9,0.0,0.0))
+        ax.plot([xc, d["x2"]], [yc, y2], linewidth=1.2, color=(0.9,0.0,0.0))
+
+if "Max required T" in picks_mode and 0 <= idx_maxT < len(refined):
+    d = refined[idx_maxT]
+    xs = np.linspace(d["x1"], d["x2"], 500)
+    ys = yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
+    ax.plot(xs, ys, linewidth=3.4, linestyle="--", color=(0.3,0.0,0.8),
+            label=f"Max required T = {d['T_req']:.1f} kN/m (Fs={d['Fs']:.3f})")
+    if show_radii:
+        y1 = float(ground.y_at(d["x1"])); y2 = float(ground.y_at(d["x2"]))
+        ax.plot([xc, d["x1"]], [yc, y1], linewidth=1.2, linestyle="--", color=(0.3,0.0,0.8))
+        ax.plot([xc, d["x2"]], [yc, y2], linewidth=1.2, linestyle="--", color=(0.3,0.0,0.8))
+
+# 軸・凡例
 x_upper = max(1.18*L, x_max + 0.05*L, 100.0)
 y_upper = max(2.30*H, y_max + 0.05*H, 100.0)
 ax.set_xlim(min(0.0 - 0.05*L, -2.0), x_upper)
 ax.set_ylim(0.0, y_upper)
 ax.set_aspect("equal", adjustable="box")
 ax.grid(True); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
-ax.legend(loc="upper right", fontsize=9)
+
+# カテゴリ凡例（色の意味）
+from matplotlib.patches import Patch
+legend_patches = [
+    Patch(color=(0.85,0.0,0.0), label="Fs < 1.0"),
+    Patch(color=(1.0,0.75,0.0), label="1.0 ≤ Fs < 1.2"),
+    Patch(color=(0.0,0.55,0.0), label="Fs ≥ 1.2"),
+]
+handles, labels = ax.get_legend_handles_labels()
+ax.legend(handles + legend_patches, labels + [p.get_label() for p in legend_patches],
+          loc="upper right", fontsize=9)
+
 ax.set_title(
     f"Quality={quality} • Center=({xc:.2f},{yc:.2f}) • Method={method} • "
-    f"Shown={len(thin_all)} arcs, top {min(P['top_thick'],len(refined))} thick • MinFs={minFs_val:.3f}"
+    f"K={len(refined)} (refined) • MinFs={minFs_val:.3f} • MaxT={maxT_val:.1f} kN/m @Fs={refined[idx_maxT]['Fs']:.3f}"
 )
 st.pyplot(fig, use_container_width=True)
 plt.close(fig)
 
 # メトリクス
-m1, m2 = st.columns(2)
-with m1: st.metric("Min Fs（精密）", f"{minFs_val:.3f}")
-with m2: st.caption("Qualityで精度×速度を一括制御。Advancedで個別上書き可。")
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("Min Fs（精密）", f"{minFs_val:.3f}", help="表示中の精密評価での最小安全率")
+with c2:
+    st.metric("Max required T", f"{maxT_val:.1f} kN/m", help=f"Fsを {Fs_target:.2f} にするための最大全体抑止力（2D）")
+with c3:
+    st.caption("必要抑止力 T_req = max(0, (Fs_target − Fs) × Σ(W sinα))")
