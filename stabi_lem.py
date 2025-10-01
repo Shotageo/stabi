@@ -1,17 +1,18 @@
-# stabi_lem.py — (unchanged parts omitted for brevity) —
+# stabi_lem.py — full module (centers→R生成/検査/FS評価まで一気通貫)
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Iterable
 import numpy as np, math
 
-DEG = math.pi / 180.0
+DEG = math.pi/180.0
 EPS = 1e-12
 
+# ----------------- 基本データ構造 -----------------
 @dataclass
 class Soil:
-    gamma: float   # kN/m3
-    c: float       # kPa
-    phi: float     # deg
+    gamma: float  # kN/m3
+    c: float      # kPa
+    phi: float    # deg
 
 @dataclass
 class GroundPL:
@@ -29,11 +30,10 @@ class GroundPL:
             x0, x1 = self.X[k], self.X[k+1]
             y0, y1 = self.Y[k], self.Y[k+1]
             t = (xv - x0) / max(x1 - x0, 1e-12)
-            y[i] = (1 - t) * y0 + t * y1
+            y[i] = (1-t)*y0 + t*y1
         return y if y.shape != () else float(y)
 
-# ……（交点計算・補助関数は既存どおり）……
-
+# ----------------- 円×折れ線 交点 -----------------
 def circle_segment_intersections(xc, yc, R, x0, y0, x1, y1):
     dx, dy = x1 - x0, y1 - y0
     a = dx*dx + dy*dy
@@ -46,6 +46,7 @@ def circle_segment_intersections(xc, yc, R, x0, y0, x1, y1):
     for t in ((-b - s)/(2*a), (-b + s)/(2*a)):
         if -1e-10 <= t <= 1 + 1e-10:
             out.append((float(x0 + t*dx), float(y0 + t*dy)))
+    # ほぼ同一点の重複除去
     uniq = []
     for p in out:
         if not any(abs(p[0]-q[0])<1e-9 and abs(p[1]-q[1])<1e-9 for q in uniq):
@@ -63,6 +64,7 @@ def circle_polyline_intersections(xc, yc, R, pl: GroundPL) -> List[Tuple[float,f
             out.append(p)
     return out
 
+# ----------------- 円弧サンプリング（最良の地表区間） -----------------
 def arc_sample_poly_best_pair(pl: GroundPL, xc, yc, R, n=241):
     pts = circle_polyline_intersections(xc, yc, R, pl)
     if len(pts) < 2: return None
@@ -95,6 +97,7 @@ def _alpha_cos(xc, yc, R, xs):
     alpha = -np.arctan(dydx)
     return alpha, np.cos(alpha), y_arc
 
+# ----------------- 複層処理（地層境界：上から順にクリップ） -----------------
 def clip_interfaces_to_ground(ground: GroundPL, interfaces: List[GroundPL], x) -> List[np.ndarray]:
     Yg = ground.y_at(x)
     ys_list = []
@@ -108,7 +111,7 @@ def clip_interfaces_to_ground(ground: GroundPL, interfaces: List[GroundPL], x) -
 def barrier_y_from_flags(Yifs: List[np.ndarray], allow_cross: List[bool]) -> np.ndarray:
     if not Yifs or not allow_cross:
         return np.full_like(Yifs[0] if Yifs else np.array([0.0]), -1e9, dtype=float)
-    assert len(allow_cross) >= len(Yifs)
+    # allow_cross[j]==False の境界より下へは降りない
     blocked = [Yifs[j] for j in range(len(Yifs)) if not allow_cross[j]]
     if not blocked:
         return np.full_like(Yifs[0], -1e9, dtype=float)
@@ -142,7 +145,7 @@ def base_soil_vectors_multi(ground: GroundPL, interfaces: List[GroundPL], soils:
     phi   = np.where(mask1, soils[0].phi,   np.where(mask2, soils[1].phi,   soils[2].phi))
     return gamma.astype(float), c.astype(float), phi.astype(float)
 
-# ---------- Fellenius / Bishop（既存と同じ） ----------
+# ----------------- Fs 計算 -----------------
 def fs_fellenius_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
                             xc, yc, R, n_slices=40) -> Optional[float]:
     s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
@@ -206,14 +209,9 @@ def fs_given_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[S
     else:
         return fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices)
 
-# ---------- 追加：必要抑止力計算に使う「D=Σ(W sinα)」を返す ----------
+# 追加：必要抑止力計算で使う駆動項 D = Σ(W sinα)
 def driving_sum_for_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
                             xc, yc, R, n_slices=40) -> Optional[Tuple[float,float,float]]:
-    """
-    戻り値: (D_sum, x1, x2)
-      D_sum = Σ (W_i * sinα_i) [kN/m] …… Felleniusの分母（駆動項）
-      x1, x2 = その円弧の地表との交点のx（描画用）
-    """
     s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
     if s is None: return None
     x1, x2, xs, ys, h = s
@@ -233,7 +231,62 @@ def driving_sum_for_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils:
     if D_sum <= 0 or not np.isfinite(D_sum): return None
     return D_sum, float(x1), float(x2)
 
-# ……（サンプル地形などは既存どおり）……
+# ----------------- 円弧候補の生成（中心→{x,depth}格子からRを作る） -----------------
+def _R_from_x_and_depth(ground: GroundPL, xc: float, yc: float, x: float, h: float) -> float:
+    yg = float(ground.y_at(x))
+    # y_arc(x) = yg - h が成り立つ R を解く → R^2 = (yg - h - yc)^2 + (x - xc)^2
+    return math.sqrt(max(0.0, (yg - h - yc)**2 + (x - xc)**2))
+
+def arcs_from_center_by_entries_multi(
+    ground: GroundPL, soils: List[Soil], xc: float, yc: float,
+    n_entries: int, method: str,
+    depth_min: float, depth_max: float,
+    interfaces: List[GroundPL], allow_cross: List[bool],
+    quick_mode: bool, n_slices_quick: int,
+    limit_arcs_per_center: int, probe_n_min: int,
+) -> Iterable[Tuple[float,float,float,float]]:
+    """
+    生成器: (x1, x2, R, Fs_quick) を yield
+      - ground.X[0]..ground.X[-1] を n_entries でサンプルした x と
+        depth ∈ [depth_min, depth_max]（等間隔）から R を作成。
+      - その R で arc_sample_poly_best_pair により (x1,x2) を決め、
+        quick（Fellenius / n_slices_quick）で Fs を評価。
+      - crossing/幾何/厚さの不適合は Fs=None となるため弾く。
+      - limit_arcs_per_center 本で打ち切り。
+    """
+    if n_entries < 2 or depth_max <= 0 or depth_max < depth_min:
+        return
+
+    # x-サンプル（端を少し避ける）
+    x0, x1 = float(ground.X[0]), float(ground.X[-1])
+    xs = np.linspace(x0+1e-6, x1-1e-6, n_entries)
+
+    # 深さサンプル（0は無意味。0.5m刻み相当を最低限確保）
+    n_depth = max(5, int(round((depth_max - depth_min)/max(0.5, (depth_max - depth_min)/10))) + 1)
+    hs = np.linspace(max(0.01, depth_min), depth_max, n_depth)
+
+    count = 0
+    for xi in xs:
+        for h in hs:
+            R = _R_from_x_and_depth(ground, xc, yc, float(xi), float(h))
+            if not (np.isfinite(R) and R > 0.5):  # 小さ過ぎる半径は除外
+                continue
+            # サンプル点数（表示の粗密に影響。quickでは抑制）
+            n_probe = max(probe_n_min, 201) if not quick_mode else max(101, probe_n_min)
+            s = arc_sample_poly_best_pair(ground, xc, yc, R, n=n_probe)
+            if s is None:
+                continue
+            a_x1, a_x2, _xs, _ys, _h = s
+            # Quick Fs（Fellenius固定が定石）
+            Fs_q = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices_quick)
+            if Fs_q is None:
+                continue
+            yield float(a_x1), float(a_x2), float(R), float(Fs_q)
+            count += 1
+            if count >= limit_arcs_per_center:
+                return
+
+# ----------------- サンプル地形（UI用） -----------------
 def make_ground_example(H: float, L: float) -> GroundPL:
     X = np.array([0.0, 0.30*L, 0.63*L, L], dtype=float)
     Y = np.array([H,   0.88*H, 0.46*H, 0.0], dtype=float)
@@ -250,10 +303,10 @@ def make_interface2_example(H: float, L: float) -> GroundPL:
     return GroundPL(X=X, Y=Y)
 
 __all__ = [
-    "Soil", "GroundPL",
-    "make_ground_example", "make_interface1_example", "make_interface2_example",
-    "arcs_from_center_by_entries_multi", "fs_given_R_multi",
-    "fs_bishop_poly_multi", "fs_fellenius_poly_multi",
-    "clip_interfaces_to_ground", "barrier_y_from_flags", "base_soil_vectors_multi",
-    "arc_sample_poly_best_pair", "driving_sum_for_R_multi",
+    "Soil","GroundPL",
+    "make_ground_example","make_interface1_example","make_interface2_example",
+    "arc_sample_poly_best_pair","circle_polyline_intersections",
+    "clip_interfaces_to_ground","barrier_y_from_flags","base_soil_vectors_multi",
+    "fs_fellenius_poly_multi","fs_bishop_poly_multi","fs_given_R_multi",
+    "arcs_from_center_by_entries_multi","driving_sum_for_R_multi",
 ]
