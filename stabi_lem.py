@@ -1,4 +1,4 @@
-# stabi_lem.py — multi-layer (≤3) with per-boundary crossing control + turbo quick mode
+# stabi_lem.py — (unchanged parts omitted for brevity) —
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Iterable
@@ -31,6 +31,8 @@ class GroundPL:
             t = (xv - x0) / max(x1 - x0, 1e-12)
             y[i] = (1 - t) * y0 + t * y1
         return y if y.shape != () else float(y)
+
+# ……（交点計算・補助関数は既存どおり）……
 
 def circle_segment_intersections(xc, yc, R, x0, y0, x1, y1):
     dx, dy = x1 - x0, y1 - y0
@@ -140,6 +142,7 @@ def base_soil_vectors_multi(ground: GroundPL, interfaces: List[GroundPL], soils:
     phi   = np.where(mask1, soils[0].phi,   np.where(mask2, soils[1].phi,   soils[2].phi))
     return gamma.astype(float), c.astype(float), phi.astype(float)
 
+# ---------- Fellenius / Bishop（既存と同じ） ----------
 def fs_fellenius_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
                             xc, yc, R, n_slices=40) -> Optional[float]:
     s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
@@ -203,53 +206,34 @@ def fs_given_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[S
     else:
         return fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices)
 
-def arcs_from_center_by_entries_multi(
-    ground: GroundPL,
-    soils: List[Soil],
-    xc: float, yc: float,
-    n_entries: int = 500,
-    method: str = "bishop",
-    depth_min: float = 0.0, depth_max: float = 1e9,
-    interfaces: List[GroundPL] | None = None,
-    allow_cross: List[bool] | None = None,
-    quick_mode: bool = False,
-    n_slices_quick: int = 16,
-    limit_arcs_per_center: Optional[int] = None,
-    probe_n_min: int = 121,   # ← 追加：クイック段の円弧プローブ点下限
-) -> Iterable[Tuple[float,float,float,float]]:
-    if interfaces is None: interfaces = []
-    if allow_cross is None: allow_cross = [True]*len(interfaces)
-    xs = np.linspace(ground.X[0], ground.X[-1], max(n_entries, 50))
-    ys = ground.y_at(xs)
-    use_bishop = method.lower().startswith("b")
-    count = 0
-    for xe, ye in zip(xs, ys):
-        R = float(math.hypot(xe - xc, ye - yc))
-        # クイック段はプローブ点を減らす
-        n_probe = max(2*n_slices_quick+1, probe_n_min) if quick_mode else 221
-        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=n_probe)
-        if s is None:
-            continue
-        x1, x2, xs_s, ys_s, h = s
-        dmax = float(np.max(h))
-        if dmax < depth_min - 1e-9 or dmax > depth_max + 1e-9:
-            continue
-        if quick_mode:
-            Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices_quick)
-        else:
-            if use_bishop:
-                Fs = fs_bishop_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
-                if Fs is None:
-                    Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
-            else:
-                Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
-        if Fs is None:
-            continue
-        yield (float(x1), float(x2), float(R), float(Fs))
-        count += 1
-        if quick_mode and (limit_arcs_per_center is not None) and (count >= limit_arcs_per_center):
-            return
+# ---------- 追加：必要抑止力計算に使う「D=Σ(W sinα)」を返す ----------
+def driving_sum_for_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
+                            xc, yc, R, n_slices=40) -> Optional[Tuple[float,float,float]]:
+    """
+    戻り値: (D_sum, x1, x2)
+      D_sum = Σ (W_i * sinα_i) [kN/m] …… Felleniusの分母（駆動項）
+      x1, x2 = その円弧の地表との交点のx（描画用）
+    """
+    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
+    if s is None: return None
+    x1, x2, xs, ys, h = s
+    xs_e  = np.linspace(x1, x2, n_slices+1)
+    xmid  = 0.5*(xs_e[:-1] + xs_e[1:])
+    dx    = (x2 - x1)/n_slices
+    alpha, cos_a, y_arc = _alpha_cos(xc, yc, R, xmid)
+    if np.any(np.isclose(cos_a,0,atol=1e-10)): return None
+    hmid  = ground.y_at(xmid) - y_arc
+    if np.any(hmid<=0): return None
+    Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, len(soils)-1)], xmid)
+    B    = barrier_y_from_flags(Yifs, allow_cross[:max(0, len(soils)-1)])
+    if np.any(y_arc < B - 1e-9): return None
+    gamma, c, phi = base_soil_vectors_multi(ground, interfaces, soils, xmid, y_arc)
+    W     = gamma * hmid * dx
+    D_sum = float(np.sum(W*np.sin(alpha)))
+    if D_sum <= 0 or not np.isfinite(D_sum): return None
+    return D_sum, float(x1), float(x2)
 
+# ……（サンプル地形などは既存どおり）……
 def make_ground_example(H: float, L: float) -> GroundPL:
     X = np.array([0.0, 0.30*L, 0.63*L, L], dtype=float)
     Y = np.array([H,   0.88*H, 0.46*H, 0.0], dtype=float)
@@ -271,4 +255,5 @@ __all__ = [
     "arcs_from_center_by_entries_multi", "fs_given_R_multi",
     "fs_bishop_poly_multi", "fs_fellenius_poly_multi",
     "clip_interfaces_to_ground", "barrier_y_from_flags", "base_soil_vectors_multi",
+    "arc_sample_poly_best_pair", "driving_sum_for_R_multi",
 ]
