@@ -1,4 +1,4 @@
-# streamlit_app.py — audit改善・端ヒット時の自動拡張・被覆率表示（Audit既定OFF/描画安全化）
+# streamlit_app.py — 確定実行モード：スライダー変更では再計算せず、ボタン押下でだけ計算
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random
@@ -11,8 +11,8 @@ from stabi_lem import (
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
 )
 
-st.set_page_config(page_title="Stabi LEM｜監査＆自動拡張", layout="wide")
-st.title("Stabi LEM｜全センター監査 & 端ヒット自動拡張")
+st.set_page_config(page_title="Stabi LEM｜確定実行モード", layout="wide")
+st.title("Stabi LEM｜確定実行（パラメータは［計算開始］で反映）")
 
 # ---------------- Quality ----------------
 QUALITY = {
@@ -66,36 +66,32 @@ def near_edge(xc, yc, x_min, x_max, y_min, y_max, tol=1e-9):
     at_top   = abs(yc - y_max) < tol
     return at_left or at_right or at_bottom or at_top, dict(left=at_left,right=at_right,bottom=at_bottom,top=at_top)
 
-# ---------------- Inputs ----------------
+# ---------------- Params form (UI現在値) ----------------
 with st.form("params"):
     A, B = st.columns(2)
     with A:
         st.subheader("Geometry")
         H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5)
         L = st.number_input("L (m)", 5.0, 400.0, 60.0, 0.5)
-        ground = make_ground_example(H, L)
 
         st.subheader("Layers")
         n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
-        interfaces = []
-        if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
-        if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
 
         st.subheader("Soils (top→bottom)")
         s1 = Soil(st.number_input("γ₁", 10.0, 25.0, 18.0, 0.5),
                   st.number_input("c₁", 0.0, 200.0, 5.0, 0.5),
                   st.number_input("φ₁", 0.0, 45.0, 30.0, 0.5))
-        soils = [s1]
+        soils_list = [s1]
         if n_layers >= 2:
             s2 = Soil(st.number_input("γ₂", 10.0, 25.0, 19.0, 0.5),
                       st.number_input("c₂", 0.0, 200.0, 8.0, 0.5),
                       st.number_input("φ₂", 0.0, 45.0, 28.0, 0.5))
-            soils.append(s2)
+            soils_list.append(s2)
         if n_layers >= 3:
-            s3 = Soil(st.number_input("γ₃", 10.0, 25.0, 20.0, 0.5),
-                      st.number_input("c₃", 0.0, 200.0, 12.0, 0.5),
-                      st.number_input("φ₃", 0.0, 45.0, 25.0, 0.5))
-            soils.append(s3)
+            s3 = Soil(st.number_input("γ３", 10.0, 25.0, 20.0, 0.5),
+                      st.number_input("c３", 0.0, 200.0, 12.0, 0.5),
+                      st.number_input("φ３", 0.0, 45.0, 25.0, 0.5))
+            soils_list.append(s3)
 
         st.subheader("Crossing control")
         allow_cross=[]
@@ -116,16 +112,24 @@ with st.form("params"):
 
         st.subheader("Method / Quality")
         method = st.selectbox("Method", ["Bishop (simplified)","Fellenius"])
-        quality = st.select_slider("Quality", options=list(QUALITY.keys()), value="Normal")
+        quality_label = st.select_slider("Quality", options=list(QUALITY.keys()), value="Normal")
+        P_current = QUALITY[quality_label].copy()  # UI現在値ベース
         with st.expander("Advanced", expanded=False):
             override = st.checkbox("Override Quality", value=False)
-            quick_slices_in  = st.slider("Quick slices", 6, 40, QUALITY[quality]["quick_slices"], 1, disabled=not override)
-            final_slices_in  = st.slider("Final slices", 20, 80, QUALITY[quality]["final_slices"], 2, disabled=not override)
-            n_entries_final_in = st.slider("Final n_entries", 200, 4000, QUALITY[quality]["n_entries_final"], 100, disabled=not override)
-            probe_min_q_in   = st.slider("Quick min probe", 41, 221, QUALITY[quality]["probe_n_min_quick"], 10, disabled=not override)
-            limit_arcs_q_in  = st.slider("Quick max arcs/center", 20, 400, QUALITY[quality]["limit_arcs_quick"], 10, disabled=not override)
-            budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 5.0, QUALITY[quality]["budget_coarse_s"], 0.1, disabled=not override)
-            budget_quick_in  = st.slider("Budget Quick (s)", 0.1, 5.0, QUALITY[quality]["budget_quick_s"], 0.1, disabled=not override)
+            quick_slices_in  = st.slider("Quick slices", 6, 40, P_current["quick_slices"], 1, disabled=not override)
+            final_slices_in  = st.slider("Final slices", 20, 80, P_current["final_slices"], 2, disabled=not override)
+            n_entries_final_in = st.slider("Final n_entries", 200, 4000, P_current["n_entries_final"], 100, disabled=not override)
+            probe_min_q_in   = st.slider("Quick min probe", 41, 221, P_current["probe_n_min_quick"], 10, disabled=not override)
+            limit_arcs_q_in  = st.slider("Quick max arcs/center", 20, 400, P_current["limit_arcs_quick"], 10, disabled=not override)
+            budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 5.0, P_current["budget_coarse_s"], 0.1, disabled=not override)
+            budget_quick_in  = st.slider("Budget Quick (s)", 0.1, 5.0, P_current["budget_quick_s"], 0.1, disabled=not override)
+            if override:
+                P_current.update(dict(
+                    quick_slices=quick_slices_in, final_slices=final_slices_in,
+                    n_entries_final=n_entries_final_in, probe_n_min_quick=probe_min_q_in,
+                    limit_arcs_quick=limit_arcs_q_in,
+                    budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
+                ))
 
         st.subheader("Depth range (vertical)")
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
@@ -133,30 +137,59 @@ with st.form("params"):
 
     run = st.form_submit_button("▶ 計算開始")
 
-# ---------------- Quality expand ----------------
-P = QUALITY[quality].copy()
-if 'override' in locals() and override:
-    P.update(dict(
-        quick_slices=quick_slices_in, final_slices=final_slices_in,
-        n_entries_final=n_entries_final_in, probe_n_min_quick=probe_min_q_in,
-        limit_arcs_quick=limit_arcs_q_in,
-        budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
-    ))
-
-# ---------------- Keys ----------------
-def param_pack():
+# ---- 現在UI→辞書（未確定） ----
+def pack_params(H,L,n_layers,soils_list,allow_cross,Fs_target,
+                x_min,x_max,y_min,y_max,nx,ny,method,P_current,depth_min,depth_max):
     return dict(
-        H=H, L=L, n_layers=n_layers,
-        soils=[(s.gamma, s.c, s.phi) for s in soils],
-        allow_cross=allow_cross, Fs_target=Fs_target,
-        center=[x_min, x_max, y_min, y_max, nx, ny],
-        method=method, quality=P, depth=[depth_min, depth_max],
+        H=float(H), L=float(L), n_layers=int(n_layers),
+        soils=[(s.gamma, s.c, s.phi) for s in soils_list],
+        allow_cross=list(allow_cross), Fs_target=float(Fs_target),
+        center=[float(x_min), float(x_max), float(y_min), float(y_max), int(nx), int(ny)],
+        method=str(method), quality=P_current, depth=[float(depth_min), float(depth_max)],
+        quality_label=str(quality_label),
     )
-param_key = hash_params(param_pack())
 
-# ---------------- Compute ----------------
+params_ui = pack_params(H,L,n_layers,soils_list,allow_cross,Fs_target,
+                        x_min,x_max,y_min,y_max,nx,ny,method,P_current,depth_min,depth_max)
+key_ui = hash_params(params_ui)
+
+# ---- 確定パラメータ管理（ボタン押下でだけ更新） ----
+if "committed_params" not in st.session_state:
+    st.session_state["committed_params"] = params_ui
+    st.session_state["last_key"] = key_ui
+    first_time = True
+else:
+    first_time = False
+    if run:
+        st.session_state["committed_params"] = params_ui
+        st.session_state["last_key"] = key_ui
+
+params = st.session_state["committed_params"]          # ← 以降は常にこれを使う
+P = params["quality"]
+Fs_target = params["Fs_target"]
+method = params["method"]
+x_min, x_max, y_min, y_max, nx, ny = params["center"]
+H = params["H"]; L = params["L"]; n_layers = params["n_layers"]
+depth_min, depth_max = params["depth"]
+allow_cross = params["allow_cross"]
+soils = [Soil(*t) for t in params["soils"]]
+
+# 未反映通知
+if not run and not first_time and key_ui != st.session_state["last_key"]:
+    st.info("パラメータは変更されていますが、**まだ計算に反映されていません**。［▶ 計算開始］で再計算します。")
+
+# ---- シーン構築（確定パラメータで統一） ----
+def build_scene(H,L,n_layers):
+    ground = make_ground_example(H, L)
+    interfaces=[]
+    if n_layers>=2: interfaces.append(make_interface1_example(H, L))
+    if n_layers>=3: interfaces.append(make_interface2_example(H, L))
+    return ground, interfaces
+
+ground, interfaces = build_scene(H,L,n_layers)
+
+# ---------------- 計算本体（確定パラメータのみ使用） ----------------
 def compute_once():
-    # 1) Coarse: pick best center with time budget
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
@@ -198,7 +231,7 @@ def compute_once():
             return dict(error="Coarseで候補なし。枠/深さを広げてください。")
     xc, yc = center
 
-    # 端ヒットなら監査用に外側へ一段拡張（計算枠はそのまま）
+    # 端ヒットなら監査用に外側へ一段拡張
     hit, where = near_edge(xc,yc,x_min,x_max,y_min,y_max)
     expand_note = None
     x_min_a, x_max_a, y_min_a, y_max_a = x_min, x_max, y_min, y_max
@@ -210,7 +243,7 @@ def compute_once():
         if where["top"]:   y_max_a = y_max + 0.20*dy
         expand_note = f"Auto-extend audit grid: x[{x_min_a:.1f},{x_max_a:.1f}], y[{y_min_a:.1f},{y_max_a:.1f}]"
 
-    # 2) Quick at chosen center → R candidates
+    # Quick（R候補抽出）
     with st.spinner("Quick（R候補抽出）"):
         heap_R=[]; deadline=time.time()+P["budget_quick_s"]
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
@@ -229,39 +262,37 @@ def compute_once():
         if not R_candidates:
             return dict(error="Quickで円弧候補なし。深さ/進入可/Qualityを緩めてください。")
 
-    # 3) Refine for chosen center
+    # Refine
     refined=[]
     for R in R_candidates[:P["show_k"]]:
-        Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
-        if Fs is None: continue
+        Fs_val = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
+        if Fs_val is None: continue
         s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
         if s is None: continue
         x1,x2,*_ = s
         packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
         if packD is None: continue
         D_sum,_,_ = packD
-        T_req = max(0.0, (Fs_target - Fs)*D_sum)
-        refined.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
+        T_req = max(0.0, (Fs_target - Fs_val)*D_sum)
+        refined.append(dict(Fs=float(Fs_val), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
     if not refined:
         return dict(error="Refineで有効弧なし。設定/Qualityを見直してください。")
     refined.sort(key=lambda d:d["Fs"])
     idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
     idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
 
-    # 全センター監査用グリッド（表示重視、計算枠はそのまま）
     centers_disp = grid_points(x_min, x_max, y_min, y_max, nx, ny)
     centers_audit= grid_points(x_min_a, x_max_a, y_min_a, y_max_a, nx, ny)
 
-    return dict(center=(xc,yc), tested_centers=tested, refined=refined,
+    return dict(center=(xc,yc), refined=refined,
                 idx_minFs=idx_minFs, idx_maxT=idx_maxT,
                 centers_disp=centers_disp, centers_audit=centers_audit,
                 expand_note=expand_note)
 
-# run
-if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
+# ---- 計算のトリガー条件：初回 or ボタン押下時のみ ----
+if ("res" not in st.session_state) or run:
     res = compute_once()
     if "error" in res: st.error(res["error"]); st.stop()
-    st.session_state["last_key"] = param_key
     st.session_state["res"] = res
 
 res = st.session_state["res"]
@@ -269,7 +300,7 @@ xc,yc = res["center"]
 refined = res["refined"]; idx_minFs = res["idx_minFs"]; idx_maxT=res["idx_maxT"]
 centers_disp = res["centers_disp"]; centers_audit = res["centers_audit"]
 
-# ---------------- After-run toggles ----------------
+# ---------------- 表示オプション（表示だけ。計算は走らない） ----------------
 st.subheader("表示オプション")
 c1,c2,c3,c4 = st.columns([1,1,1,2])
 with c1:
@@ -280,17 +311,16 @@ with c3:
     show_minFs = st.checkbox("Show Min Fs", True)
     show_maxT  = st.checkbox("Show Max required T", True)
 with c4:
-    # 既定OFF（重さの主犯を封じる）
     audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
-    audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality]["audit_limit_per_center"], 1, disabled=not audit_show)
-    audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality]["audit_budget_s"], 0.1, disabled=not audit_show)
+    audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[params['quality_label']]["audit_limit_per_center"], 1, disabled=not audit_show)
+    audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[params['quality_label']]["audit_budget_s"], 0.1, disabled=not audit_show)
     audit_seed   = st.number_input("Audit seed", 0, 9999, 0, disabled=not audit_show)
 
-# ---------------- Audit computation (round-robin-ish) ----------------
+# ---------------- Audit computation（可視化だけ。確定Pで） ----------------
 def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
     rng = random.Random(int(seed))
-    order = list(range(len(centers)))  # ← 余計な ) を削除
-    rng.shuffle(order)  # 偏り防止
+    order = list(range(len(centers)))
+    rng.shuffle(order)
     deadline = time.time() + total_budget_s
     arcs=[]; covered=set()
     for idx in order:
@@ -315,8 +345,7 @@ def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
 
 audit_arcs=[]; covered=0; total=0
 if audit_show:
-    akey = hash_params(dict(K=param_key, limit=audit_limit, budget=round(audit_budget,2), seed=int(audit_seed),
-                            xa=centers_audit[0][0] if centers_audit else 0.0))
+    akey = hash_params(dict(K=st.session_state["last_key"], limit=audit_limit, budget=round(audit_budget,2), seed=int(audit_seed)))
     cache = st.session_state.get("audit_cache", {})
     if cache.get("key")==akey and "arcs" in cache:
         audit_arcs=cache["arcs"]; covered=cache["covered"]; total=cache["total"]
@@ -325,30 +354,30 @@ if audit_show:
             audit_arcs, covered, total = compute_audit_arcs(centers_audit, audit_limit, audit_budget, seed=audit_seed)
         st.session_state["audit_cache"] = {"key": akey, "arcs": audit_arcs, "covered": covered, "total": total}
 
-# ---------------- Plot ----------------
+# ---------------- Plot（確定パラメータの地形で描画） ----------------
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
 
-Xd = np.linspace(ground.X[0], ground.X[-1], 600)
-# ベクトル非対応でも安全に：配列内包 → ndarray
-Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
+Xd = np.linspace(0.0, L, 600)
+Yg = ground.y_at(Xd)
 
 if n_layers==1:
     ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
 elif n_layers==2:
-    Y1 = clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
+    Y1 = clip_interfaces_to_ground(ground, [make_interface1_example(H,L)], Xd)[0]
     ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
     ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
 else:
-    Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
+    Y1,Y2 = clip_interfaces_to_ground(ground, [make_interface1_example(H,L), make_interface2_example(H,L)], Xd)
     ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
     ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
     ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
 
 ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if n_layers>=2:
-    ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
+    ax.plot(Xd, clip_interfaces_to_ground(ground, [make_interface1_example(H,L)], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
 if n_layers>=3:
-    ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
+    ax.plot(Xd, clip_interfaces_to_ground(ground, [make_interface1_example(H,L), make_interface2_example(H,L)], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
+
 # 外周
 ax.plot([ground.X[-1], ground.X[-1]],[0.0, ground.y_at(ground.X[-1])], linewidth=1.0)
 ax.plot([ground.X[0],  ground.X[-1]],[0.0, 0.0],                       linewidth=1.0)
@@ -358,6 +387,7 @@ ax.plot([ground.X[0],  ground.X[0]], [0.0, ground.y_at(ground.X[0])],  linewidth
 if show_centers:
     xs=[c[0] for c in centers_disp]; ys=[c[1] for c in centers_disp]
     ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
+
 # chosen center
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
@@ -412,8 +442,7 @@ h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
 title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}"]
-if "expand_note" in res and res["expand_note"]: title_tail.append(res["expand_note"])
-# covered/total は audit_show True のときだけ追加
+if res.get("expand_note"): title_tail.append(res["expand_note"])
 if 'audit_arcs' in locals() and audit_show:
     title_tail.append(f"audit cover {covered}/{total} centers, arcs={len(audit_arcs)}")
 ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • Method={method} • " + " • ".join(title_tail))
