@@ -1,4 +1,4 @@
-# streamlit_app.py — R-sweep主導（ユーザー条件厳守）版
+# streamlit_app.py — R-sweep主導＋堅牢交点フォールバック＋診断表示（条件厳守）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json
@@ -8,25 +8,29 @@ import pandas as pd
 from stabi_lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
-    clip_interfaces_to_ground, arcs_from_center_by_entries_multi,  # 互換のため残すが本版は使わない
+    clip_interfaces_to_ground,  # 交点検出は自前でも行う
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
-    # 水位クラス（stabi_lem側にある前提）
+    # 水位クラス（stabi_lem側にある前提。無ければ Water… の import を外してください）
     WaterLine, WaterPolyline, WaterOffset,
 )
 
-st.set_page_config(page_title="Stabi LEM｜R-sweep candidates", layout="wide")
-st.title("Stabi LEM｜Rスイープ主導（条件厳守）")
+st.set_page_config(page_title="Stabi LEM｜R-sweep (robust intersections)", layout="wide")
+st.title("Stabi LEM｜Rスイープ（条件厳守）＋堅牢交点フォールバック")
 
 # ---------------- Quality presets ----------------
 QUALITY = {
-    "Coarse": dict(quick_slices=10, final_slices=30, show_k=60, budget_coarse_s=0.6,
-                   coarse_subsample="every 2nd", R_quick=120, R_coarse=60),
-    "Normal": dict(quick_slices=12, final_slices=40, show_k=120, budget_coarse_s=0.9,
-                   coarse_subsample="every 2nd", R_quick=180, R_coarse=80),
-    "Fine":   dict(quick_slices=16, final_slices=50, show_k=180, budget_coarse_s=1.3,
-                   coarse_subsample="full",    R_quick=240, R_coarse=100),
-    "Very-fine": dict(quick_slices=20, final_slices=60, show_k=240, budget_coarse_s=1.8,
-                   coarse_subsample="full",    R_quick=300, R_coarse=140),
+    "Coarse": dict(quick_slices=10, final_slices=30, show_k=60,  budget_coarse_s=0.9,
+                   coarse_subsample="every 2nd", R_quick=180, R_coarse=80,
+                   sample_N=1201),
+    "Normal": dict(quick_slices=12, final_slices=40, show_k=120, budget_coarse_s=1.2,
+                   coarse_subsample="every 2nd", R_quick=220, R_coarse=100,
+                   sample_N=1501),
+    "Fine":   dict(quick_slices=16, final_slices=50, show_k=180, budget_coarse_s=1.6,
+                   coarse_subsample="full",    R_quick=280, R_coarse=140,
+                   sample_N=1801),
+    "Very-fine": dict(quick_slices=20, final_slices=60, show_k=240, budget_coarse_s=2.2,
+                   coarse_subsample="full",    R_quick=360, R_coarse=180,
+                   sample_N=2201),
 }
 
 # ---------------- Utils ----------------
@@ -60,6 +64,50 @@ def _xy_from_table(df: pd.DataFrame, L: float) -> tuple[np.ndarray, np.ndarray] 
     x = np.clip(x, 0.0, L)
     order = np.argsort(x)
     return x[order], y[order]
+
+# --- 円と地表の交点（堅牢フォールバック） ---
+def circle_ground_intersections(xc: float, yc: float, R: float, ground: GroundPL, L: float, N: int=1201):
+    """
+    ground.y_at が失敗/不連続でも拾えるよう、高密サンプリングで
+    f(x)=y_circle(x)-y_ground(x) の符号反転を検出し、線形補間で根を得る。
+    戻り値: (x1, x2) or None
+    """
+    if not (np.isfinite(xc) and np.isfinite(yc) and np.isfinite(R)): return None
+    if R <= 0: return None
+    # 円の定義域： [xc-R, xc+R] と地形区間 [0,L] の共通部分
+    a = max(0.0, float(xc - R)); b = min(float(xc + R), float(L))
+    if b - a <= 1e-6: return None
+    # サンプリング
+    N = int(max(401, N))
+    xs = np.linspace(a, b, N)
+    # ground.y_at はスカラー前提のためループで評価（安全第一）
+    yg = np.array([float(ground.y_at(float(x))) for x in xs], dtype=float)
+    inside = np.maximum(0.0, R*R - (xs - xc)**2)
+    # 円弧（中心上側にある円：下向きのアーチ）
+    ycirc = yc - np.sqrt(inside)
+    f = ycirc - yg
+    # 符号反転（ゼロ交差）を検出
+    s = np.sign(f)
+    idx = np.where(s[:-1]*s[1:] <= 0)[0]  # <=0 で接触も拾う
+    if idx.size < 2:
+        return None
+    # 最初と最後の根を線形補間で推定
+    def root_at(i):
+        x0, x1 = xs[i], xs[i+1]
+        f0, f1 = f[i], f[i+1]
+        if abs(f1 - f0) < 1e-12:
+            return float(0.5*(x0+x1))
+        t = -f0/(f1-f0)
+        return float(x0 + t*(x1 - x0))
+    x_roots = [root_at(int(i)) for i in idx]
+    x1 = x_roots[0]; x2 = x_roots[-1]
+    if x2 - x1 < 1e-3:
+        return None
+    # 地表区間の両端に近過ぎる弧は捨てる（演算安定のため）→ ただし 0.2m 緩衝で十分
+    eps = 0.2
+    if (x1 <= 0.0+eps and x2 <= 0.0+eps) or (x1 >= L-eps and x2 >= L-eps):
+        return None
+    return (x1, x2)
 
 # ---------------- Session defaults ----------------
 if "geom_custom" not in st.session_state:
@@ -162,9 +210,10 @@ with st.form("params"):
             quick_slices_in  = st.slider("Quick slices", 6, 40, QUALITY[quality]["quick_slices"], 1, disabled=not override)
             final_slices_in  = st.slider("Final slices", 20, 80, QUALITY[quality]["final_slices"], 2, disabled=not override)
             show_k_in        = st.slider("Refine top-K", 20, 400, QUALITY[quality]["show_k"], 10, disabled=not override)
-            R_quick_in       = st.slider("R-sweep (Quick) per center", 40, 400, QUALITY[quality]["R_quick"], 10, disabled=not override)
-            R_coarse_in      = st.slider("R-sweep (Coarse) per center", 20, 200, QUALITY[quality]["R_coarse"], 10, disabled=not override)
-            budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 5.0, QUALITY[quality]["budget_coarse_s"], 0.1, disabled=not override)
+            R_quick_in       = st.slider("R-sweep (Quick) per center", 40, 600, QUALITY[quality]["R_quick"], 10, disabled=not override)
+            R_coarse_in      = st.slider("R-sweep (Coarse) per center", 20, 300, QUALITY[quality]["R_coarse"], 10, disabled=not override)
+            sampleN_in       = st.slider("Intersection sample N", 401, 4001, QUALITY[quality]["sample_N"], 200, disabled=not override)
+            budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 6.0, QUALITY[quality]["budget_coarse_s"], 0.1, disabled=not override)
 
         st.subheader("Depth range (vertical)")
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
@@ -228,7 +277,7 @@ if 'override' in locals() and override:
     P.update(dict(
         quick_slices=quick_slices_in, final_slices=final_slices_in,
         show_k=show_k_in, R_quick=R_quick_in, R_coarse=R_coarse_in,
-        budget_coarse_s=budget_coarse_in,
+        sample_N=sampleN_in, budget_coarse_s=budget_coarse_in,
     ))
 
 # -------- Param key --------
@@ -248,65 +297,85 @@ param_key = hash_params(param_pack())
 # ===== R-sweep：センター毎に半径レンジを深さから直決め =====
 def r_range_from_depth(xc: float, yc: float, dmin: float, dmax: float) -> tuple[float,float] | None:
     ys = float(ground.y_at(xc))
-    R_low  = yc - (ys + dmax)  # 大きい深さ → 小さい半径
-    R_high = yc - (ys + dmin)  # 小さい深さ → 大きい半径
-    R_low  = float(R_low); R_high = float(R_high)
-    # 半径は正・かつレンジ幅あり
+    R_low  = yc - (ys + dmax)  # 深い→小半径
+    R_high = yc - (ys + dmin)  # 浅い→大半径
     if not np.isfinite(R_low) or not np.isfinite(R_high): return None
+    R_high = float(R_high); R_low = float(max(R_low, 0.05))
     if R_high <= 0.0: return None
-    R_low = max(R_low, 0.05)  # 最小半径の下駄
     if R_high - R_low < 1e-6: return None
     return R_low, R_high
 
-def quick_candidates_by_Rs(xc, yc, R_list, quick_slices, method, allow_cross, interfaces, water_kwargs):
-    # Rごとに：交点を取り（無ければskip）→ Quick分割でFs評価
+def quick_candidates_by_Rs(xc, yc, R_list, quick_slices, method, allow_cross, interfaces, water_kwargs, L, sampleN):
+    """
+    R毎に：
+      1) arc_sample_poly_best_pair（高速）を試す
+      2) 失敗なら circle_ground_intersections（堅牢フォールバック）
+      3) Fsは quick_slices で評価
+    """
     heap=[]  # (-Fs, R, x1, x2)
+    diag = dict(tried=len(R_list), sampled_hit=0, fallback_hit=0, fs_ok=0)
     for R in R_list:
+        xpair = None
         s = arc_sample_poly_best_pair(ground, xc, yc, float(R), n=241)
-        if s is None: continue
-        x1, x2 = float(s[0]), float(s[1])
+        if s is not None:
+            xpair = (float(s[0]), float(s[1]))
+            diag["sampled_hit"] += 1
+        else:
+            # 堅牢フォールバック
+            s2 = circle_ground_intersections(xc, yc, float(R), ground, L, N=sampleN)
+            if s2 is not None:
+                xpair = (float(s2[0]), float(s2[1]))
+                diag["fallback_hit"] += 1
+
+        if xpair is None: 
+            continue
+
         Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method,
                               xc, yc, float(R), n_slices=int(quick_slices),
                               **water_kwargs)
-        if Fs is None or not np.isfinite(Fs): continue
-        heapq.heappush(heap, (-float(Fs), float(R), x1, x2))
-    return heap
+        if Fs is None or not np.isfinite(Fs):
+            continue
+        diag["fs_ok"] += 1
+        heapq.heappush(heap, (-float(Fs), float(R), xpair[0], xpair[1]))
+    return heap, diag
 
 # ===== 計算 =====
 def compute_once():
-    # 1) Coarse：格子のサブサンプルで「候補が出る」センターを必ず拾う
+    diag_all = {}
+
+    # 1) Coarse：格子サブサンプルで“候補が出る”センターを必ず拾う
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx); ys = np.linspace(y_min, y_max, ny)
         tag = P["coarse_subsample"]
         if tag == "every 2nd":
             xs = xs[::2] if len(xs)>1 else xs; ys = ys[::2] if len(ys)>1 else ys
-        elif tag == "full":
-            pass
+        # "full" はそのまま
         return [(float(xc), float(yc)) for yc in ys for xc in xs]
 
     best_center=None; best_score=None
     tested_centers=[]
     deadline = time.time() + float(P["budget_coarse_s"])
-    for (xc,yc) in subsampled_centers():
+    for (cx,cy) in subsampled_centers():
         if time.time() > deadline: break
-        rng = r_range_from_depth(xc, yc, depth_min, depth_max)
+        rng = r_range_from_depth(cx, cy, depth_min, depth_max)
         if rng is None:
-            tested_centers.append((xc,yc,0,None))
+            tested_centers.append((cx,cy,0,None))
             continue
         R_low, R_high = rng
         Rs = np.linspace(R_low, R_high, int(P["R_coarse"]))
-        heap = quick_candidates_by_Rs(xc, yc, Rs, max(8, P["quick_slices"]//2),
-                                      "Fellenius", allow_cross, interfaces, water_kwargs)
+        heap, diag = quick_candidates_by_Rs(cx, cy, Rs, max(8, P["quick_slices"]//2),
+                                            "Fellenius", allow_cross, interfaces, water_kwargs,
+                                            L, P["sample_N"])
         cnt = len(heap)
         Fs_min = (-heap[0][0]) if cnt>0 else None
-        tested_centers.append((xc,yc,cnt,Fs_min))
-        if cnt>0:
-            score = (cnt, -Fs_min)  # 多く・かつFsが小さいほど良い
-            if (best_score is None) or (score > best_score):
-                best_score = score; best_center=(xc,yc)
+        tested_centers.append((cx,cy,cnt,Fs_min))
+        score = (cnt, - (Fs_min if Fs_min is not None else 1e9))
+        if (best_score is None) or (score > best_score):
+            best_score = score; best_center=(cx,cy)
+        if time.time() > deadline: break
 
     if best_center is None:
-        return dict(error="Coarseで候補なし。センター/深さ/水位を見直してください。")
+        return dict(error="Coarseで候補なし。センター/深さ/水位/層跨ぎの整合を確認してください。")
 
     xc, yc = best_center
 
@@ -316,9 +385,14 @@ def compute_once():
         return dict(error="選抜センターで半径レンジが成立しません。深さレンジまたはセンター枠を調整してください。")
     R_low, R_high = rng
     Rs = np.linspace(R_low, R_high, int(P["R_quick"]))
-    heap = quick_candidates_by_Rs(xc, yc, Rs, P["quick_slices"], method, allow_cross, interfaces, water_kwargs)
+    heap, diag_q = quick_candidates_by_Rs(xc, yc, Rs, P["quick_slices"], method, allow_cross, interfaces, water_kwargs,
+                                          L, P["sample_N"])
+    diag_all["R_range"] = (float(R_low), float(R_high))
+    diag_all["Quick_diag"] = diag_q
+    diag_all["Quick_heap"] = len(heap)
+
     if not heap:
-        return dict(error="Quickで円弧候補なし。条件が矛盾している可能性があります（深さ/水位/層跨ぎ）。")
+        return dict(error="Quickで円弧候補なし（交点検出の両系とも不成立）。深さ/水位/層跨ぎを再確認してください。")
 
     # 3) Refine：上位K（Fs小）を最終分割で精算
     topK = int(P["show_k"])
@@ -336,6 +410,7 @@ def compute_once():
         T_req = max(0.0, (Fs_target - Fs)*D_sum)
         refined.append(dict(Fs=float(Fs), Fs_q=float(Fs_q), R=float(R),
                             x1=float(x1), x2=float(x2), T_req=float(T_req)))
+
     if not refined:
         return dict(error="Refineで有効弧なし。設定/Quality/水位を見直してください。")
 
@@ -345,7 +420,8 @@ def compute_once():
 
     centers_disp = grid_points(x_min, x_max, y_min, y_max, nx, ny)
     return dict(center=(xc,yc), tested=tested_centers, refined=refined,
-                idx_minFs=idx_minFs, idx_maxT=idx_maxT, centers_disp=centers_disp)
+                idx_minFs=idx_minFs, idx_maxT=idx_maxT, centers_disp=centers_disp,
+                diag=diag_all)
 
 # ---- Run or cache ----
 if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
@@ -433,7 +509,7 @@ if 0<=idx_maxT<len(refined):
 # axis & legend
 x_span = ground.X[-1]-ground.X[0]
 ax.set_xlim(min(ground.X[0]-0.05*x_span, -2.0), ground.X[-1]+max(0.05*x_span, 2.0))
-ax.set_ylim(0.0, max(2.30*H, y_max + 0.05*H, 100.0))
+ax.set_ylim(0.0, max(2.30*H, 100.0))
 ax.set_aspect("equal", adjustable="box")
 ax.grid(True); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
 
@@ -444,7 +520,17 @@ legend_patches=[Patch(color=(0.85,0,0),label="Fs<1.0"),
 h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
-title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}"]
-if enable_w and water is not None: title_tail.append("Water=ON")
-ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • Method={method} • " + " • ".join(title_tail))
+# ---- Diagnostics ----
+st.divider()
+st.subheader("Diagnostics")
+colA, colB = st.columns([2,1])
+with colA:
+    st.write(f"Chosen center = ({xc:.2f}, {yc:.2f})  • Method = {method}  • Quality = {quality}")
+    if "diag" in res:
+        st.json(res["diag"], expanded=False)
+with colB:
+    st.caption("最小Fs / 最大必要抑止力")
+    if 0<=idx_minFs<len(refined): st.metric("Min Fs (refined)", f"{refined[idx_minFs]['Fs']:.3f}")
+    if 0<=idx_maxT<len(refined):  st.metric("Max required T", f"{refined[idx_maxT]['T_req']:.1f} kN/m")
+
 st.pyplot(fig, use_container_width=True); plt.close(fig)
