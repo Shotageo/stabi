@@ -1,7 +1,7 @@
-# streamlit_app.py — 水位をデフォルトOFF、完全ゲート／安全ガード付き
+# streamlit_app.py — 水位デフォルトOFF & レスキュー探索つき（フル置き換え版）
 from __future__ import annotations
 import streamlit as st
-import numpy as np, heapq, time, hashlib, json, random
+import numpy as np, heapq, time, hashlib, json
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -10,12 +10,11 @@ from stabi_lem import (
     make_ground_example, make_interface1_example, make_interface2_example,
     clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
-    # 水位モデル（stabi_lem 側にある想定）
     WaterLine, WaterPolyline, WaterOffset,
 )
 
-st.set_page_config(page_title="Stabi LEM｜水位ゲート版", layout="wide")
-st.title("Stabi LEM｜水位 OFF デフォルト（オン時のみ反映）")
+st.set_page_config(page_title="Stabi LEM｜水位ゲート & レスキュー", layout="wide")
+st.title("Stabi LEM｜水位OFFデフォルト／候補ゼロ時はレスキュー探索")
 
 # ---------------- Quality presets ----------------
 QUALITY = {
@@ -23,26 +22,22 @@ QUALITY = {
                    limit_arcs_quick=80,  show_k=60,  top_thick=10,
                    coarse_subsample="every 3rd", coarse_entries=160,
                    coarse_limit_arcs=50, coarse_probe_min=61,
-                   budget_coarse_s=0.6, budget_quick_s=0.9,
-                   audit_limit_per_center=10, audit_budget_s=2.0),
+                   budget_coarse_s=0.6, budget_quick_s=0.9),
     "Normal": dict(quick_slices=12, final_slices=40, n_entries_final=1300, probe_n_min_quick=101,
                    limit_arcs_quick=120, show_k=120, top_thick=12,
                    coarse_subsample="every 2nd", coarse_entries=220,
                    coarse_limit_arcs=70, coarse_probe_min=81,
-                   budget_coarse_s=0.8, budget_quick_s=1.2,
-                   audit_limit_per_center=12, audit_budget_s=2.8),
+                   budget_coarse_s=0.8, budget_quick_s=1.2),
     "Fine": dict(quick_slices=16, final_slices=50, n_entries_final=1700, probe_n_min_quick=121,
                  limit_arcs_quick=160, show_k=180, top_thick=16,
                  coarse_subsample="full", coarse_entries=320,
                  coarse_limit_arcs=100, coarse_probe_min=101,
-                 budget_coarse_s=1.2, budget_quick_s=1.8,
-                 audit_limit_per_center=16, audit_budget_s=3.2),
+                 budget_coarse_s=1.2, budget_quick_s=1.8),
     "Very-fine": dict(quick_slices=20, final_slices=60, n_entries_final=2200, probe_n_min_quick=141,
                       limit_arcs_quick=220, show_k=240, top_thick=20,
                       coarse_subsample="full", coarse_entries=420,
                       coarse_limit_arcs=140, coarse_probe_min=121,
-                      budget_coarse_s=1.8, budget_quick_s=2.6,
-                      audit_limit_per_center=20, audit_budget_s=4.0),
+                      budget_coarse_s=1.8, budget_quick_s=2.6),
 }
 
 # ---------------- Utils ----------------
@@ -61,13 +56,6 @@ def hash_params(obj) -> str:
     s = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=float)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-def near_edge(xc, yc, x_min, x_max, y_min, y_max, tol=1e-9):
-    at_left  = abs(xc - x_min) < tol
-    at_right = abs(xc - x_max) < tol
-    at_bottom= abs(yc - y_min) < tol
-    at_top   = abs(yc - y_max) < tol
-    return at_left or at_right or at_bottom or at_top, dict(left=at_left,right=at_right,bottom=at_bottom,top=at_top)
-
 def _mk_table_from_xy(X: np.ndarray, Y: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame({"x": np.asarray(X, dtype=float), "y": np.asarray(Y, dtype=float)})
 
@@ -85,7 +73,7 @@ def _xy_from_table(df: pd.DataFrame, L: float) -> tuple[np.ndarray, np.ndarray] 
     order = np.argsort(x)
     return x[order], y[order]
 
-# ---------------- Session defaults for geometry editing ----------------
+# ---------------- Session defaults ----------------
 if "geom_custom" not in st.session_state:
     st.session_state["geom_custom"] = False
 if "ground_table" not in st.session_state:
@@ -100,24 +88,20 @@ with st.form("params"):
         st.subheader("Geometry")
         H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5)
         L = st.number_input("L (m)", 5.0, 400.0, 60.0, 0.5)
-
         ground_default = make_ground_example(H, L)
 
         st.checkbox("Edit geometry in tables (ground / interfaces)", value=st.session_state["geom_custom"], key="geom_custom")
-        gt_return = None
-        iface_returns: dict[str, pd.DataFrame] = {}
-
         if st.session_state["geom_custom"]:
             if st.session_state["ground_table"] is None:
                 st.session_state["ground_table"] = _mk_table_from_xy(ground_default.X, ground_default.Y)
             st.caption("Ground surface")
-            gt_return = st.data_editor(
+            st.data_editor(
                 st.session_state["ground_table"],
                 num_rows="dynamic", use_container_width=True, key="ground_tbl_edit",
             )
 
             n_layers_edit = st.selectbox("Number of layers (tables)", [0,1,2], index=0,
-                                         help="ここでの値は“表編集”用。下の『Layers』の設定とは独立です。")
+                                         help="ここでの値は“表編集”用。下の『Layers』と独立。")
             iface_tables_local = st.session_state["iface_tables"]
             for k in range(n_layers_edit):
                 name = f"Interface {k+1}"
@@ -127,15 +111,13 @@ with st.form("params"):
                     else:
                         xi, yi = make_interface2_example(H, L)
                     iface_tables_local[name] = _mk_table_from_xy(xi, yi)
-
                 st.caption(name)
-                iface_returns[name] = st.data_editor(
+                st.data_editor(
                     iface_tables_local[name], num_rows="dynamic", use_container_width=True, key=f"iface_tbl_{k}"
                 )
 
         st.subheader("Layers (for calculation)")
         n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
-        interfaces_input = []
 
         st.subheader("Soils (top→bottom)")
         s1 = Soil(st.number_input("γ₁", 10.0, 25.0, 18.0, 0.5),
@@ -161,9 +143,9 @@ with st.form("params"):
         st.subheader("Target safety")
         Fs_target = st.number_input("Target FS", 1.00, 2.00, 1.20, 0.05)
 
-        # ---- Water table: デフォルトOFF、オン時のみ計算へ反映 ----
+        # ---- Water table: デフォルトOFF、ON時のみ反映 ----
         st.subheader("Water table (Phreatic)")
-        enable_w = st.checkbox("Enable water table", False)   # ★ デフォルトFalse
+        enable_w = st.checkbox("Enable water table", False)   # ★ False がデフォルト
         wsrc = st.radio("Source", ["Linear (2-point)", "CSV polyline", "Offset from ground"],
                         horizontal=True, disabled=not enable_w)
         gamma_w = st.number_input("γ_w (kN/m³)", 9.00, 10.50, 9.81, 0.01, disabled=not enable_w)
@@ -189,8 +171,7 @@ with st.form("params"):
         x_max = st.number_input("x max", 0.30*L, 4.00*L, 1.15*L, 0.05*L)
         y_min = st.number_input("y min", 0.80*H, 7.00*H, 1.60*H, 0.10*H)
         y_max = st.number_input("y max", 1.00*H, 8.00*H, 2.20*H, 0.10*H)
-        nx = st.slider("nx", 6, 60, 14)
-        ny = st.slider("ny", 4, 40, 9)
+        nx = st.slider("nx", 6, 60, 14); ny = st.slider("ny", 4, 40, 9)
 
         st.subheader("Method / Quality")
         method = st.selectbox("Method", ["Bishop (simplified)","Fellenius"])
@@ -230,18 +211,17 @@ if st.session_state.get("geom_custom", False):
         df2 = st.session_state.get("iface_tbl_1", iface_tables_local.get("Interface 2"))
         xy2 = _xy_from_table(df2, L)
         interfaces.append(xy2 if xy2 is not None else make_interface2_example(H, L))
-    st.session_state["iface_tables"] = iface_tables_local
 else:
     ground = ground_default
     interfaces = []
     if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
     if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
 
-# ===== 水位オブジェクト（オン時のみ作成） =====
+# ===== 水位オブジェクト（ON時のみ） =====
 water = None
 water_key = None
 pore_tag = None
-water_kwargs = {}  # ← これを **展開 して渡す（OFF時は空）
+water_kwargs = {}
 if enable_w:
     pore_tag = "buoyancy" if pore_mode.startswith("buoyancy") else "u-only"
     if wsrc.startswith("Linear"):
@@ -282,12 +262,13 @@ param_key = hash_params(param_pack())
 
 # ====== 計算部 ======
 def compute_once():
-    P = QUALITY.get(st.session_state.get("quality_sel", "Normal"), QUALITY["Normal"])
+    P_loc = QUALITY[st.session_state.get("quality_sel", "Normal")] if "quality_sel" in st.session_state else QUALITY["Normal"]
 
+    # 1) Coarse: 最有望センター選抜
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
-        tag = P["coarse_subsample"]
+        tag = P_loc["coarse_subsample"]
         if tag == "every 3rd":
             xs = xs[::3] if len(xs)>2 else xs; ys = ys[::3] if len(ys)>2 else ys
         elif tag == "every 2nd":
@@ -301,13 +282,13 @@ def compute_once():
             cnt=0; Fs_min=None
             for _x1,_x2,_R,Fs in arcs_from_center_by_entries_multi(
                 ground, soils, xc, yc,
-                n_entries=P["coarse_entries"], method="Fellenius",
+                n_entries=P_loc["coarse_entries"], method="Fellenius",
                 depth_min=depth_min, depth_max=depth_max,
                 interfaces=interfaces, allow_cross=allow_cross,
-                quick_mode=True, n_slices_quick=max(8, P["quick_slices"]//2),
-                limit_arcs_per_center=P["coarse_limit_arcs"],
-                probe_n_min=P["coarse_probe_min"],
-                **water_kwargs,  # ← 水位ONの時だけ効く
+                quick_mode=True, n_slices_quick=max(8, P_loc["quick_slices"]//2),
+                limit_arcs_per_center=P_loc["coarse_limit_arcs"],
+                probe_n_min=P_loc["coarse_probe_min"],
+                **water_kwargs,
             ):
                 cnt+=1
                 if (Fs_min is None) or (Fs < Fs_min): Fs_min = Fs
@@ -318,7 +299,6 @@ def compute_once():
             if time.time() > deadline: break
         return (best[1] if best else None), tested
 
-    P_loc = QUALITY[quality]
     with st.spinner("Coarse（最有望センター選抜）"):
         center, tested = pick_center(P_loc["budget_coarse_s"])
         if center is None:
@@ -328,58 +308,53 @@ def compute_once():
             return dict(error=msg)
     xc, yc = center
 
-    hit, where = near_edge(xc,yc,x_min,x_max,y_min,y_max)
-    x_min_a, x_max_a, y_min_a, y_max_a = x_min, x_max, y_min, y_max
-    if hit:
-        dx=(x_max-x_min); dy=(y_max-y_min)
-        if where["left"]:  x_min_a = x_min - 0.20*dx
-        if where["right"]: x_max_a = x_max + 0.20*dx
-        if where["bottom"]:y_min_a = y_min - 0.20*dy
-        if where["top"]:   y_max_a = y_max + 0.20*dy
-
+    # 2) Quick: R候補抽出（候補ゼロ時はレスキュー）
     def quick_R_candidates(xc, yc, budget_s):
-    P_loc = QUALITY[quality]
-    # ① 通常トライ
-    def run_once(relax=False):
-        heap_R=[]; deadline=time.time()+budget_s*(1.0 if not relax else 0.8)
+        def run_once(relax=False):
+            heap_R=[]; deadline=time.time()+budget_s*(1.0 if not relax else 0.8)
 
-        # 深さ・探索緩和
-        dmin = depth_min if not relax else max(0.0, 0.5*depth_min)
-        dmax = depth_max if not relax else max(depth_max*1.7, 8.0)
+            dmin = depth_min if not relax else max(0.0, 0.5*depth_min)
+            dmax = depth_max if not relax else max(depth_max*1.7, 8.0)
 
-        probe_min = P_loc["probe_n_min_quick"] if not relax else max(41, int(0.7*P_loc["probe_n_min_quick"]))
-        limit_arcs = P_loc["limit_arcs_quick"] if not relax else int(1.5*P_loc["limit_arcs_quick"])
-        tol_R = 0.05 if not relax else 0.15
+            probe_min = P_loc["probe_n_min_quick"] if not relax else max(41, int(0.7*P_loc["probe_n_min_quick"]))
+            limit_arcs = P_loc["limit_arcs_quick"] if not relax else int(1.5*P_loc["limit_arcs_quick"])
+            tol_R = 0.05 if not relax else 0.15
 
-        # 一時的な層・水設定
-        allow_tmp = allow_cross if not relax else [True]*max(0, len(interfaces))
-        water_kwargs_local = water_kwargs if (not relax) else {}  # レスキュー時は水位無視
+            allow_tmp = allow_cross if not relax else [True]*max(0, len(interfaces))
+            water_kwargs_local = water_kwargs if not relax else {}
 
-        for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
-            ground, soils, xc, yc,
-            n_entries=P_loc["n_entries_final"], method="Fellenius",
-            depth_min=dmin, depth_max=dmax,
-            interfaces=interfaces, allow_cross=allow_tmp,
-            quick_mode=True, n_slices_quick=P_loc["quick_slices"],
-            limit_arcs_per_center=limit_arcs,
-            probe_n_min=probe_min, tol_R=tol_R,
-            **water_kwargs_local,
-        ):
-            heapq.heappush(heap_R, (-Fs, R))
-            if len(heap_R) > max(P_loc["show_k"], P_loc["top_thick"] + 20):
-                heapq.heappop(heap_R)
-            if time.time() > deadline:
-                break
+            for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
+                ground, soils, xc, yc,
+                n_entries=P_loc["n_entries_final"], method="Fellenius",
+                depth_min=dmin, depth_max=dmax,
+                interfaces=interfaces, allow_cross=allow_tmp,
+                quick_mode=True, n_slices_quick=P_loc["quick_slices"],
+                limit_arcs_per_center=limit_arcs,
+                probe_n_min=probe_min, tol_R=tol_R,
+                **water_kwargs_local,
+            ):
+                heapq.heappush(heap_R, (-Fs, R))
+                if len(heap_R) > max(P_loc["show_k"], P_loc["top_thick"] + 20):
+                    heapq.heappop(heap_R)
+                if time.time() > deadline:
+                    break
 
-        return [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
+            return [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
 
-    out = run_once(relax=False)
-    if not out:
-        # ② レスキュー
-        out = run_once(relax=True)
-    return out
+        out = run_once(relax=False)
+        if not out:
+            out = run_once(relax=True)
+        return out
 
+    with st.spinner("Quick（R候補抽出）"):
+        R_candidates = quick_R_candidates(xc, yc, P_loc["budget_quick_s"])
+        if not R_candidates:
+            msg = "Quickで円弧候補なし。深さ/Quality"
+            if enable_w: msg += "/水位"
+            msg += "を緩めてください。"
+            return dict(error=msg)
 
+    # 3) Refine: 選抜Rで精算（本来の制約で）
     refined=[]
     for R in R_candidates[:P_loc["show_k"]]:
         Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method,
@@ -395,6 +370,7 @@ def compute_once():
         D_sum,_,_ = packD
         T_req = max(0.0, (Fs_target - Fs)*D_sum)
         refined.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
+
     if not refined:
         msg = "Refineで有効弧なし。設定/Quality"
         if enable_w: msg += "/水位"
@@ -448,14 +424,14 @@ if len(interfaces)>=1:
 if len(interfaces)>=2:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
 
-# water line（ON時のみ可視化）
+# water line（ON時のみ）
 if enable_w and water is not None:
     try:
         if isinstance(water, WaterOffset):
             Yw = np.array([water.y_at(float(x), ground) for x in Xd], dtype=float)
             ax.plot(Xd, Yw, color="tab:blue", linestyle="-.", linewidth=1.4, label=f"Water offset")
             ax.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
-        elif isinstance(water, WaterLine) or isinstance(water, WaterPolyline):
+        else:
             Yw = np.array([water.y_at(float(x), ground) for x in Xd], dtype=float)
             ax.plot(Xd, Yw, color="tab:blue", linestyle="--", linewidth=1.3, label="Water table")
             ax.fill_between(Xd, np.minimum(Yw, Yg), 0.0, color="tab:blue", alpha=0.06)
@@ -472,7 +448,7 @@ xs=[c[0] for c in centers_disp]; ys=[c[1] for c in centers_disp]
 ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
-# refined arcs（Fsカラー）
+# refined arcs
 for d in refined:
     xs=np.linspace(d["x1"], d["x2"], 200)
     ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
@@ -517,8 +493,3 @@ if enable_w and water is not None:
     title_tail.append("Water=ON")
 ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • Method={method} • " + " • ".join(title_tail))
 st.pyplot(fig, use_container_width=True); plt.close(fig)
-
-# metrics
-m1,m2 = st.columns(2)
-with m1: st.metric("Min Fs（精密・選抜センター）", f"{refined[idx_minFs]['Fs']:.3f}")
-with m2: st.metric("Max required T", f"{refined[idx_maxT]['T_req']:.1f} kN/m")
