@@ -1,4 +1,4 @@
-# streamlit_app.py — Lightweight fan view with up to 3 layers & crossing control (batch-run)
+# streamlit_app.py — Turbo two-stage (quick scan → refine) + up to 3 layers + crossing control
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq
@@ -7,11 +7,11 @@ import matplotlib.pyplot as plt
 from stabi_lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
-    arcs_from_center_by_entries_multi, clip_interfaces_to_ground
+    arcs_from_center_by_entries_multi, clip_interfaces_to_ground, fs_given_R_multi
 )
 
-st.set_page_config(page_title="Stabi LEM（軽量・3層対応・一括実行）", layout="wide")
-st.title("Stabi LEM（センター固定／首振り・最大3層・境界進入制御）")
+st.set_page_config(page_title="Stabi LEM（Turbo・多層）", layout="wide")
+st.title("Stabi LEM｜Turbo（二段）・最大3層・境界進入制御")
 
 # ---------------- UI: フォーム一括 ----------------
 with st.form("params"):
@@ -29,11 +29,9 @@ with st.form("params"):
         n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
         interfaces: list[GroundPL] = []
         if n_layers >= 2:
-            iface1 = make_interface1_example(H, L)
-            interfaces.append(iface1)
+            iface1 = make_interface1_example(H, L); interfaces.append(iface1)
         if n_layers >= 3:
-            iface2 = make_interface2_example(H, L)
-            interfaces.append(iface2)
+            iface2 = make_interface2_example(H, L); interfaces.append(iface2)
 
         st.subheader("Soil parameters (top→bottom)")
         gamma1 = st.number_input("γ₁ (kN/m³)", 10.0, 25.0, 18.0, 0.5)
@@ -57,11 +55,9 @@ with st.form("params"):
         st.subheader("Crossing control (下層へ進入可否)")
         allow_cross = []
         if n_layers >= 2:
-            # I1の下（＝Layer2）へ入れる？
             allow_cross_L2 = st.checkbox("Allow crossing into Layer 2 (below Interface 1)", True)
             allow_cross.append(allow_cross_L2)
         if n_layers >= 3:
-            # I2の下（＝Layer3）へ入れる？（安定層ならOFFに）
             allow_cross_L3 = st.checkbox("Allow crossing into Layer 3 (below Interface 2)", False)
             allow_cross.append(allow_cross_L3)
 
@@ -74,16 +70,25 @@ with st.form("params"):
         nx = st.slider("Grid nx", 6, 60, 14)
         ny = st.slider("Grid ny", 4, 40, 9)
 
-        st.subheader("Fan parameters（軽量）")
+        st.subheader("Fan parameters")
         method = st.selectbox("Method", ["Bishop (simplified)", "Fellenius"])
-        n_entries = st.slider("Entry samples on ground", 100, 2000, 600, 50)
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
         depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5)
-        show_k    = st.slider("Show top-K arcs (thin)", 10, 400, 120, 10)
-        top_thick = st.slider("Emphasize top-N (thick)", 1, 30, 12, 1)
+
+        st.subheader("Turbo settings（二段）")
+        turbo = st.checkbox("Use Turbo (quick scan → refine)", True)
+        quick_factor = st.slider("Quick n_entries factor", 0.2, 1.0, 0.35, 0.05,
+                                 help="クイック段の地表エントリ密度（本番の割合）")
+        n_entries = st.slider("Final n_entries (ground samples)", 200, 3000, 1200, 100)
+        n_slices_quick = st.slider("Quick slices", 8, 40, 16, 1)
+        n_slices_final = st.slider("Final slices", 20, 80, 40, 5)
+        limit_arcs_quick = st.slider("Quick: max arcs per center", 50, 400, 160, 10,
+                                     help="各センターで評価する円弧数の上限（クイック段の早期打切り）")
+        show_k    = st.slider("Plot top-K arcs (refined)", 10, 400, 120, 10)
+        top_thick = st.slider("Emphasize top-N thick", 1, 30, 12, 1)
         show_radii = st.checkbox("Show radii to both ends", True)
 
-        # モード保持（フォーム内）
+        # Center picking（保持）
         if "pick_mode" not in st.session_state:
             st.session_state["pick_mode"] = "Max arcs (robust)"
         mode = st.radio(
@@ -93,36 +98,37 @@ with st.form("params"):
             key="pick_mode"
         )
 
-    run = st.form_submit_button("▶ 計算開始（バッチ実行）")
+    run = st.form_submit_button("▶ 計算開始（Turbo 二段実行）")
 
 if not run:
     st.info("パラメータを調整して **[▶ 計算開始]** を押してね。実行まで再計算しません。")
     st.stop()
 
-# --------------- ユーティリティ：センター走査＆自動拡張（軽量） ---------------
-def count_arcs_and_minFs(center, *, limit_k: int | None = None):
+# ---------------- ユーティリティ（クイック段） ----------------
+def count_quick(center):
+    """クイック段：本数・最小Fs(クイック)・上位K候補（クイックFs昇順）"""
     xc, yc = center
     cnt = 0
     Fs_min = None
-    top_heap: list[tuple[float, tuple[float,float,float]]] = []
+    top_heap: list[tuple[float, float]] = []  # (-Fs_quick, R)
+    q_entries = max(int(n_entries*quick_factor), 80)
     for x1, x2, R, Fs in arcs_from_center_by_entries_multi(
         ground, soils, xc, yc,
-        n_entries=n_entries, method=method,
+        n_entries=q_entries, method="Fellenius",  # クイックはFellenius固定
         depth_min=depth_min, depth_max=depth_max,
-        interfaces=interfaces, allow_cross=allow_cross
+        interfaces=interfaces, allow_cross=allow_cross,
+        quick_mode=True, n_slices_quick=n_slices_quick,
+        limit_arcs_per_center=limit_arcs_quick
     ):
         cnt += 1
         if (Fs_min is None) or (Fs < Fs_min):
             Fs_min = Fs
-        if limit_k is not None:
-            heapq.heappush(top_heap, (-Fs, (x1, x2, R)))
-            if len(top_heap) > limit_k:
-                heapq.heappop(top_heap)
-    if limit_k is not None:
-        top_list = sorted([(-fsneg, dat) for fsneg, dat in top_heap], key=lambda t: t[0])
-    else:
-        top_list = []
-    return cnt, (Fs_min if Fs_min is not None else float("inf")), top_list
+        # 上位候補はRだけ持つ（後段で再評価）
+        heapq.heappush(top_heap, (-Fs, R))
+        if len(top_heap) > max(show_k, top_thick + 20):
+            heapq.heappop(top_heap)
+    top_list_R = [r for _, r in sorted([(-fsneg, R) for fsneg, R in top_heap], key=lambda t:t[0])]
+    return cnt, (Fs_min if Fs_min is not None else float("inf")), top_list_R
 
 def near_boundary(xc, yc, x_min, x_max, y_min, y_max, nx, ny):
     dx = (x_max - x_min) / max(nx-1, 1)
@@ -131,27 +137,25 @@ def near_boundary(xc, yc, x_min, x_max, y_min, y_max, nx, ny):
     return (abs(xc - x_min) <= epsx or abs(xc - x_max) <= epsx or
             abs(yc - y_min) <= epsy or abs(yc - y_max) <= epsy)
 
-def scan_best_center_with_auto_expand(x_min, x_max, y_min, y_max, nx, ny,
-                                      mode="Max arcs (robust)", expand_steps=3):
+def pick_center_auto_expand(x_min, x_max, y_min, y_max, nx, ny, mode, expand_steps=3):
     used_bounds = []
     for step in range(expand_steps+1):
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
         centers = [(float(xc), float(yc)) for yc in ys for xc in xs]
         best_center = None
-
         if mode == "Max arcs (robust)":
-            best_score = -1; best_top = []
+            best_score = -1; best_Rs = []
             for c in centers:
-                cnt, _, top = count_arcs_and_minFs(c, limit_k=show_k)
+                cnt, _, Rs = count_quick(c)
                 if cnt > best_score:
-                    best_score, best_center, best_top = cnt, c, top
+                    best_score, best_center, best_Rs = cnt, c, Rs
         else:
-            best_val = float("inf"); best_cnt = -1; best_top=[]
+            best_val = float("inf"); best_cnt = -1; best_Rs=[]
             for c in centers:
-                cnt, Fs_min, top = count_arcs_and_minFs(c, limit_k=show_k)
+                cnt, Fs_min, Rs = count_quick(c)
                 if Fs_min < best_val or (Fs_min == best_val and cnt > best_cnt):
-                    best_val, best_cnt, best_center, best_top = Fs_min, cnt, c, top
+                    best_val, best_cnt, best_center, best_Rs = Fs_min, cnt, c, Rs
 
         if best_center and near_boundary(best_center[0], best_center[1], x_min, x_max, y_min, y_max, nx, ny) and step < expand_steps:
             used_bounds.append((x_min, x_max, y_min, y_max))
@@ -160,24 +164,54 @@ def scan_best_center_with_auto_expand(x_min, x_max, y_min, y_max, nx, ny,
             continue
 
         used_bounds.append((x_min, x_max, y_min, y_max))
-        _, Fs_min, _ = count_arcs_and_minFs(best_center, limit_k=None)
-        return best_center, best_top, used_bounds, Fs_min
-    return None, [], used_bounds, float("inf")
+        return best_center, used_bounds
+    return None, used_bounds
 
-# ----------------------- 中心決定（自動拡張付き） -----------------------
+# ---------------- センター選定（クイック段だけで実施） ----------------
 mode = st.session_state.get("pick_mode", "Max arcs (robust)")
-with st.spinner("センター走査中（軽量・自動拡張あり） ..."):
-    best_center, top_list, used_bounds, minFs_val = scan_best_center_with_auto_expand(
-        x_min, x_max, y_min, y_max, nx, ny, mode=mode, expand_steps=3
-    )
-if best_center is None or len(top_list) == 0:
-    st.error("有効な円弧が見つかりませんでした。パラメータや交差可否を見直して再実行してください。")
+with st.spinner("クイック走査中（Turbo 第1段）..."):
+    best_center, used_bounds = pick_center_auto_expand(x_min, x_max, y_min, y_max, nx, ny, mode, expand_steps=3)
+
+if best_center is None:
+    st.error("有効なセンターが見つかりません。範囲を広げてください。")
     st.stop()
 
 xc, yc = best_center
 x_min_u, x_max_u, y_min_u, y_max_u = used_bounds[-1]
 
-# ----------------------- 描画（層クリップ & 扇） -----------------------
+# ---------------- 候補抽出（クイック）→ 精密再評価（第2段） ----------------
+with st.spinner("精密再評価中（Turbo 第2段）..."):
+    # クイックで上位候補Rを集める（改めて一回）
+    _, _, R_candidates = count_quick(best_center)
+    if len(R_candidates) == 0:
+        st.error("このセンターで有効な円弧候補がありません。条件を見直してください。")
+        st.stop()
+
+    # 上位から show_k 個まで精密評価（Bishop/Fellenius 指定・スライス数指定）
+    refined = []
+    for R in R_candidates[:show_k]:
+        Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=n_slices_final)
+        if Fs is None:
+            continue
+        # 端点取得のため、再度サンプル（表示用）
+        # 低コスト化：nは固定に近い数で十分
+        from stabi_lem import arc_sample_poly_best_pair
+        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
+        if s is None:
+            continue
+        x1, x2, xs, ys, h = s
+        refined.append( (Fs, (x1, x2, R)) )
+
+    if len(refined) == 0:
+        st.error("精密再評価で有効な円弧が得られませんでした。条件を見直してください。")
+        st.stop()
+
+    refined.sort(key=lambda t: t[0])  # Fs昇順
+    thin_all = refined
+    thick_sel = refined[:min(top_thick, len(refined))]
+    minFs_val = refined[0][0]
+
+# ---------------- 可視化 ----------------
 fig, ax = plt.subplots(figsize=(10, 7))
 
 # 層の塗り（地表 ≥ I1 ≥ I2 ≥ 0 を保証しつつ）
@@ -195,7 +229,7 @@ else:
     ax.fill_between(Xdense, Y2, Y1, alpha=0.12, label="Layer2")
     ax.fill_between(Xdense, 0.0, Y2, alpha=0.12, label="Layer3")
 
-# 地表・層境界描画（クリップ後）
+# 地表・層境界線（クリップ後）
 ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if n_layers >= 2:
     Y1_line = clip_interfaces_to_ground(ground, [interfaces[0]], Xdense)[0]
@@ -209,7 +243,7 @@ ax.plot([ground.X[-1], ground.X[-1]], [0.0, ground.y_at(ground.X[-1])], linewidt
 ax.plot([ground.X[0],  ground.X[-1]], [0.0, 0.0],                         linewidth=1.2)
 ax.plot([ground.X[0],  ground.X[0]],  [0.0, ground.y_at(ground.X[0])],    linewidth=1.2)
 
-# グリッド（自動拡張後）
+# センターグリッド枠＆点
 ax.plot([x_min_u, x_max_u, x_max_u, x_min_u, x_min_u],
         [y_min_u, y_min_u, y_max_u, y_max_u, y_min_u],
         linestyle="--", alpha=0.65, label="Center-grid (used)")
@@ -218,9 +252,7 @@ XX, YY = np.meshgrid(np.linspace(x_min_u, x_max_u, nx),
 ax.scatter(XX.ravel(), YY.ravel(), s=12, alpha=0.5)
 ax.scatter([xc], [yc], s=65, marker="s", label="Chosen center")
 
-# 扇：thin=top-K / thick=上位N
-thin_all = top_list
-thick_sel = top_list[:min(top_thick, len(top_list))]
+# 扇：thin=refined上位K / thick=上位N
 for Fs, (x1, x2, R) in thin_all:
     xs_line = np.linspace(x1, x2, 200)
     ys_line = yc - np.sqrt(np.maximum(0.0, R*R - (xs_line - xc)**2))
@@ -244,7 +276,7 @@ ax.grid(True); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
 ax.legend(loc="upper right", fontsize=9)
 ax.set_title(
     f"[{mode}] Center=({xc:.2f},{yc:.2f}) • Method={method} • "
-    f"Shown={len(thin_all)} arcs (thin), top {len(thick_sel)} thick"
+    f"Shown={len(thin_all)} arcs (refined), top {min(top_thick,len(thin_all))} thick"
 )
 
 st.pyplot(fig, use_container_width=True)
@@ -253,9 +285,9 @@ plt.close(fig)
 # メトリクス
 mcol1, mcol2, mcol3 = st.columns(3)
 with mcol1:
-    st.metric("Min Fs（このセンター）", f"{minFs_val:.3f}")
+    st.metric("Min Fs（このセンター｜精密）", f"{minFs_val:.3f}")
 with mcol2:
-    st.write(f"Center-grid（実使用）: x=[{x_min_u:.2f}, {x_max_u:.2f}], y=[{y_min_u:.2f}, {y_max_u:.2f}]")
+    st.write(f"Grid used: x=[{x_min_u:.2f},{x_max_u:.2f}], y=[{y_min_u:.2f},{y_max_u:.2f}]")
 with mcol3:
     if n_layers >= 2:
         txt = f"Crossing: L2={'OK' if allow_cross[0] else 'NG'}"
