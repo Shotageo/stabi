@@ -1,9 +1,9 @@
-# streamlit_app.py — Full-span robust：交点ペア走査＋Quickヒントで区間確定
+# streamlit_app.py — Full-span robust++（深さ方式選択・候補上位精査・自動フォールバック）
 from __future__ import annotations
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
-import heapq, time, json, hashlib, random
+import heapq, time, json, hashlib
 from dataclasses import dataclass
 
 from stabi_lem import (
@@ -12,10 +12,10 @@ from stabi_lem import (
     clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
 )
 
-st.set_page_config(page_title="Stabi LEM｜Full-span (robust)", layout="wide")
-st.title("Stabi LEM｜Full-span（交点ペア走査＋Quickヒント）")
+st.set_page_config(page_title="Stabi LEM｜Full-span robust++", layout="wide")
+st.title("Stabi LEM｜Full-span robust++")
 
-# ---------- 小物 ----------
+# ---------- utils ----------
 def fs_to_color(fs: float):
     if fs < 1.0: return (0.85, 0.0, 0.0)
     if fs < 1.2:
@@ -25,9 +25,10 @@ def fs_to_color(fs: float):
 
 def hash_params(obj) -> str:
     s = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=float)
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+    import hashlib as _h
+    return _h.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-# ---------- 円×地表：全交点 → 隣接ペアを候補にして評価 ----------
+# 円×地表：全交点x座標
 def circle_polyline_all_hits(ground: GroundPL, xc: float, yc: float, R: float):
     X = np.asarray(ground.X); Y = np.asarray(ground.Y)
     hits = []
@@ -43,20 +44,20 @@ def circle_polyline_all_hits(ground: GroundPL, xc: float, yc: float, R: float):
         D = B*B - 4*A*C
         if D < 0: 
             continue
-        sD = np.sqrt(D)
+        sD = float(np.sqrt(D))
         for sgn in (-1.0, 1.0):
             t = (-B + sgn*sD) / (2*A)
             if 0.0 <= t <= 1.0:
                 hits.append(float(x0 + t*vx))
     if not hits: 
         return []
-    # xでソート＋重複除去
     hits = sorted(hits)
-    dedup = []
+    # 近接重複を除去
+    ded = []
     for x in hits:
-        if not dedup or abs(x - dedup[-1]) > 1e-6:
-            dedup.append(x)
-    return dedup
+        if not ded or abs(x - ded[-1]) > 1e-6:
+            ded.append(x)
+    return ded
 
 def arc_base_y(x, xc, yc, R):
     under = R*R - (x - xc)**2
@@ -64,49 +65,6 @@ def arc_base_y(x, xc, yc, R):
         return None
     return yc - np.sqrt(under)
 
-def choose_full_span_interval(ground: GroundPL, xc: float, yc: float, R: float,
-                              hits: list[float], hint_pair: tuple[float,float] | None,
-                              min_cov: float = 0.85, n_probe: int = 25):
-    """隣り合う交点ペア [xi, xi+1] を走査。区間内で円弧が終始地表下（h>0）が
-       規定の被覆率(min_cov)以上ある区間を候補に。hintに最も近い区間を優先。"""
-    if len(hits) < 2:
-        return None
-    candidates = []
-    for i in range(len(hits)-1):
-        xL, xR = hits[i], hits[i+1]
-        xs = np.linspace(xL, xR, n_probe)
-        h = []
-        valid_pts = 0
-        sum_h = 0.0
-        for x in xs:
-            y_surf = float(ground.y_at(x))
-            y_base = arc_base_y(x, xc, yc, R)
-            if y_base is None:
-                continue
-            hh = y_surf - y_base
-            if hh > 1e-6:
-                valid_pts += 1
-                sum_h += hh
-            h.append(hh)
-        cov = valid_pts / max(1, len(xs))
-        mean_h = (sum_h / max(1, valid_pts)) if valid_pts>0 else 0.0
-        if cov >= min_cov and mean_h > 1e-4:
-            # ヒント距離
-            if hint_pair is not None:
-                xm_hint = 0.5*(hint_pair[0] + hint_pair[1])
-                xm_this = 0.5*(xL + xR)
-                hint_dist = abs(xm_this - xm_hint)
-            else:
-                hint_dist = 1e9
-            # 厚い方、かつヒントに近い方を優先したいので、(-mean_h, hint_dist)
-            candidates.append((( -mean_h, hint_dist ), (xL, xR)))
-    if not candidates:
-        return None
-    # まず平均厚で降順（-mean_h）、同率ならヒントに近い順
-    candidates.sort(key=lambda t: t[0])
-    return candidates[0][1]  # (x1, x2)
-
-# ---------- フルスパン・スライス作成＆Fs ----------
 @dataclass
 class SliceGeom:
     xL: float; xR: float; xC: float
@@ -139,7 +97,7 @@ def make_slices_fullspan(ground: GroundPL, xc: float, yc: float, R: float,
 def soil_at_base(x: float, y_base: float, ground: GroundPL, interfaces: list[GroundPL], soils: list[Soil]):
     if not interfaces:
         return soils[0]
-    yints = [float(ifc.y_at(x)) for ifc in interfaces]  # 上から順に
+    yints = [float(ifc.y_at(x)) for ifc in interfaces]
     if y_base >= yints[0]: return soils[0]
     if len(interfaces) == 1: return soils[1]
     if y_base >= yints[1]: return soils[1]
@@ -159,7 +117,7 @@ def fs_fullspan(ground, interfaces, soils, method: str,
         cs.append(c); tans.append(np.tan(np.deg2rad(phi)))
     Ws=np.array(Ws); sinA=np.array(sinA); cosA=np.array(cosA)
     bs=np.array(bs); cs=np.array(cs); tans=np.array(tans)
-    D = float(np.sum(Ws * sinA))  # ΣW sinα
+    D = float(np.sum(Ws * sinA))
     if D <= 1e-9:
         return None, None
 
@@ -168,10 +126,9 @@ def fs_fullspan(ground, interfaces, soils, method: str,
         FS = float(Rnum / D)
         return FS, D
 
-    # Bishop (simplified) 反復
+    # Bishop (simplified)
     FS = 1.20
     for _ in range(60):
-        # tanα = sin/cos
         tanA = sinA/np.maximum(1e-12, cosA)
         m = 1.0 + (tans * tanA)/max(1e-12, FS)
         Rnum = np.sum((cs*bs + (Ws * cosA) * tans) / np.maximum(1e-12, m))
@@ -181,20 +138,23 @@ def fs_fullspan(ground, interfaces, soils, method: str,
         FS = FS_new
     return FS, D
 
-# ---------- Quality ----------
+# ---------- presets ----------
 QUALITY = {
     "Coarse": dict(quick_slices=10, final_slices=36, n_entries_final=900,
                    probe_n_min_quick=81, limit_arcs_quick=80,
-                   budget_coarse_s=0.6, budget_quick_s=0.9, show_k=80),
+                   budget_coarse_s=0.6, budget_quick_s=0.9, show_k=80,
+                   pairs_eval_top=4),
     "Normal": dict(quick_slices=12, final_slices=44, n_entries_final=1300,
                    probe_n_min_quick=101, limit_arcs_quick=120,
-                   budget_coarse_s=0.8, budget_quick_s=1.2, show_k=140),
+                   budget_coarse_s=0.8, budget_quick_s=1.2, show_k=140,
+                   pairs_eval_top=6),
     "Fine": dict(quick_slices=16, final_slices=56, n_entries_final=1700,
                  probe_n_min_quick=121, limit_arcs_quick=160,
-                 budget_coarse_s=1.2, budget_quick_s=1.8, show_k=200),
+                 budget_coarse_s=1.2, budget_quick_s=1.8, show_k=200,
+                 pairs_eval_top=8),
 }
 
-# ---------- 入力 ----------
+# ---------- inputs ----------
 with st.form("params"):
     A,B = st.columns(2)
     with A:
@@ -252,9 +212,10 @@ with st.form("params"):
             budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 5.0, QUALITY[quality]["budget_coarse_s"], 0.1, disabled=not override)
             budget_quick_in  = st.slider("Budget Quick (s)", 0.1, 5.0, QUALITY[quality]["budget_quick_s"], 0.1, disabled=not override)
 
-        st.subheader("Depth (vertical)")
+        st.subheader("Depth filter")
+        depth_mode = st.selectbox("Filter mode", ["By apex (deepest)", "By endpoints", "Off"], index=0)
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
-        depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 6.0, 0.5)  # ← 少し広げた既定
+        depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 6.0, 0.5)
 
         st.subheader("Display")
         show_minFs = st.checkbox("Show Min Fs", True)
@@ -262,7 +223,7 @@ with st.form("params"):
         show_all_refined = st.checkbox("Show refined arcs (Fs-colored)", True)
         show_centers = st.checkbox("Show center-grid points", True)
 
-    run = st.form_submit_button("▶ 計算開始（Full-span robust）")
+    run = st.form_submit_button("▶ 計算開始（Full-span robust++）")
 
 # Quality適用
 P = QUALITY[quality].copy()
@@ -274,18 +235,37 @@ if 'override' in locals() and override:
         budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
     ))
 
-# ---------- キー ----------
+# ---------- keys ----------
 param_key = hash_params(dict(
     H=H, L=L, n_layers=n_layers,
     soils=[(s.gamma, s.c, s.phi) for s in soils],
     allow_cross=allow_cross, Fs_target=Fs_target,
     center=[x_min, x_max, y_min, y_max, nx, ny],
-    method=method, quality=P, depth=[depth_min, depth_max],
+    method=method, quality=P, depth=[depth_mode, depth_min, depth_max],
 ))
 
-# ---------- 本計算 ----------
+# ---------- core ----------
+def depth_pass(ground, xc, yc, R, x1, x2, mode, dmin, dmax):
+    xs = np.linspace(x1, x2, 41)
+    ds = []
+    for x in xs:
+        y_surf = float(ground.y_at(x))
+        y_base = arc_base_y(x, xc, yc, R)
+        if y_base is None: continue
+        ds.append(y_surf - y_base)
+    if not ds: return False
+    d_left  = ds[1]
+    d_right = ds[-2]
+    d_apex  = float(np.max(ds))
+    if mode == "Off":
+        return True
+    if mode == "By endpoints":
+        return (dmin <= d_left <= dmax) and (dmin <= d_right <= dmax)
+    # By apex (deepest)
+    return (dmin <= d_apex <= dmax)
+
 def compute_once():
-    # 1) Coarse：最有望センター選抜（簡略）
+    # 1) Coarse：選抜センター
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
@@ -317,14 +297,15 @@ def compute_once():
         return (best[1] if best else None), tested
 
     with st.spinner("Coarse（センター選抜）"):
-        center, tested = pick_center(P["budget_coarse_s"])
-        if center is None: return dict(error="Coarseでセンターなし。枠/深さを調整。")
+        center, _tested = pick_center(P["budget_coarse_s"])
+        if center is None:
+            return dict(error="Coarseでセンターなし。枠/深さを調整してください。")
     xc, yc = center
 
-    # 2) Quick：選抜センターでR候補＋x1,x2ヒント収集
+    # 2) Quick：R候補＋ヒント
     with st.spinner("Quick（R候補抽出）"):
         heap_R=[]; deadline=time.time()+P["budget_quick_s"]
-        hints=[]  # (R, (x1,x2))
+        hints=[]
         for qx1,qx2,R,Fs_q in arcs_from_center_by_entries_multi(
             ground, soils, xc, yc,
             n_entries=P["n_entries_final"], method="Fellenius",
@@ -335,58 +316,81 @@ def compute_once():
             probe_n_min=P["probe_n_min_quick"],
         ):
             heapq.heappush(heap_R, (-Fs_q, R))
-            hints.append((R, (qx1,qx2)))
+            hints.append((float(R), (qx1, qx2)))
             if len(heap_R) > P["show_k"]: heapq.heappop(heap_R)
             if time.time() > deadline: break
-        if not heap_R: 
+        if not heap_R:
             return dict(error="Quickで候補なし。条件を緩めてください。")
-        # Rを低Fs順に
         tmp = sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])
-        R_candidates = [r for _fs, r in tmp]
-        # R→hint辞書
+        R_candidates = [float(r) for _fs, r in tmp]
         hint_map = {}
         for R, pair in hints:
-            # 近いRが複数あると上書きされるが問題なし
-            hint_map.setdefault(round(float(R), 6), pair)
+            hint_map.setdefault(round(R,6), pair)
 
-    # 3) Refine（フルスパン確定 → Fs/D）
+    # 3) Refine：全交点→ペアを評価、上位だけ精密Fs
     refined=[]
-    for R in R_candidates:
-        hits = circle_polyline_all_hits(ground, xc, yc, R)
-        if len(hits) < 2: 
-            continue
-        # ヒントの近いRを拾う
-        hint_pair = hint_map.get(round(float(R),6))
-        span = choose_full_span_interval(ground, xc, yc, R, hits, hint_pair, min_cov=0.85, n_probe=25)
-        if span is None:
-            # ヒントが遠い等で決まらない→少し緩和して再試行
-            span = choose_full_span_interval(ground, xc, yc, R, hits, hint_pair, min_cov=0.70, n_probe=21)
-            if span is None:
+    rescue_msg=[]
+    def try_refine(min_cov, pairs_top, mode_for_depth):
+        nonlocal refined
+        for R in R_candidates:
+            xs_hits = circle_polyline_all_hits(ground, xc, yc, R)
+            if len(xs_hits) < 2: 
                 continue
-        x1, x2 = span
-        # 深さレンジの適合性（区間全体での最大深さで判定）
-        xs = np.linspace(x1, x2, 31)
-        depths = []
-        for x in xs:
-            y_surf = float(ground.y_at(x))
-            y_base = arc_base_y(x, xc, yc, R)
-            if y_base is None: continue
-            depths.append(y_surf - y_base)
-        if not depths: 
-            continue
-        max_d = float(np.max(depths))
-        if (max_d < depth_min) or (max_d > depth_max):
-            continue
+            # 交点ペアを走査してスコア（平均厚・被覆率・ヒント近さ）
+            cand=[]
+            hint_pair = hint_map.get(round(R,6))
+            hint_mid = None if hint_pair is None else 0.5*(hint_pair[0]+hint_pair[1])
+            for i in range(len(xs_hits)-1):
+                x1, x2 = xs_hits[i], xs_hits[i+1]
+                xs = np.linspace(x1, x2, 25)
+                valid=0; sum_h=0.0; miss=0
+                for x in xs:
+                    y_s = float(ground.y_at(x))
+                    y_b = arc_base_y(x, xc, yc, R)
+                    if y_b is None: 
+                        miss += 1; continue
+                    h = y_s - y_b
+                    if h > 1e-6:
+                        valid += 1; sum_h += h
+                cov = valid / max(1, len(xs))
+                if cov < min_cov: 
+                    continue
+                mean_h = sum_h / max(1, valid)
+                hint_d = 0.0 if hint_mid is None else abs(0.5*(x1+x2) - hint_mid)
+                # 厚いほど良い、ヒントに近いほど良い → (-mean_h, hint_d)
+                cand.append((( -mean_h, hint_d), (x1, x2), cov))
+            if not cand:
+                continue
+            cand.sort(key=lambda t: t[0])
+            for _score, (x1,x2), cov in cand[:pairs_top]:
+                if not depth_pass(ground, xc, yc, R, x1, x2, mode_for_depth, depth_min, depth_max):
+                    continue
+                FS, D = fs_fullspan(ground, interfaces, soils, method, xc, yc, R, x1, x2, n_slices=P["final_slices"])
+                if FS is None or D is None: 
+                    continue
+                T_req = max(0.0, (Fs_target - FS) * D)
+                refined.append(dict(R=float(R), x1=float(x1), x2=float(x2),
+                                    Fs=float(FS), D=float(D), T_req=float(T_req), cov=float(cov)))
+        return len(refined) > 0
 
-        FS, D = fs_fullspan(ground, interfaces, soils, method, xc, yc, R, x1, x2, n_slices=P["final_slices"])
-        if FS is None or D is None:
-            continue
-        T_req = max(0.0, (Fs_target - FS) * D)
-        refined.append(dict(R=float(R), x1=float(x1), x2=float(x2), Fs=float(FS), D=float(D), T_req=float(T_req)))
+    # 段階的フォールバック
+    if not try_refine(min_cov=0.85, pairs_top=P["pairs_eval_top"], mode_for_depth=depth_mode):
+        rescue_msg.append("fallback: min_cov→0.70")
+        if not try_refine(min_cov=0.70, pairs_top=P["pairs_eval_top"], mode_for_depth=depth_mode):
+            rescue_msg.append("fallback: min_cov→0.50")
+            if not try_refine(min_cov=0.50, pairs_top=P["pairs_eval_top"]+2, mode_for_depth=depth_mode):
+                # 最後の手：深さ方式を端点基準に切替
+                if depth_mode != "By endpoints":
+                    rescue_msg.append("fallback: depth filter→By endpoints")
+                    if not try_refine(min_cov=0.50, pairs_top=P["pairs_eval_top"]+2, mode_for_depth="By endpoints"):
+                        pass
+
     if not refined:
-        return dict(error="Refine（フルスパン）で有効弧なし。深さ/枠/Qualityを緩めてください。")
+        msg = "Refineで有効弧が得られません。Depth/枠/Qualityを緩めるか、Depth filterをOff/Endpointsに。"
+        if rescue_msg: msg += " [" + " , ".join(rescue_msg) + "]"
+        return dict(error=msg)
 
-    refined.sort(key=lambda d: d["Fs"])
+    refined.sort(key=lambda d:d["Fs"])
     idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
     idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
 
@@ -394,9 +398,9 @@ def compute_once():
                                       for xc in np.linspace(x_min, x_max, nx)]
     return dict(center=(xc,yc), refined=refined,
                 idx_minFs=idx_minFs, idx_maxT=idx_maxT,
-                centers_disp=centers_disp)
+                centers_disp=centers_disp, rescue_msg="; ".join(rescue_msg))
 
-# 実行
+# run
 if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
     res = compute_once()
     if "error" in res: st.error(res["error"]); st.stop()
@@ -408,11 +412,11 @@ xc,yc = res["center"]
 refined = res["refined"]; idx_minFs=res["idx_minFs"]; idx_maxT=res["idx_maxT"]
 centers_disp = res["centers_disp"]
 
-# ---------- 描画 ----------
+# ---------- plot ----------
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
 Xd = np.linspace(0.0, L, 600); Yg = [ground.y_at(x) for x in Xd]
 
-# 層塗り
+# 塗り
 if n_layers == 1:
     ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
 elif n_layers == 2:
@@ -481,12 +485,14 @@ legend_patches=[Patch(color=(0.85,0,0),label="Fs<1.0"),
 h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
-ax.set_title(f"Full-span robust • Center=({xc:.2f},{yc:.2f}) • Method={method} • "
-             f"MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={Fs_target:.2f}")
+subtitle = f"Center=({xc:.2f},{yc:.2f}) • Method={method} • Depth mode={depth_mode}"
+if "rescue_msg" in res and res["rescue_msg"]:
+    subtitle += f" • {res['rescue_msg']}"
+ax.set_title(f"Full-span robust++ • MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={Fs_target:.2f}\n{subtitle}")
 
 st.pyplot(fig, use_container_width=True); plt.close(fig)
 
-# メトリクス
+# metrics
 m1,m2 = st.columns(2)
 with m1: st.metric("Min Fs（Full-span, 精密）", f"{refined[idx_minFs]['Fs']:.3f}")
 with m2: st.metric("Max required T", f"{refined[idx_maxT]['T_req']:.1f} kN/m")
