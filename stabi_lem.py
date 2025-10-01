@@ -7,7 +7,6 @@ import numpy as np, math
 DEG = math.pi / 180.0
 EPS = 1e-12
 
-# ---------- 基本データ ----------
 @dataclass
 class Soil:
     gamma: float   # kN/m3
@@ -16,7 +15,6 @@ class Soil:
 
 @dataclass
 class GroundPL:
-    """x単調増加の折線（地表 or 層境界 共通）"""
     X: np.ndarray
     Y: np.ndarray
     def y_at(self, x):
@@ -34,7 +32,6 @@ class GroundPL:
             y[i] = (1 - t) * y0 + t * y1
         return y if y.shape != () else float(y)
 
-# ---------- 幾何（円×折線 交点） ----------
 def circle_segment_intersections(xc, yc, R, x0, y0, x1, y1):
     dx, dy = x1 - x0, y1 - y0
     a = dx*dx + dy*dy
@@ -47,7 +44,6 @@ def circle_segment_intersections(xc, yc, R, x0, y0, x1, y1):
     for t in ((-b - s)/(2*a), (-b + s)/(2*a)):
         if -1e-10 <= t <= 1 + 1e-10:
             out.append((float(x0 + t*dx), float(y0 + t*dy)))
-    # 重複削除
     uniq = []
     for p in out:
         if not any(abs(p[0]-q[0])<1e-9 and abs(p[1]-q[1])<1e-9 for q in uniq):
@@ -65,20 +61,19 @@ def circle_polyline_intersections(xc, yc, R, pl: GroundPL) -> List[Tuple[float,f
             out.append(p)
     return out
 
-# ---------- 円弧サンプリング（隣接ペアのうち h>0 を最大化） ----------
 def arc_sample_poly_best_pair(pl: GroundPL, xc, yc, R, n=241):
     pts = circle_polyline_intersections(xc, yc, R, pl)
     if len(pts) < 2: return None
     best = None
     for i in range(len(pts)-1):
         (x1,y1),(x2,y2) = pts[i], pts[i+1]
-        if x2 - x1 <= 1e-10: 
+        if x2 - x1 <= 1e-10:
             continue
         xs = np.linspace(x1, x2, n)
         inside = R*R - (xs - xc)**2
         if np.any(inside <= 0): 
             continue
-        ys = yc - np.sqrt(inside)         # 下面枝
+        ys = yc - np.sqrt(inside)
         h  = pl.y_at(xs) - ys
         if np.any(h <= 0) or np.any(~np.isfinite(h)):
             continue
@@ -89,19 +84,16 @@ def arc_sample_poly_best_pair(pl: GroundPL, xc, yc, R, n=241):
     x1, x2, xs, ys, h, _ = best
     return x1, x2, xs, ys, h
 
-# ---------- 幾何補助 ----------
 def _alpha_cos(xc, yc, R, xs):
     inside = R*R - (xs - xc)**2
     y_arc = yc - np.sqrt(inside)
     denom = y_arc - yc
     denom = np.where(np.abs(denom) < 1e-12, np.sign(denom)*1e-12, denom)
     dydx  = -(xs - xc) / denom
-    alpha = -np.arctan(dydx)     # 右下向きが正
+    alpha = -np.arctan(dydx)
     return alpha, np.cos(alpha), y_arc
 
-# ---------- 層の前処理（クリップと障壁） ----------
 def clip_interfaces_to_ground(ground: GroundPL, interfaces: List[GroundPL], x) -> List[np.ndarray]:
-    """各境界を必ず地表以下にし、かつ上位境界を越えないよう段付きでクリップ"""
     Yg = ground.y_at(x)
     ys_list = []
     y_top = Yg
@@ -109,12 +101,10 @@ def clip_interfaces_to_ground(ground: GroundPL, interfaces: List[GroundPL], x) -
         yi = np.minimum(pl_if.y_at(x), y_top)
         ys_list.append(yi)
         y_top = yi
-    return ys_list  # [Y1, Y2, ...] with Yg >= Y1 >= Y2 ...
+    return ys_list
 
 def barrier_y_from_flags(Yifs: List[np.ndarray], allow_cross: List[bool]) -> np.ndarray:
-    """allow_cross[j]==False の境界は ‘越えられない’ → その上側に留まる (= y_arc >= that Y)"""
-    if not Yifs or not allow_cross: 
-        # 制限なし
+    if not Yifs or not allow_cross:
         return np.full_like(Yifs[0] if Yifs else np.array([0.0]), -1e9, dtype=float)
     assert len(allow_cross) >= len(Yifs)
     blocked = [Yifs[j] for j in range(len(Yifs)) if not allow_cross[j]]
@@ -125,14 +115,8 @@ def barrier_y_from_flags(Yifs: List[np.ndarray], allow_cross: List[bool]) -> np.
         B = np.maximum(B, arr)
     return B
 
-# ---------- 層別パラメータ取得（≤3層） ----------
-def base_soil_vectors_multi(
-    ground: GroundPL,
-    interfaces: List[GroundPL],
-    soils: List[Soil],
-    xmid: np.ndarray,
-    y_arc: np.ndarray
-):
+def base_soil_vectors_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil],
+                            xmid: np.ndarray, y_arc: np.ndarray):
     nL = len(soils)
     Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, nL-1)], xmid)
     if nL == 1:
@@ -147,7 +131,6 @@ def base_soil_vectors_multi(
         c     = np.where(mask1, soils[0].c,     soils[1].c)
         phi   = np.where(mask1, soils[0].phi,   soils[1].phi)
         return gamma.astype(float), c.astype(float), phi.astype(float)
-    # 3層
     Y1, Y2 = Yifs[0], Yifs[1]
     mask1 = (y_arc >= Y1)
     mask3 = (y_arc <  Y2)
@@ -157,15 +140,11 @@ def base_soil_vectors_multi(
     phi   = np.where(mask1, soils[0].phi,   np.where(mask2, soils[1].phi,   soils[2].phi))
     return gamma.astype(float), c.astype(float), phi.astype(float)
 
-# ---------- Fs（Fellenius / Bishop）：多層＋障壁対応 ----------
-def fs_fellenius_poly_multi(
-    ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
-    xc, yc, R, n_slices=40
-) -> Optional[float]:
+def fs_fellenius_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
+                            xc, yc, R, n_slices=40) -> Optional[float]:
     s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
     if s is None: return None
     x1, x2, xs, ys, h = s
-
     xs_e  = np.linspace(x1, x2, n_slices+1)
     xmid  = 0.5*(xs_e[:-1] + xs_e[1:])
     dx    = (x2 - x1)/n_slices
@@ -173,13 +152,9 @@ def fs_fellenius_poly_multi(
     if np.any(np.isclose(cos_a,0,atol=1e-10)): return None
     hmid  = ground.y_at(xmid) - y_arc
     if np.any(hmid<=0): return None
-
-    # 障壁チェック
     Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, len(soils)-1)], xmid)
     B    = barrier_y_from_flags(Yifs, allow_cross[:max(0, len(soils)-1)])
-    if np.any(y_arc < B - 1e-9):
-        return None
-
+    if np.any(y_arc < B - 1e-9): return None
     gamma, c, phi = base_soil_vectors_multi(ground, interfaces, soils, xmid, y_arc)
     b     = dx / cos_a
     W     = gamma * hmid * dx
@@ -190,14 +165,11 @@ def fs_fellenius_poly_multi(
     Fs    = num/den
     return Fs if (np.isfinite(Fs) and Fs>0) else None
 
-def fs_bishop_poly_multi(
-    ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
-    xc, yc, R, n_slices=40
-) -> Optional[float]:
+def fs_bishop_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
+                         xc, yc, R, n_slices=40) -> Optional[float]:
     s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
     if s is None: return None
     x1, x2, xs, ys, h = s
-
     xs_e  = np.linspace(x1, x2, n_slices+1)
     xmid  = 0.5*(xs_e[:-1] + xs_e[1:])
     dx    = (x2 - x1)/n_slices
@@ -205,13 +177,9 @@ def fs_bishop_poly_multi(
     if np.any(np.isclose(cos_a,0,atol=1e-10)): return None
     hmid  = ground.y_at(xmid) - y_arc
     if np.any(hmid<=0): return None
-
-    # 障壁チェック
     Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, len(soils)-1)], xmid)
     B    = barrier_y_from_flags(Yifs, allow_cross[:max(0, len(soils)-1)])
-    if np.any(y_arc < B - 1e-9):
-        return None
-
+    if np.any(y_arc < B - 1e-9): return None
     gamma, c, phi = base_soil_vectors_multi(ground, interfaces, soils, xmid, y_arc)
     b     = dx / cos_a
     W     = gamma * hmid * dx
@@ -228,7 +196,6 @@ def fs_bishop_poly_multi(
         Fs = Fs_new
     return float(Fs)
 
-# ---------- Rを指定して再評価（精密段用） ----------
 def fs_given_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
                      method: str, xc: float, yc: float, R: float, n_slices: int) -> Optional[float]:
     if method.lower().startswith("b"):
@@ -236,7 +203,6 @@ def fs_given_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[S
     else:
         return fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices)
 
-# ---------- 首振り：エントリ掃引（Turbo: quick/limit対応） ----------
 def arcs_from_center_by_entries_multi(
     ground: GroundPL,
     soils: List[Soil],
@@ -246,33 +212,28 @@ def arcs_from_center_by_entries_multi(
     depth_min: float = 0.0, depth_max: float = 1e9,
     interfaces: List[GroundPL] | None = None,
     allow_cross: List[bool] | None = None,
-    # --- Turbo options ---
     quick_mode: bool = False,
     n_slices_quick: int = 16,
     limit_arcs_per_center: Optional[int] = None,
+    probe_n_min: int = 121,   # ← 追加：クイック段の円弧プローブ点下限
 ) -> Iterable[Tuple[float,float,float,float]]:
-    """
-    戻り値: (x1, x2, R, Fs) を逐次返す（配列は保持しない）
-    quick_mode=True なら Fellenius & n_slices_quick で評価し、limit_arcs_per_center で早期打ち切り
-    """
     if interfaces is None: interfaces = []
     if allow_cross is None: allow_cross = [True]*len(interfaces)
-
     xs = np.linspace(ground.X[0], ground.X[-1], max(n_entries, 50))
     ys = ground.y_at(xs)
     use_bishop = method.lower().startswith("b")
-
     count = 0
     for xe, ye in zip(xs, ys):
         R = float(math.hypot(xe - xc, ye - yc))
-        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices_quick+1, 201) if quick_mode else 221)
+        # クイック段はプローブ点を減らす
+        n_probe = max(2*n_slices_quick+1, probe_n_min) if quick_mode else 221
+        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=n_probe)
         if s is None:
             continue
         x1, x2, xs_s, ys_s, h = s
         dmax = float(np.max(h))
         if dmax < depth_min - 1e-9 or dmax > depth_max + 1e-9:
             continue
-
         if quick_mode:
             Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices_quick)
         else:
@@ -282,16 +243,13 @@ def arcs_from_center_by_entries_multi(
                     Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
             else:
                 Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
-
         if Fs is None:
             continue
-
         yield (float(x1), float(x2), float(R), float(Fs))
         count += 1
         if quick_mode and (limit_arcs_per_center is not None) and (count >= limit_arcs_per_center):
-            return  # 早期終了
+            return
 
-# ---------- 例: プリセット ----------
 def make_ground_example(H: float, L: float) -> GroundPL:
     X = np.array([0.0, 0.30*L, 0.63*L, L], dtype=float)
     Y = np.array([H,   0.88*H, 0.46*H, 0.0], dtype=float)
