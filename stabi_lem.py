@@ -1,4 +1,4 @@
-　# stabi_lem.py — LEM core (no water). Fellenius & Bishop(simplified), multilayer, interfaces, crossing control.
+# stabi_lem.py — LEM core (no water). Fellenius & Bishop(simplified), multilayer, interfaces, crossing control.
 from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass
