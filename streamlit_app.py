@@ -1,4 +1,4 @@
-# streamlit_app.py — audit改善・端ヒット時の自動拡張・被覆率表示
+# streamlit_app.py — audit改善・端ヒット時の自動拡張・被覆率表示（Audit既定OFF/描画安全化）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random
@@ -144,13 +144,15 @@ if 'override' in locals() and override:
     ))
 
 # ---------------- Keys ----------------
-param_key = hash_params(dict(
-    H=H, L=L, n_layers=n_layers,
-    soils=[(s.gamma, s.c, s.phi) for s in soils],
-    allow_cross=allow_cross, Fs_target=Fs_target,
-    center=[x_min, x_max, y_min, y_max, nx, ny],
-    method=method, quality=P, depth=[depth_min, depth_max],
-))
+def param_pack():
+    return dict(
+        H=H, L=L, n_layers=n_layers,
+        soils=[(s.gamma, s.c, s.phi) for s in soils],
+        allow_cross=allow_cross, Fs_target=Fs_target,
+        center=[x_min, x_max, y_min, y_max, nx, ny],
+        method=method, quality=P, depth=[depth_min, depth_max],
+    )
+param_key = hash_params(param_pack())
 
 # ---------------- Compute ----------------
 def compute_once():
@@ -278,7 +280,8 @@ with c3:
     show_minFs = st.checkbox("Show Min Fs", True)
     show_maxT  = st.checkbox("Show Max required T", True)
 with c4:
-    audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", True)
+    # 既定OFF（重さの主犯を封じる）
+    audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
     audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality]["audit_limit_per_center"], 1, disabled=not audit_show)
     audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality]["audit_budget_s"], 0.1, disabled=not audit_show)
     audit_seed   = st.number_input("Audit seed", 0, 9999, 0, disabled=not audit_show)
@@ -286,7 +289,7 @@ with c4:
 # ---------------- Audit computation (round-robin-ish) ----------------
 def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
     rng = random.Random(int(seed))
-    order = list(range(len(centers)))
+    order = list(range(len(centers)))  # ← 余計な ) を削除
     rng.shuffle(order)  # 偏り防止
     deadline = time.time() + total_budget_s
     arcs=[]; covered=set()
@@ -307,7 +310,6 @@ def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
             count+=1
             if count>=per_center_limit: break
         if count>0: covered.add(idx)
-        # 予算超過でbreak（次の周回をしない）
         if time.time() > deadline: break
     return arcs, len(covered), len(centers)
 
@@ -327,7 +329,9 @@ if audit_show:
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
 
 Xd = np.linspace(ground.X[0], ground.X[-1], 600)
-Yg = ground.y_at(Xd)
+# ベクトル非対応でも安全に：配列内包 → ndarray
+Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
+
 if n_layers==1:
     ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
 elif n_layers==2:
@@ -339,6 +343,7 @@ else:
     ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
     ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
     ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
+
 ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if n_layers>=2:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
@@ -408,7 +413,9 @@ ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="uppe
 
 title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}"]
 if "expand_note" in res and res["expand_note"]: title_tail.append(res["expand_note"])
-if audit_show: title_tail.append(f"audit cover {covered}/{total} centers, arcs={len(audit_arcs)}")
+# covered/total は audit_show True のときだけ追加
+if 'audit_arcs' in locals() and audit_show:
+    title_tail.append(f"audit cover {covered}/{total} centers, arcs={len(audit_arcs)}")
 ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • Method={method} • " + " • ".join(title_tail))
 
 st.pyplot(fig, use_container_width=True); plt.close(fig)
