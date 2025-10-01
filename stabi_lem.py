@@ -1,4 +1,4 @@
-# stabi_lem.py — multi-layer (≤3) with per-boundary crossing control, lightweight
+# stabi_lem.py — multi-layer (≤3) with per-boundary crossing control + turbo quick mode
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Iterable
@@ -101,7 +101,7 @@ def _alpha_cos(xc, yc, R, xs):
 
 # ---------- 層の前処理（クリップと障壁） ----------
 def clip_interfaces_to_ground(ground: GroundPL, interfaces: List[GroundPL], x) -> List[np.ndarray]:
-    """各境界を必ず地表以下にし、かつ上位境界を越えないように段付きでクリップ"""
+    """各境界を必ず地表以下にし、かつ上位境界を越えないよう段付きでクリップ"""
     Yg = ground.y_at(x)
     ys_list = []
     y_top = Yg
@@ -114,12 +114,12 @@ def clip_interfaces_to_ground(ground: GroundPL, interfaces: List[GroundPL], x) -
 def barrier_y_from_flags(Yifs: List[np.ndarray], allow_cross: List[bool]) -> np.ndarray:
     """allow_cross[j]==False の境界は ‘越えられない’ → その上側に留まる (= y_arc >= that Y)"""
     if not Yifs or not allow_cross: 
+        # 制限なし
         return np.full_like(Yifs[0] if Yifs else np.array([0.0]), -1e9, dtype=float)
     assert len(allow_cross) >= len(Yifs)
     blocked = [Yifs[j] for j in range(len(Yifs)) if not allow_cross[j]]
     if not blocked:
-        return np.full_like(Yifs[0], -1e9, dtype=float)  # 制限なし
-    # “上に留まる”制約 → もっとも浅い（yが大きい）ブロック境界が支配的
+        return np.full_like(Yifs[0], -1e9, dtype=float)
     B = blocked[0].copy()
     for arr in blocked[1:]:
         B = np.maximum(B, arr)
@@ -135,13 +135,11 @@ def base_soil_vectors_multi(
 ):
     nL = len(soils)
     Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, nL-1)], xmid)
-    # 1層
     if nL == 1:
         gamma = np.full_like(xmid, soils[0].gamma, dtype=float)
         c     = np.full_like(xmid, soils[0].c,     dtype=float)
         phi   = np.full_like(xmid, soils[0].phi,   dtype=float)
         return gamma, c, phi
-    # 2層
     if nL == 2:
         Y1 = Yifs[0]
         mask1 = (y_arc >= Y1)
@@ -176,7 +174,7 @@ def fs_fellenius_poly_multi(
     hmid  = ground.y_at(xmid) - y_arc
     if np.any(hmid<=0): return None
 
-    # 障壁チェック（越えてはならない境界の上側に留まる）
+    # 障壁チェック
     Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, len(soils)-1)], xmid)
     B    = barrier_y_from_flags(Yifs, allow_cross[:max(0, len(soils)-1)])
     if np.any(y_arc < B - 1e-9):
@@ -230,7 +228,15 @@ def fs_bishop_poly_multi(
         Fs = Fs_new
     return float(Fs)
 
-# ---------- 首振り：エントリ点掃引（多層＋障壁対応 / 逐次ストリーム） ----------
+# ---------- Rを指定して再評価（精密段用） ----------
+def fs_given_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
+                     method: str, xc: float, yc: float, R: float, n_slices: int) -> Optional[float]:
+    if method.lower().startswith("b"):
+        return fs_bishop_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices)
+    else:
+        return fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices)
+
+# ---------- 首振り：エントリ掃引（Turbo: quick/limit対応） ----------
 def arcs_from_center_by_entries_multi(
     ground: GroundPL,
     soils: List[Soil],
@@ -240,12 +246,14 @@ def arcs_from_center_by_entries_multi(
     depth_min: float = 0.0, depth_max: float = 1e9,
     interfaces: List[GroundPL] | None = None,
     allow_cross: List[bool] | None = None,
+    # --- Turbo options ---
+    quick_mode: bool = False,
+    n_slices_quick: int = 16,
+    limit_arcs_per_center: Optional[int] = None,
 ) -> Iterable[Tuple[float,float,float,float]]:
     """
     戻り値: (x1, x2, R, Fs) を逐次返す（配列は保持しない）
-    soils: 層の上から順に（1〜3層）
-    interfaces: 上から順に [I1, I2]（層数-1個、無ければ[]）
-    allow_cross: 各境界に対応（True=下層へ進入可 / False=不可）
+    quick_mode=True なら Fellenius & n_slices_quick で評価し、limit_arcs_per_center で早期打ち切り
     """
     if interfaces is None: interfaces = []
     if allow_cross is None: allow_cross = [True]*len(interfaces)
@@ -254,9 +262,10 @@ def arcs_from_center_by_entries_multi(
     ys = ground.y_at(xs)
     use_bishop = method.lower().startswith("b")
 
+    count = 0
     for xe, ye in zip(xs, ys):
         R = float(math.hypot(xe - xc, ye - yc))
-        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=221)
+        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices_quick+1, 201) if quick_mode else 221)
         if s is None:
             continue
         x1, x2, xs_s, ys_s, h = s
@@ -264,32 +273,36 @@ def arcs_from_center_by_entries_multi(
         if dmax < depth_min - 1e-9 or dmax > depth_max + 1e-9:
             continue
 
-        if use_bishop:
-            Fs = fs_bishop_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
-            if Fs is None:
-                Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
+        if quick_mode:
+            Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices_quick)
         else:
-            Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
+            if use_bishop:
+                Fs = fs_bishop_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
+                if Fs is None:
+                    Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
+            else:
+                Fs = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=40)
 
         if Fs is None:
             continue
-        yield (float(x1), float(x2), float(R), float(Fs))
 
-# ---------- 例: 地表／層境界プリセット ----------
+        yield (float(x1), float(x2), float(R), float(Fs))
+        count += 1
+        if quick_mode and (limit_arcs_per_center is not None) and (count >= limit_arcs_per_center):
+            return  # 早期終了
+
+# ---------- 例: プリセット ----------
 def make_ground_example(H: float, L: float) -> GroundPL:
-    # 3セグメント（緩い段付き）—上面
     X = np.array([0.0, 0.30*L, 0.63*L, L], dtype=float)
     Y = np.array([H,   0.88*H, 0.46*H, 0.0], dtype=float)
     return GroundPL(X=X, Y=Y)
 
 def make_interface1_example(H: float, L: float) -> GroundPL:
-    # 上位の層境界
     X = np.array([0.0, 0.35*L, 0.70*L, L], dtype=float)
     Y = np.array([0.70*H, 0.60*H, 0.38*H, 0.20*H], dtype=float)
     return GroundPL(X=X, Y=Y)
 
 def make_interface2_example(H: float, L: float) -> GroundPL:
-    # さらに下位の層境界（上位よりも必ず下側になるよう想定）
     X = np.array([0.0, 0.40*L, 0.75*L, L], dtype=float)
     Y = np.array([0.45*H, 0.38*H, 0.22*H, 0.10*H], dtype=float)
     return GroundPL(X=X, Y=Y)
@@ -297,7 +310,7 @@ def make_interface2_example(H: float, L: float) -> GroundPL:
 __all__ = [
     "Soil", "GroundPL",
     "make_ground_example", "make_interface1_example", "make_interface2_example",
-    "arcs_from_center_by_entries_multi",
+    "arcs_from_center_by_entries_multi", "fs_given_R_multi",
     "fs_bishop_poly_multi", "fs_fellenius_poly_multi",
     "clip_interfaces_to_ground", "barrier_y_from_flags", "base_soil_vectors_multi",
 ]
