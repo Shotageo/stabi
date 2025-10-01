@@ -1,293 +1,279 @@
-# stabi_lem.py — LEM core with phreatic line: linear / CSV polyline / ground-offset
+# stabi_lem.py — LEM core (no water). Fellenius & Bishop(simplified), multilayer, interfaces, crossing control.
 from __future__ import annotations
-import math
 import numpy as np
 from dataclasses import dataclass
 
-# ---------------- Basic data ----------------
+# ---------------- Basic data types ----------------
 @dataclass
 class Soil:
-    gamma: float  # total unit weight [kN/m3]
-    c: float      # cohesion (effective) [kPa = kN/m2]
-    phi: float    # friction angle (effective) [deg]
+    gamma: float  # kN/m^3
+    c: float      # kPa (kN/m^2)
+    phi: float    # deg
+
+    @property
+    def phi_rad(self) -> float:
+        return np.deg2rad(self.phi)
 
 class GroundPL:
-    """Piecewise-linear ground surface. X, Y are 1D numpy arrays (monotonic in X)."""
+    """Piecewise-linear ground surface y(x). X must be sorted."""
     def __init__(self, X: np.ndarray, Y: np.ndarray):
         X = np.asarray(X, dtype=float); Y = np.asarray(Y, dtype=float)
-        assert len(X) >= 2 and X.shape == Y.shape
-        # enforce monotonic increasing X
+        assert X.ndim==1 and Y.ndim==1 and len(X)==len(Y)>=2
         order = np.argsort(X)
-        self.X = X[order]; self.Y = Y[order]
+        self.X = X[order]
+        self.Y = Y[order]
+        self.X0 = float(self.X[0]); self.X1 = float(self.X[-1])
 
-    def y_at(self, x: float) -> float:
-        X, Y = self.X, self.Y
-        if x <= X[0]: return float(Y[0])
-        if x >= X[-1]: return float(Y[-1])
-        i = np.searchsorted(X, x) - 1
-        i = max(0, min(i, len(X)-2))
-        t = (x - X[i]) / (X[i+1]-X[i] + 1e-12)
-        return float((1-t)*Y[i] + t*Y[i+1])
+    def y_at(self, x):
+        x = np.asarray(x, dtype=float)
+        return np.interp(x, self.X, self.Y, left=self.Y[0], right=self.Y[-1])
 
-# ---------------- Example geometry ----------------
+# ---------------- Example geometries ----------------
 def make_ground_example(H: float, L: float) -> GroundPL:
-    # 2段勾配の標準形
-    X = np.array([0.0, 0.40*L, L])
-    Y = np.array([H,   0.65*H, 0.0])
+    # simple planar slope from (0,H) to (L,0)
+    X = np.array([0.0, L], dtype=float)
+    Y = np.array([H, 0.0], dtype=float)
     return GroundPL(X, Y)
 
 def make_interface1_example(H: float, L: float):
-    x = np.linspace(0.0, L, 64)
-    g = make_ground_example(H, L)
-    yg = np.array([g.y_at(float(xx)) for xx in x])
-    y = np.maximum(0.0, yg - (0.35*H + 0.05*yg))
-    return (x, y)
+    # a gently dipping line below ground
+    X = np.array([0.0, L], dtype=float)
+    Y = np.array([0.50*H, 0.15*H], dtype=float)
+    return (X, Y)
 
 def make_interface2_example(H: float, L: float):
-    x = np.linspace(0.0, L, 64)
-    g = make_ground_example(H, L)
-    yg = np.array([g.y_at(float(xx)) for xx in x])
-    y = np.maximum(0.0, yg - (0.60*H + 0.05*yg))
-    return (x, y)
+    X = np.array([0.0, L], dtype=float)
+    Y = np.array([0.28*H, 0.05*H], dtype=float)
+    return (X, Y)
 
-def _interp_xy(x_src: np.ndarray, y_src: np.ndarray, xq: np.ndarray) -> np.ndarray:
-    return np.interp(xq, x_src, y_src, left=y_src[0], right=y_src[-1])
+def _interp_polyline_y(Xi: np.ndarray, Yi: np.ndarray, xq: np.ndarray) -> np.ndarray:
+    return np.interp(xq, np.asarray(Xi, dtype=float), np.asarray(Yi, dtype=float),
+                     left=Yi[0], right=Yi[-1])
 
-def clip_interfaces_to_ground(ground: GroundPL, interfaces: list[tuple[np.ndarray,np.ndarray]], xq: np.ndarray):
+def clip_interfaces_to_ground(ground: GroundPL, interfaces, Xd: np.ndarray):
+    """Return list of interface Y(Xd) clipped into [0, ground(x)]."""
+    Yg = ground.y_at(Xd)
     out = []
-    yg = np.array([ground.y_at(float(x)) for x in xq])
-    for (xi, yi) in interfaces:
-        yiq = _interp_xy(np.asarray(xi), np.asarray(yi), xq)
-        out.append(np.minimum(yiq, yg))
+    for (Xi, Yi) in interfaces:
+        Yi_q = _interp_polyline_y(Xi, Yi, Xd)
+        Yi_q = np.clip(Yi_q, 0.0, Yg)
+        out.append(Yi_q)
     return out
 
-# ---------------- Water line (phreatic) ----------------
-@dataclass
-class WaterLine:
-    """2点直線の水位線（x=0->y0, x=L->y1）、常に地表以下にクリップ。"""
-    x0: float
-    x1: float
-    y0: float
-    y1: float
-    def y_at(self, x: float, ground: GroundPL) -> float:
-        if x <= self.x0: y = self.y0
-        elif x >= self.x1: y = self.y1
-        else:
-            t = (x - self.x0) / (self.x1 - self.x0 + 1e-12)
-            y = (1-t)*self.y0 + t*self.y1
-        return min(float(y), float(ground.y_at(x)))
+# ---------------- Circle/ground intersections ----------------
+def _arc_y(x, xc, yc, R):
+    inside = np.maximum(0.0, R*R - (x - xc)**2)
+    return yc - np.sqrt(inside)
 
-@dataclass
-class WaterPolyline:
-    """CSV等で与える任意折れ線の水位線、常に地表以下にクリップ。"""
-    X: np.ndarray  # sorted
-    Y: np.ndarray
-    def y_at(self, x: float, ground: GroundPL) -> float:
-        y = float(np.interp(x, self.X, self.Y, left=self.Y[0], right=self.Y[-1]))
-        return min(y, float(ground.y_at(x)))
-
-@dataclass
-class WaterOffset:
-    """地表面から一定オフセット（下向きが正：offset>0で地表−offset）。"""
-    offset: float
-    def y_at(self, x: float, ground: GroundPL) -> float:
-        return max(0.0, float(ground.y_at(x)) - float(self.offset))
-
-# ---------------- Helpers: circle/arc ----------------
-def _circle_y(x: np.ndarray, xc: float, yc: float, R: float) -> np.ndarray:
-    dx = x - xc
-    rad = np.maximum(0.0, R*R - dx*dx)
-    return yc - np.sqrt(rad)
-
-def _arc_intersections_with_ground(ground: GroundPL, xc: float, yc: float, R: float, n_scan: int=600):
-    xs = np.linspace(ground.X[0], ground.X[-1], n_scan)
-    yg = np.array([ground.y_at(float(xx)) for xx in xs])
-    ya = _circle_y(xs, xc, yc, R)
+def _intersections_by_sampling(ground: GroundPL, xc, yc, R, N=241):
+    a = max(ground.X0, float(xc - R))
+    b = min(ground.X1, float(xc + R))
+    if b - a <= 1e-8: return None
+    xs = np.linspace(a, b, int(max(201, N)))
+    yg = ground.y_at(xs)
+    ya = _arc_y(xs, xc, yc, R)
     f = ya - yg
     s = np.sign(f)
-    hits = []
-    for i in range(len(xs)-1):
-        if s[i] == 0.0:
-            hits.append(xs[i])
-        elif s[i]*s[i+1] < 0.0:
-            a, b = xs[i], xs[i+1]
-            fa, fb = f[i], f[i+1]
-            for _ in range(30):
-                m = 0.5*(a+b)
-                fm = _circle_y(np.array([m]), xc, yc, R)[0] - ground.y_at(m)
-                if fa*fm <= 0: b, fb = m, fm
-                else: a, fa = m, fm
-            hits.append(0.5*(a+b))
-    hits = sorted(hits)
-    if len(hits) >= 2:
-        return (hits[0], hits[-1])
-    return None
+    idx = np.where(s[:-1]*s[1:] <= 0)[0]
+    if idx.size < 2:
+        return None
+    def root(i):
+        x0, x1 = xs[i], xs[i+1]; f0, f1 = f[i], f[i+1]
+        if abs(f1 - f0) < 1e-12: return float(0.5*(x0+x1))
+        t = -f0/(f1-f0); return float(x0 + t*(x1 - x0))
+    x1 = root(int(idx[0])); x2 = root(int(idx[-1]))
+    if x2 - x1 < 1e-3: return None
+    return (x1, x2)
 
-# ---------------- Layer picking ----------------
-def _layer_index_at(interfaces_clip: list[np.ndarray], xgrid: np.ndarray, x: float, y: float) -> int:
-    if not interfaces_clip: return 0
-    i = int(np.clip(np.searchsorted(xgrid, x) - 1, 0, len(xgrid)-2))
-    def yi_at(arr):
-        t = (x - xgrid[i]) / (xgrid[i+1]-xgrid[i] + 1e-12)
-        return float((1-t)*arr[i] + t*arr[i+1])
-    for k, Yk in enumerate(interfaces_clip, start=1):
-        if y >= yi_at(Yk):
-            return k-1
-    return len(interfaces_clip)
+def arc_sample_poly_best_pair(ground: GroundPL, xc: float, yc: float, R: float, n=241):
+    """Return (x1,x2) for slip arc if it cuts ground twice, else None."""
+    return _intersections_by_sampling(ground, xc, yc, R, N=max(201,int(n)))
 
-# ---------------- Driving sum (for required T calc) ----------------
-def driving_sum_for_R_multi(ground: GroundPL, interfaces: list[tuple[np.ndarray,np.ndarray]],
-                            soils: list[Soil], allow_cross: list[bool],
-                            xc: float, yc: float, R: float, n_slices: int=40) -> tuple[float,float,float] | None:
-    pair = _arc_intersections_with_ground(ground, xc, yc, R)
+# ---------------- Layer helpers ----------------
+def _interfaces_y_at(interfaces, x):
+    ys = []
+    for (Xi, Yi) in interfaces:
+        ys.append(float(np.interp(float(x), Xi, Yi, left=Yi[0], right=Yi[-1])))
+    return ys  # top→bottom order as given
+
+def _layer_index_at_depth(ground: GroundPL, interfaces, x, y):
+    """Return 1-based layer index at (x,y). Layer1: between ground and iface1."""
+    g = float(ground.y_at(x))
+    if not interfaces:
+        return 1
+    ys = _interfaces_y_at(interfaces, x)  # [y_if1, y_if2, ...]
+    # ground (top) -> if1 -> if2 -> ... -> 0
+    if y >= ys[0]:  # above or equal to first interface
+        return 1
+    for i in range(len(ys)-1):
+        if ys[i+1] <= y < ys[i]:
+            return i+2  # 2..n-1
+    # below last interface
+    return len(ys)+1
+
+def _soil_for_layer(soils, idx):
+    idx = int(max(1, min(idx, len(soils))))
+    return soils[idx-1]
+
+def _allowed_max_layer(allow_cross, n_layers):
+    # Layer1 always allowed. allow_cross[k] means "allow entering layer k+2".
+    allowed = 1
+    for k, ok in enumerate(list(allow_cross)[:max(0,n_layers-1)]):
+        if ok: allowed += 1
+        else: break
+    return min(allowed, n_layers)
+
+# ---------------- Slice integrals ----------------
+def _slice_geometry(ground: GroundPL, xc, yc, R, x_edges):
+    """Return for each slice: width dx, arc angle alpha at mid, base length b."""
+    xm = 0.5*(x_edges[:-1] + x_edges[1:])
+    ya = _arc_y(xm, xc, yc, R)
+    # derivative dy/dx of arc at xm
+    S = np.maximum(1e-12, R*R - (xm - xc)**2)
+    slope = (xm - xc)/np.sqrt(S)  # dy/dx
+    alpha = np.arctan(slope)      # base inclination (radians)
+    dx = (x_edges[1:] - x_edges[:-1])
+    b = dx/np.cos(np.clip(alpha, -1.553, 1.553))  # base length ~ projection
+    # column height ≈ ground - arc at mid (for weight area)
+    h = np.maximum(0.0, ground.y_at(xm) - ya)
+    return xm, ya, dx, alpha, b, h
+
+def _weights_by_layer(ground: GroundPL, interfaces, soils, xm, ya, dx, h):
+    """Compute slice weight W = gamma * area, using soil at base depth."""
+    W = np.zeros_like(xm)
+    gam = np.zeros_like(xm)
+    for i, x in enumerate(xm):
+        yb = ya[i]
+        layer = _layer_index_at_depth(ground, interfaces, x, yb)
+        s = _soil_for_layer(soils, layer)
+        area = max(0.0, h[i]) * dx[i]  # trapezoid approx simplified: mid height * width
+        W[i] = s.gamma * area
+        gam[i] = s.gamma
+    return W, gam
+
+def _c_phi_by_layer(ground: GroundPL, interfaces, soils, xm, ya):
+    c = np.zeros_like(xm); tanphi = np.zeros_like(xm)
+    for i, x in enumerate(xm):
+        layer = _layer_index_at_depth(ground, interfaces, x, ya[i])
+        s = _soil_for_layer(soils, layer)
+        c[i] = s.c
+        tanphi[i] = np.tan(s.phi_rad)
+    return c, tanphi
+
+# ---------------- Fs computation ----------------
+def _fellenius_fs(ground, interfaces, soils, xc, yc, R, x1, x2, n_slices):
+    x_edges = np.linspace(x1, x2, int(max(10, n_slices))+1)
+    xm, ya, dx, alpha, b, h = _slice_geometry(ground, xc, yc, R, x_edges)
+    W, _ = _weights_by_layer(ground, interfaces, soils, xm, ya, dx, h)
+    c, tanphi = _c_phi_by_layer(ground, interfaces, soils, xm, ya)
+
+    T = np.sum(W * np.sin(alpha))
+    S = np.sum(c * b + (W * np.cos(alpha)) * tanphi)
+    if T <= 1e-9: return None
+    FS = S / T
+    if not np.isfinite(FS) or FS <= 0: return None
+    return float(FS)
+
+def _bishop_fs(ground, interfaces, soils, xc, yc, R, x1, x2, n_slices):
+    x_edges = np.linspace(x1, x2, int(max(10, n_slices))+1)
+    xm, ya, dx, alpha, b, h = _slice_geometry(ground, xc, yc, R, x_edges)
+    W, _ = _weights_by_layer(ground, interfaces, soils, xm, ya, dx, h)
+    c, tanphi = _c_phi_by_layer(ground, interfaces, soils, xm, ya)
+
+    # Fixed-point iteration
+    T = np.sum(W * np.sin(alpha))
+    if T <= 1e-12: return None
+    FS = 1.0
+    for _ in range(50):
+        m = 1.0 / (1.0 + (tanphi * np.tan(alpha)) / max(FS, 1e-6))
+        num = np.sum((c * b + W * tanphi) * m)
+        den = T
+        FS_new = num / den
+        if not np.isfinite(FS_new) or FS_new <= 0: return None
+        if abs(FS_new - FS) < 1e-4:
+            FS = FS_new; break
+        FS = FS_new
+    return float(FS)
+
+def fs_given_R_multi(ground: GroundPL, interfaces, soils, allow_cross, method: str,
+                     xc: float, yc: float, R: float, n_slices: int=30):
+    # entry/exit
+    pair = arc_sample_poly_best_pair(ground, xc, yc, R, n=241)
     if pair is None: return None
     x1, x2 = pair
-    if x2 - x1 < 1e-3: return None
-    b = (x2 - x1) / n_slices
-    Xd = np.linspace(ground.X[0], ground.X[-1], 256)
-    ints = clip_interfaces_to_ground(ground, interfaces, Xd) if interfaces else []
-    D_sum = 0.0; W_sum = 0.0; S_sum = 0.0
-    for i in range(n_slices):
-        xm = x1 + (i+0.5)*b
-        yg = ground.y_at(xm)
-        ys = _circle_y(np.array([xm]), xc, yc, R)[0]
-        h = max(0.0, yg - ys)
-        if h <= 0.0: continue
-        li = _layer_index_at(ints, Xd, xm, 0.5*(ys+yg))
-        soil = soils[min(li, len(soils)-1)]
-        W = soil.gamma * b * h
-        sin_a = (xm - xc) / R
-        D_sum += W * max(0.0, sin_a)
-        W_sum += W
-        S_sum += b
-    return (D_sum, W_sum, S_sum)
+    # crossing constraint：最深点でチェック
+    y_bottom = yc - R
+    deepest_layer = _layer_index_at_depth(ground, interfaces, xc, y_bottom)
+    allowed_max = _allowed_max_layer(allow_cross, len(soils))
+    if deepest_layer > allowed_max:
+        return None
 
-# ---------------- Fs for a given R (Bishop / Fellenius) with water ----------------
-def fs_given_R_multi(ground: GroundPL, interfaces: list[tuple[np.ndarray,np.ndarray]], soils: list[Soil],
-                     allow_cross: list[bool], method: str,
-                     xc: float, yc: float, R: float, n_slices: int=40,
-                     water=None, gamma_w: float=9.81, pore_mode: str="u-only") -> float | None:
-    pair = _arc_intersections_with_ground(ground, xc, yc, R)
+    if method.lower().startswith("bishop"):
+        return _bishop_fs(ground, interfaces, soils, xc, yc, R, x1, x2, n_slices)
+    else:
+        return _fellenius_fs(ground, interfaces, soils, xc, yc, R, x1, x2, n_slices)
+
+def driving_sum_for_R_multi(ground: GroundPL, interfaces, soils, allow_cross,
+                            xc: float, yc: float, R: float, n_slices: int=30):
+    pair = arc_sample_poly_best_pair(ground, xc, yc, R, n=241)
     if pair is None: return None
     x1, x2 = pair
-    if x2 - x1 < 1e-3: return None
+    # crossing constraint（同上）
+    y_bottom = yc - R
+    deepest_layer = _layer_index_at_depth(ground, interfaces, xc, y_bottom)
+    allowed_max = _allowed_max_layer(allow_cross, len(soils))
+    if deepest_layer > allowed_max:
+        return None
 
-    Xd = np.linspace(ground.X[0], ground.X[-1], 256)
-    ints = clip_interfaces_to_ground(ground, interfaces, Xd) if interfaces else []
+    x_edges = np.linspace(x1, x2, int(max(10, n_slices))+1)
+    xm, ya, dx, alpha, b, h = _slice_geometry(ground, xc, yc, R, x_edges)
+    W, _ = _weights_by_layer(ground, interfaces, soils, xm, ya, dx, h)
+    D = np.sum(W * np.sin(alpha))
+    N = np.sum(W * np.cos(alpha))
+    B = np.sum(b)
+    if D <= 1e-12: return None
+    return float(D), float(N), float(B)
 
-    b = (x2 - x1) / n_slices
-    W = np.zeros(n_slices); sin_a = np.zeros(n_slices); cos_a = np.zeros(n_slices)
-    ub = np.zeros(n_slices)
-    phi = np.zeros(n_slices); cc = np.zeros(n_slices)
+# ---------------- Candidate generator ----------------
+def arcs_from_center_by_entries_multi(ground: GroundPL, soils, xc: float, yc: float,
+                                      n_entries: int, method: str,
+                                      depth_min: float, depth_max: float,
+                                      interfaces, allow_cross,
+                                      quick_mode: bool=True, n_slices_quick: int=12,
+                                      limit_arcs_per_center: int=120, probe_n_min: int=81):
+    """
+    Yield (x1, x2, R, Fs_quick) for a fixed center by sweeping R derived from depth band.
+    """
+    yg = float(ground.y_at(xc))
+    R_min = yc - (yg + float(depth_max))  # deeper -> smaller R
+    R_max = yc - (yg + float(depth_min))  # shallower -> larger R
+    if not np.isfinite(R_min) or not np.isfinite(R_max): return
+    R_min = max(0.05, float(R_min))
+    if R_max <= R_min + 1e-6: return
 
-    for i in range(n_slices):
-        xm = x1 + (i+0.5)*b
-        yg = ground.y_at(xm)
-        ys = _circle_y(np.array([xm]), xc, yc, R)[0]
-        h = max(0.0, yg - ys)
-        if h <= 0.0: return None
-        li = _layer_index_at(ints, Xd, xm, 0.5*(ys+yg))
-        soil = soils[min(li, len(soils)-1)]
-        phi[i] = math.radians(float(soil.phi))
-        cc[i] = float(soil.c)
+    nR = int(max(20, min(n_entries, 2000)))
+    Rs = np.linspace(R_min, R_max, nR)
 
-        if water and pore_mode == "buoyancy":
-            yw = water.y_at(xm, ground)
-            h_w = max(0.0, min(yg, yw) - ys)
-            h_a = max(0.0, yg - max(ys, yw))
-            gamma_eff = soil.gamma * h_a + max(0.0, soil.gamma - gamma_w) * h_w
-            W[i] = gamma_eff * b
-        else:
-            W[i] = soil.gamma * b * h
+    count = 0
+    for R in Rs:
+        pair = arc_sample_poly_best_pair(ground, xc, yc, float(R), n=201)
+        if pair is None:
+            continue
+        x1, x2 = pair
+        # crossing constraint at deepest point
+        yb = yc - R
+        deepest_layer = _layer_index_at_depth(ground, interfaces, xc, yb)
+        allowed_max = _allowed_max_layer(allow_cross, len(soils))
+        if deepest_layer > allowed_max:
+            continue
 
-        s = (xm - xc) / R
-        s = max(-1.0, min(1.0, s))
-        sin_a[i] = s
-        cos_a[i] = math.sqrt(max(0.0, 1.0 - s*s))
-
-        if water:
-            yw = water.y_at(xm, ground)
-            head = max(0.0, yw - ys)
-            ub[i] = gamma_w * head * b
-        else:
-            ub[i] = 0.0
-
-    if method.startswith("Fellenius"):
-        num = 0.0; den = 0.0
-        for i in range(n_slices):
-            N_eff = W[i]*cos_a[i] - ub[i]
-            num += cc[i]*b + max(0.0, N_eff) * math.tan(phi[i])
-            den += W[i]*sin_a[i]
-        if den <= 0.0: return None
-        return float(num / den)
-
-    Fs = 1.20
-    for _ in range(60):
-        num = 0.0; den = 0.0
-        for i in range(n_slices):
-            S = cc[i]*b + (W[i] - ub[i]) * math.tan(phi[i])
-            m = cos_a[i] + (math.tan(phi[i])*sin_a[i])/max(Fs, 1e-9)
-            num += S / max(m, 1e-9)
-            den += W[i]*sin_a[i]
-        if den <= 0.0: return None
-        Fs_new = num / den
-        if not math.isfinite(Fs_new): return None
-        if abs(Fs_new - Fs) < 1e-4: return float(Fs_new)
-        Fs = 0.5*Fs + 0.5*Fs_new
-    return float(Fs)
-
-# ---------------- Entry/exit → R generation (Quick) ----------------
-def arcs_from_center_by_entries_multi(
-    ground: GroundPL, soils: list[Soil], xc: float, yc: float,
-    n_entries: int=220, method: str="Fellenius",
-    depth_min: float=0.5, depth_max: float=4.0,
-    interfaces: list[tuple[np.ndarray,np.ndarray]]|None=None, allow_cross: list[bool]|None=None,
-    quick_mode: bool=True, n_slices_quick: int=12,
-    limit_arcs_per_center: int=120, probe_n_min: int=81,
-    water=None, gamma_w: float=9.81, pore_mode: str="u-only",
-    tol_R: float=0.03,   # ← R一致の許容（救済で広げる）
-):
-    """Generate slip circles for a fixed center by pairing entry/exit points along ground."""
-    L0, L1 = float(ground.X[0]), float(ground.X[-1])
-    Xs = np.linspace(L0, L1, int(n_entries))
-    Yg = np.array([ground.y_at(float(x)) for x in Xs])
-
-    out = 0
-    min_span = max(0.04*(L1-L0), 0.8)
-    step = max(1, len(Xs)//max(1, int(probe_n_min)))
-    for i in range(0, len(Xs)-2, step):
-        x1 = float(Xs[i]); y1 = float(Yg[i])
-        R1 = math.hypot(x1 - xc, y1 - yc)
-        for j in range(i+2, len(Xs), step):
-            x2 = float(Xs[j]); y2 = float(Yg[j])
-            if x2 - x1 < min_span: continue
-            R2 = math.hypot(x2 - xc, y2 - yc)
-            if abs(R2 - R1) > tol_R*max(R1,1e-6):
-                continue
-            R = 0.5*(R1 + R2)
-
-            xm = 0.5*(x1+x2)
-            yg = ground.y_at(xm)
-            ys = yc - math.sqrt(max(0.0, R*R - (xm - xc)**2))
-            dvert = max(0.0, yg - ys)
-            if not (depth_min <= dvert <= depth_max):
-                continue
-
-            Fs_q = fs_given_R_multi(
-                ground, interfaces or [], soils, allow_cross or [], method,
-                xc, yc, R, n_slices=n_slices_quick,
-                water=water, gamma_w=gamma_w, pore_mode=pore_mode
-            )
-            if Fs_q is None or not math.isfinite(Fs_q):
-                continue
-
-            yield (x1, x2, R, float(Fs_q))
-            out += 1
-            if out >= limit_arcs_per_center:
-                return
-
-# ---------------- Arc sampling for plot ----------------
-def arc_sample_poly_best_pair(ground: GroundPL, xc: float, yc: float, R: float, n: int=201):
-    pr = _arc_intersections_with_ground(ground, xc, yc, R)
-    if pr is None: return None
-    return (float(pr[0]), float(pr[1]))
+        nsl = int(max(8, n_slices_quick if quick_mode else max(12, n_slices_quick)))
+        Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, float(R), n_slices=nsl)
+        if Fs is None: 
+            continue
+        yield (float(x1), float(x2), float(R), float(Fs))
+        count += 1
+        if count >= int(limit_arcs_per_center):
+            break
+    # ensure at least probe_n_min attempts were possible（ここでは yield 数でなく探査完了なのでノーオペ）
+    return
