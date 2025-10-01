@@ -1,4 +1,4 @@
-# streamlit_app.py — 確定実行モード（手入力しても計算しない／ボタン押下でだけ確定・計算）
+# streamlit_app.py — 確定実行＋MinFs/MaxTにスライス線を重ね描画
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random
@@ -11,8 +11,8 @@ from stabi_lem import (
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
 )
 
-st.set_page_config(page_title="Stabi LEM｜確定実行モード", layout="wide")
-st.title("Stabi LEM｜確定実行（パラメータは［計算開始］でだけ反映）")
+st.set_page_config(page_title="Stabi LEM｜確定実行＋スライス表示", layout="wide")
+st.title("Stabi LEM｜確定実行（Min-Fs / Max-T にスライス重ね描画）")
 
 # ---------------- Quality ----------------
 QUALITY = {
@@ -66,14 +66,14 @@ def near_edge(xc, yc, x_min, x_max, y_min, y_max, tol=1e-9):
     at_top   = abs(yc - y_max) < tol
     return at_left or at_right or at_bottom or at_top, dict(left=at_left,right=at_right,bottom=at_bottom,top=at_top)
 
-# ===================== UI（キー付き） =====================
+# ===================== 確定実行モードのUI状態 =====================
 def _init_once():
     ss = st.session_state
     ss.setdefault("ui_H", 25.0)
     ss.setdefault("ui_L", 60.0)
     ss.setdefault("ui_layers", 3)
     ss.setdefault("ui_soils", [(18.0,5.0,30.0),(19.0,8.0,28.0),(20.0,12.0,25.0)])  # (γ,c,φ)
-    ss.setdefault("ui_allow_cross", [True, True])  # into layer2, into layer3
+    ss.setdefault("ui_allow_cross", [True, True])
     ss.setdefault("ui_Fs_target", 1.20)
     ss.setdefault("ui_xmin_ratio", 0.25)
     ss.setdefault("ui_xmax_ratio", 1.15)
@@ -275,29 +275,29 @@ def compute_once(params):
 
     # Quick（R候補抽出）
     with st.spinner("Quick（R候補抽出）"):
-        heap_R=[]; deadline=time.time()+P["budget_quick_s"]
+        heap_R=[]; deadline=time.time()+params["quality"]["budget_quick_s"]
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
             ground, [Soil(*t) for t in params["soils"]], xc, yc,
-            n_entries=P["n_entries_final"], method="Fellenius",
+            n_entries=params["quality"]["n_entries_final"], method="Fellenius",
             depth_min=depth_min, depth_max=depth_max,
             interfaces=interfaces, allow_cross=allow_cross,
-            quick_mode=True, n_slices_quick=P["quick_slices"],
-            limit_arcs_per_center=P["limit_arcs_quick"],
-            probe_n_min=P["probe_n_min_quick"],
+            quick_mode=True, n_slices_quick=params["quality"]["quick_slices"],
+            limit_arcs_per_center=params["quality"]["limit_arcs_quick"],
+            probe_n_min=params["quality"]["probe_n_min_quick"],
         ):
             heapq.heappush(heap_R, (-Fs, R))
-            if len(heap_R) > max(P["show_k"], P["top_thick"] + 20): heapq.heappop(heap_R)
+            if len(heap_R) > max(params["quality"]["show_k"], params["quality"]["top_thick"] + 20): heapq.heappop(heap_R)
             if time.time() > deadline: break
         R_candidates = [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
         if not R_candidates:
             return dict(error="Quickで円弧候補なし。深さ/進入可/Qualityを緩めてください。")
 
-    # -------- Refine（★修正：interfaces を正しく渡す） --------
+    # Refine（interfacesを正しく渡す）
     refined=[]
-    for R in R_candidates[:P["show_k"]]:
+    for R in R_candidates[:params["quality"]["show_k"]]:
         Fs_val = fs_given_R_multi(
             ground, interfaces, [Soil(*t) for t in params["soils"]],
-            allow_cross, method, xc, yc, R, n_slices=P["final_slices"]
+            allow_cross, params["method"], xc, yc, R, n_slices=params["quality"]["final_slices"]
         )
         if Fs_val is None: continue
         s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
@@ -305,7 +305,7 @@ def compute_once(params):
         x1,x2,*_ = s
         packD = driving_sum_for_R_multi(
             ground, interfaces, [Soil(*t) for t in params["soils"]],
-            allow_cross, xc, yc, R, n_slices=P["final_slices"]
+            allow_cross, xc, yc, R, n_slices=params["quality"]["final_slices"]
         )
         if packD is None: continue
         D_sum,_,_ = packD
@@ -347,19 +347,25 @@ centers_disp = res["centers_disp"]; centers_audit = res["centers_audit"]
 Fs_target = params["Fs_target"]; method=params["method"]; n_layers=params["n_layers"]
 L=params["L"]; H=params["H"]
 quality_label = params["quality_label"]
+final_slices_vis = params["quality"]["final_slices"]
 
 # ---------------- 表示オプション ----------------
 st.subheader("表示オプション")
-c1,c2,c3,c4 = st.columns([1,1,1,2])
+c1,c2,c3,c4 = st.columns([1,1,2,2])
 with c1:
-    show_centers = st.checkbox("Show center-grid (all points)", True)
+    show_centers = st.checkbox("Show center-grid", True)
 with c2:
     show_all_refined = st.checkbox("Show refined arcs (Fs-colored)", True)
 with c3:
     show_minFs = st.checkbox("Show Min Fs", True)
-    show_maxT  = st.checkbox("Show Max required T", True)
+    show_minFs_slices = st.checkbox("Show slices on Min-Fs arc", True, disabled=not show_minFs)
 with c4:
-    audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
+    show_maxT  = st.checkbox("Show Max required T", True)
+    show_maxT_slices = st.checkbox("Show slices on Max-T arc", False, disabled=not show_maxT)
+
+# 監査（既定OFF）
+with st.expander("Audit (Quick arcs from all centers)", expanded=False):
+    audit_show = st.checkbox("Enable audit overlay", False)
     audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality_label]["audit_limit_per_center"], 1, disabled=not audit_show)
     audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality_label]["audit_budget_s"], 0.1, disabled=not audit_show)
     audit_seed   = st.number_input("Audit seed", 0, 9999, 0, disabled=not audit_show)
@@ -402,6 +408,18 @@ if audit_show:
             audit_arcs, covered, total = compute_audit_arcs(centers_audit, audit_limit, audit_budget, seed=audit_seed)
         st.session_state["audit_cache"] = {"key": akey, "arcs": audit_arcs, "covered": covered, "total": total}
 
+# ---------------- スライス線の描画ヘルパ ----------------
+def draw_slice_lines(ax, x1, x2, xc, yc, R, ground: GroundPL, n_slices: int,
+                     color=(0.3,0.3,0.3), lw=0.8, alpha=0.8):
+    xs_e = np.linspace(float(x1), float(x2), int(n_slices)+1)
+    inside = np.maximum(0.0, R*R - (xs_e - xc)**2)
+    y_arc_e = yc - np.sqrt(inside)
+    y_g_e   = ground.y_at(xs_e)
+    # 安全側：厚みが正の区間のみ描画
+    for xe, ya, yg in zip(xs_e, y_arc_e, y_g_e):
+        if np.isfinite(ya) and np.isfinite(yg) and (yg - ya) >= 0:
+            ax.plot([xe, xe], [ya, yg], color=color, linewidth=lw, alpha=alpha)
+
 # ---------------- Plot（確定パラメータの地形で描画） ----------------
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
 
@@ -436,17 +454,6 @@ if show_centers:
     xs=[c[0] for c in centers_disp]; ys=[c[1] for c in centers_disp]
     ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
 
-# chosen center
-ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
-
-# audit arcs
-if audit_show and audit_arcs:
-    for a in audit_arcs:
-        cx,cy,R,x1,x2,Fs = a["xc"],a["yc"],a["R"],a["x1"],a["x2"],a["Fs"]
-        xs = np.linspace(x1, x2, 140)
-        ys = cy - np.sqrt(np.maximum(0.0, R*R - (xs - cx)**2))
-        ax.plot(xs, ys, linewidth=0.6, alpha=0.25, color=fs_to_color(Fs))
-
 # refined (chosen center)
 if show_all_refined:
     for d in refined:
@@ -454,15 +461,20 @@ if show_all_refined:
         ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
         ax.plot(xs, ys, linewidth=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
 
-# pick-ups
+# pick-ups + スライス線
+drawn_ids=set()
 if show_minFs and 0<=idx_minFs<len(refined):
     d=refined[idx_minFs]
     xs=np.linspace(d["x1"], d["x2"], 400)
     ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
     ax.plot(xs, ys, linewidth=3.0, color=(0.9,0.0,0.0), label=f"Min Fs = {d['Fs']:.3f}")
+    # 半径線
     y1=float(ground.y_at(d["x1"])); y2=float(ground.y_at(d["x2"]))
     ax.plot([xc,d["x1"]],[yc,y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
     ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
+    if show_minFs_slices:
+        draw_slice_lines(ax, d["x1"], d["x2"], xc, yc, d["R"], ground, final_slices_vis, color=(0.2,0.2,0.2), lw=0.8, alpha=0.85)
+    drawn_ids.add(idx_minFs)
 
 if show_maxT and 0<=idx_maxT<len(refined):
     d=refined[idx_maxT]
@@ -473,8 +485,18 @@ if show_maxT and 0<=idx_maxT<len(refined):
     y1=float(ground.y_at(d["x1"])); y2=float(ground.y_at(d["x2"]))
     ax.plot([xc,d["x1"]],[yc,y1], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
     ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
+    if show_maxT_slices and (idx_maxT not in drawn_ids):
+        draw_slice_lines(ax, d["x1"], d["x2"], xc, yc, d["R"], ground, final_slices_vis, color=(0.25,0.25,0.25), lw=0.8, alpha=0.85)
 
-# axis & legend
+# 監査オーバレイ
+if audit_show and audit_arcs:
+    for a in audit_arcs:
+        cx,cy,R,x1,x2,Fs = a["xc"],a["yc"],a["R"],a["x1"],a["x2"],a["Fs"]
+        xs = np.linspace(x1, x2, 140)
+        ys = cy - np.sqrt(np.maximum(0.0, R*R - (xs - cx)**2))
+        ax.plot(xs, ys, linewidth=0.6, alpha=0.25, color=fs_to_color(Fs))
+
+# 軸・凡例
 x_min, x_max, y_min, y_max, nx, ny = params["center"]
 x_upper = max(1.18*L, x_max + 0.05*L, 100.0)
 y_upper = max(2.30*H, y_max + 0.05*H, 100.0)
