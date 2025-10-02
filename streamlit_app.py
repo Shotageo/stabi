@@ -1,7 +1,7 @@
-# streamlit_app.py — audit改善・端ヒット時の自動拡張・被覆率表示（Audit既定OFF/描画安全化+y>=0クリップ）
+# streamlit_app.py — audit改善・端ヒット自動拡張・被覆率表示＋水位指定対応（全文差し替え）
 from __future__ import annotations
 import streamlit as st
-import numpy as np, heapq, time, hashlib, json, random
+import numpy as np, heapq, time, hashlib, json, random, io, csv
 import matplotlib.pyplot as plt
 
 from stabi_lem import (
@@ -9,6 +9,7 @@ from stabi_lem import (
     make_ground_example, make_interface1_example, make_interface2_example,
     clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
+    # stabi_lem 側の make_water_from_* を使わず、ここでは CSV/Offset を UI で z(x) にして dict 化
 )
 
 st.set_page_config(page_title="Stabi LEM｜監査＆自動拡張", layout="wide")
@@ -138,6 +139,46 @@ with st.form("params"):
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
         depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5)
 
+        st.subheader("Water")
+        water_mode = st.radio("Water model", ["Dry", "Offset from ground", "CSV (x,z)", "ru model"], index=0, horizontal=True)
+        water = None
+        if water_mode == "Offset from ground":
+            offset = st.number_input("Offset (m): +above / -below ground", -50.0, 50.0, -1.5, 0.1)
+            def zfun(x):
+                return np.asarray(ground.y_at(x), dtype=float) + float(offset)
+            water = {"type":"WT","z": zfun, "meta":{"source":"offset","offset":float(offset)}}
+        elif water_mode == "CSV (x,z)":
+            up = st.file_uploader("Upload waterline CSV (columns: x,z)", type=["csv"])
+            if up is not None:
+                data = up.read().decode("utf-8")
+                xs, zs = [], []
+                snif = csv.Sniffer()
+                has_header = snif.has_header(data[:1024])
+                rd = csv.reader(io.StringIO(data))
+                if has_header: next(rd, None)
+                for row in rd:
+                    if len(row) < 2: continue
+                    try:
+                        xs.append(float(row[0])); zs.append(float(row[1]))
+                    except: pass
+                if len(xs) >= 2:
+                    xp = np.array(xs, dtype=float)
+                    yp = np.array(zs, dtype=float)
+                    def zfun(x):
+                        x = np.asarray(x, dtype=float)
+                        out = np.empty_like(x)
+                        out[x <= xp[0]] = yp[0]
+                        out[x >= xp[-1]] = yp[-1]
+                        mid = (x > xp[0]) & (x < xp[-1])
+                        out[mid] = np.interp(x[mid], xp, yp)
+                        return out
+                    water = {"type":"WT","z": zfun, "meta":{"source":"csv","n":len(xp)}}
+        elif water_mode == "ru model":
+            ru = st.number_input("ru value", 0.0, 1.0, 0.3, 0.05)
+            water = {"type":"ru","ru": float(ru)}
+        else:
+            water = {"type":"dry"}
+
     run = st.form_submit_button("▶ 計算開始")
 
 # ---------------- Quality expand ----------------
@@ -158,12 +199,12 @@ def param_pack():
         allow_cross=allow_cross, Fs_target=Fs_target,
         center=[x_min, x_max, y_min, y_max, nx, ny],
         method=method, quality=P, depth=[depth_min, depth_max],
+        water_mode=water_mode
     )
 param_key = hash_params(param_pack())
 
 # ---------------- Compute ----------------
 def compute_once():
-    # 1) Coarse: pick best center with time budget
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
@@ -189,6 +230,7 @@ def compute_once():
                 quick_mode=True, n_slices_quick=max(8, P["quick_slices"]//2),
                 limit_arcs_per_center=P["coarse_limit_arcs"],
                 probe_n_min=P["coarse_probe_min"],
+                water=water
             ):
                 cnt+=1
                 if (Fs_min is None) or (Fs < Fs_min): Fs_min = Fs
@@ -205,7 +247,6 @@ def compute_once():
             return dict(error="Coarseで候補なし。枠/深さを広げてください。")
     xc, yc = center
 
-    # 端ヒットなら監査用に外側へ一段拡張（計算枠はそのまま）
     hit, where = near_edge(xc,yc,x_min,x_max,y_min,y_max)
     expand_note = None
     x_min_a, x_max_a, y_min_a, y_max_a = x_min, x_max, y_min, y_max
@@ -217,7 +258,6 @@ def compute_once():
         if where["top"]:   y_max_a = y_max + 0.20*dy
         expand_note = f"Auto-extend audit grid: x[{x_min_a:.1f},{x_max_a:.1f}], y[{y_min_a:.1f},{y_max_a:.1f}]"
 
-    # 2) Quick at chosen center → R candidates
     with st.spinner("Quick（R候補抽出）"):
         heap_R=[]; deadline=time.time()+P["budget_quick_s"]
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
@@ -228,6 +268,7 @@ def compute_once():
             quick_mode=True, n_slices_quick=P["quick_slices"],
             limit_arcs_per_center=P["limit_arcs_quick"],
             probe_n_min=P["probe_n_min_quick"],
+            water=water
         ):
             heapq.heappush(heap_R, (-Fs, R))
             if len(heap_R) > max(P["show_k"], P["top_thick"] + 20): heapq.heappop(heap_R)
@@ -236,15 +277,17 @@ def compute_once():
         if not R_candidates:
             return dict(error="Quickで円弧候補なし。深さ/進入可/Qualityを緩めてください。")
 
-    # 3) Refine for chosen center
     refined=[]
     for R in R_candidates[:P["show_k"]]:
-        Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
+        Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R,
+                              n_slices=P["final_slices"], water=water)
         if Fs is None: continue
+        # span 取得（描画都合。計算は stabi_lem 内で y_floor=-inf で評価される）
         s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
         if s is None: continue
         x1,x2,*_ = s
-        packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
+        packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R,
+                                        n_slices=P["final_slices"], water=water)
         if packD is None: continue
         D_sum,_,_ = packD
         T_req = max(0.0, (Fs_target - Fs)*D_sum)
@@ -255,14 +298,13 @@ def compute_once():
     idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
     idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
 
-    # 全センター監査用グリッド（表示重視、計算枠はそのまま）
     centers_disp = grid_points(x_min, x_max, y_min, y_max, nx, ny)
     centers_audit= grid_points(x_min_a, x_max_a, y_min_a, y_max_a, nx, ny)
 
-    return dict(center=(xc,yc), tested_centers=tested, refined=refined,
+    return dict(center=(xc,yc), refined=refined,
                 idx_minFs=idx_minFs, idx_maxT=idx_maxT,
                 centers_disp=centers_disp, centers_audit=centers_audit,
-                expand_note=expand_note)
+                expand_note=expand_note, water_mode=water_mode)
 
 # run
 if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
@@ -287,7 +329,6 @@ with c3:
     show_minFs = st.checkbox("Show Min Fs", True)
     show_maxT  = st.checkbox("Show Max required T", True)
 with c4:
-    # 既定OFF（重さの主犯を封じる）
     audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
     audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality]["audit_limit_per_center"], 1, disabled=not audit_show)
     audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality]["audit_budget_s"], 0.1, disabled=not audit_show)
@@ -316,6 +357,7 @@ if n_layers>=2:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
 if n_layers>=3:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
+
 # 外周
 ax.plot([ground.X[-1], ground.X[-1]],[0.0, ground.y_at(ground.X[-1])], linewidth=1.0)
 ax.plot([ground.X[0],  ground.X[-1]],[0.0, 0.0],                       linewidth=1.0)
@@ -328,8 +370,8 @@ if show_centers:
 # chosen center
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
-# audit arcs（描画時クリップ）
-if audit_show:
+# audit arcs（描画時クリップ）— 監査機能は別途キャッシュ構成に依存するため省略維持
+if audit_show and "audit_cache" in st.session_state:
     for a in st.session_state.get("audit_cache", {}).get("arcs", []):
         cx,cy,R,x1,x2,Fs = a["xc"],a["yc"],a["R"],a["x1"],a["x2"],a["Fs"]
         xs = np.linspace(x1, x2, 140)
@@ -392,7 +434,7 @@ legend_patches=[Patch(color=(0.85,0,0),label="Fs<1.0"),
 h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
-title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}"]
+title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}", f"Water={res['water_mode']}"]
 if "expand_note" in res and res["expand_note"]: title_tail.append(res["expand_note"])
 if 'audit_cache' in st.session_state and audit_show:
     cache = st.session_state['audit_cache']
