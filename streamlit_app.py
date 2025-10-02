@@ -268,11 +268,37 @@ param_key = hash_params(param_pack())
 
 # ---------------- Compute ----------------
 # ---------------- Compute ----------------
+# ---------------- Compute ----------------
 def compute_once():
-    # === パラメータ ===
-    EXT_FACTOR = 0.30   # 1回の拡張率（幅/高さの30%を外側へ足す）
-    MAX_EXT_ROUNDS = 2  # 最大拡張ラウンド数
-    FS_IMPROVE_TOL = 1e-4  # 改善がこの相対量未満なら打ち切り（0.01%）
+    """
+    仕様強化：
+    - ユーザー指定の center-grid を「初期枠」として扱うが、最小FSの中心が外周上に来た場合は
+      ユーザー指定を越えて外側に強制拡張して再探索する。
+    - 最終的に「最小FSの中心の四方向（左右上下）すべてで、少なくとも1グリッド間隔以上の内側にある」
+      （= 周囲にまだ center-grid が残っている）状態で終了する。
+    """
+    # === 拡張パラメータ ===
+    EXT_FACTOR_START = 0.30      # 1回目拡張は現枠の30%を外側へ
+    EXT_FACTOR_GROW  = 1.35      # 拡張はラウンドごとに倍率を掛けて強める
+    MAX_EXT_ROUNDS   = 6         # 最大拡張ラウンド
+    FS_IMPROVE_TOL   = 1e-4      # FS 改善が 0.01% 未満なら「打ち切り候補」
+    INTERIOR_MARGIN  = 1.00      # 「内側1マス以上」= ちょうど1グリッド間隔
+    TINY             = 1e-12
+
+    def grid_step(xmin, xmax, ymin, ymax):
+        """現在のグリッドでの中心点間隔（ほぼ）"""
+        dxg = (xmax - xmin) / max(nx - 1, 1)
+        dyg = (ymax - ymin) / max(ny - 1, 1)
+        return dxg, dyg
+
+    def is_center_interior(xc, yc, xmin, xmax, ymin, ymax):
+        """中心が四方向すべてで最低1マス分だけ内側にあるか？"""
+        dxg, dyg = grid_step(xmin, xmax, ymin, ymax)
+        left_ok   = (xc - xmin) > (INTERIOR_MARGIN * dxg + TINY)
+        right_ok  = (xmax - xc) > (INTERIOR_MARGIN * dxg + TINY)
+        bottom_ok = (yc - ymin) > (INTERIOR_MARGIN * dyg + TINY)
+        top_ok    = (ymax - yc) > (INTERIOR_MARGIN * dyg + TINY)
+        return left_ok and right_ok and bottom_ok and top_ok
 
     def subsampled_centers(xmin, xmax, ymin, ymax):
         xs = np.linspace(xmin, xmax, nx)
@@ -328,7 +354,7 @@ def compute_once():
             if time.time() > deadline: break
         R_candidates = [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
         if not R_candidates:
-            return None, None
+            return [], None
 
         # Refine
         refined_local=[]
@@ -350,24 +376,24 @@ def compute_once():
         refined_local.sort(key=lambda d:d["Fs"])
         return refined_local, float(refined_local[0]["Fs"])
 
-    # ====== ここから自動拡張ループ ======
-    # 初期グリッド
-    cur = dict(xmin=x_min, xmax=x_max, ymin=y_min, ymax=y_max)
-    history = []
+    # ====== 強制拡張ループ ======
+    # 初期（ユーザー指定）枠
+    user_box = dict(xmin=x_min, xmax=x_max, ymin=y_min, ymax=y_max)
+    cur = dict(**user_box)
     best_pack = None  # (Fs_min, res_dict)
+    ext_factor = EXT_FACTOR_START
+    history = []
 
     for round_id in range(MAX_EXT_ROUNDS + 1):
-        with st.spinner(("Coarse/Quick/Refine 実行中" if round_id==0 else f"再探索（拡張#{round_id}）")):
+        with st.spinner("探索中…" if round_id == 0 else f"探索中（自動拡張 #{round_id}）"):
             center, tested = pick_center(cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"], P["budget_coarse_s"])
             if center is None:
-                # これまでのベストがあればそれを返す
                 if best_pack is not None:
                     break
                 return dict(error="Coarseで候補なし。枠/深さを広げてください。")
             xc, yc = center
             refined, Fs_min = refine_at_center(xc, yc)
             if not refined:
-                # ベストがあれば採用、なければエラー
                 if best_pack is not None:
                     break
                 return dict(error="Refineで有効弧なし。設定/Qualityを見直してください。")
@@ -375,87 +401,89 @@ def compute_once():
         # 今回結果のまとめ
         idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
         idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
-        centers_disp  = grid_points(x_min, x_max, y_min, y_max, nx, ny)          # 表示用は元の範囲
-        centers_audit = grid_points(cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"], nx, ny)  # 監査は拡張後範囲
+        centers_disp  = grid_points(user_box["xmin"], user_box["xmax"], user_box["ymin"], user_box["ymax"], nx, ny)  # 表示はユーザー枠
+        centers_audit = grid_points(cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"], nx, ny)                     # 監査は現枠（拡張後）
 
         res_now = dict(center=(xc,yc), refined=refined,
                        idx_minFs=idx_minFs, idx_maxT=idx_maxT,
                        centers_disp=centers_disp, centers_audit=centers_audit)
 
         # ベスト更新
-        if (best_pack is None) or (Fs_min < best_pack[0] - FS_IMPROVE_TOL*best_pack[0]):
+        if (best_pack is None) or (Fs_min < best_pack[0] - FS_IMPROVE_TOL*max(best_pack[0],1.0)):
             best_pack = (Fs_min, res_now)
 
-        # 端ヒット判定（センターがグリッド外周に“貼り付いた”か）
-        hit, where = near_edge(xc, yc, cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"])
-        history.append(dict(round=round_id, grid=dict(**cur), center=(xc,yc), hit=where, Fs=Fs_min))
+        # 「十分に内側か？」を判定（= 周囲にまだ center-grid がある状態）
+        interior_ok = is_center_interior(xc, yc, cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"])
 
-        # 拡張する？（条件：ヒット & ラウンド余裕）
-        if (not hit) or (round_id >= MAX_EXT_ROUNDS):
+        # 端ヒットの詳細（どの辺に近いか）も記録
+        dxg, dyg = grid_step(cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"])
+        where = dict(
+            left   = (xc - cur["xmin"]) <= (INTERIOR_MARGIN * dxg + TINY),
+            right  = (cur["xmax"] - xc) <= (INTERIOR_MARGIN * dxg + TINY),
+            bottom = (yc - cur["ymin"]) <= (INTERIOR_MARGIN * dyg + TINY),
+            top    = (cur["ymax"] - yc) <= (INTERIOR_MARGIN * dyg + TINY),
+        )
+        history.append(dict(round=round_id, grid=dict(**cur), center=(xc,yc), margin_ok=interior_ok, hit=where, Fs=Fs_min))
+
+        # 条件を満たせば終了
+        if interior_ok:
             break
 
-        # どの方向へ伸ばすか
+        # ここから強制拡張（ユーザー指定より外側へ出ても拡張する）
+        # 当たっている方向にのみ伸ばす。伸ばし量は ext_factor * 現枠サイズ または
+        # 「1マス以上の余白」を確保できる量の大きい方。
         dx = (cur["xmax"] - cur["xmin"])
         dy = (cur["ymax"] - cur["ymin"])
         grew = False
-        if where["left"]:
-            cur["xmin"] = cur["xmin"] - EXT_FACTOR*dx; grew=True
-        if where["right"]:
-            cur["xmax"] = cur["xmax"] + EXT_FACTOR*dx; grew=True
-        if where["bottom"]:
-            cur["ymin"] = cur["ymin"] - EXT_FACTOR*dy; grew=True
-        if where["top"]:
-            cur["ymax"] = cur["ymax"] + EXT_FACTOR*dy; grew=True
 
-        # 伸ばしたがさらに安全側に限る：下限など最小値の制約はお好みで
-        # ここでは下方向の下限を 0.5*H に制限しない（深い円弧も探索するため）
+        # 左
+        if where["left"]:
+            need = (INTERIOR_MARGIN * dxg + TINY) - (xc - cur["xmin"])
+            add  = max(ext_factor * dx, need + 0.25*dxg)  # 少しバッファ
+            cur["xmin"] -= max(add, 0.0); grew = True
+        # 右
+        if where["right"]:
+            need = (INTERIOR_MARGIN * dxg + TINY) - (cur["xmax"] - xc)
+            add  = max(ext_factor * dx, need + 0.25*dxg)
+            cur["xmax"] += max(add, 0.0); grew = True
+        # 下
+        if where["bottom"]:
+            need = (INTERIOR_MARGIN * dyg + TINY) - (yc - cur["ymin"])
+            add  = max(ext_factor * dy, need + 0.25*dyg)
+            cur["ymin"] -= max(add, 0.0); grew = True
+        # 上
+        if where["top"]:
+            need = (INTERIOR_MARGIN * dyg + TINY) - (cur["ymax"] - yc)
+            add  = max(ext_factor * dy, need + 0.25*dyg)
+            cur["ymax"] += max(add, 0.0); grew = True
+
         if not grew:
+            # 理論上ここは来ないはずだが、保険で break
             break
+
+        # 次ラウンドは拡張を少し強める（収束促進）
+        ext_factor *= EXT_FACTOR_GROW
 
     # ループ終了：ベストを採用
     Fs_best, res_best = best_pack
-    # タイトル尾に履歴を短く付記
+    # 実績メモ
     note = []
+    # 1回でもユーザー枠の外へ出ていれば強制拡張実施
+    if (res_best["centers_audit"][0][0] < user_box["xmin"] or
+        res_best["centers_audit"][-1][0] > user_box["xmax"] or
+        any(y < user_box["ymin"] or y > user_box["ymax"] for _,y in res_best["centers_audit"])):
+        note.append("auto-extend beyond user grid")
     if len(history) > 1:
-        last = history[-1]
-        note.append(f"auto-extend {len(history)-1}x")
         sides=[]
         for k in ("left","right","bottom","top"):
             if any(h["hit"][k] for h in history):
                 sides.append(k[0].upper())
         if sides:
             note.append("dirs=" + "".join(sides))
+        note.append(f"rounds={len(history)-1}")
     res_best["expand_note"] = " / ".join(note) if note else None
     return res_best
 
-    refined=[]
-    for R in R_candidates[:P["show_k"]]:
-        Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R,
-                              n_slices=P["final_slices"], water=water)
-        if Fs is None: continue
-        # span（描画用, 計算は stabi_lem 内で y_floor=-inf 前提）
-        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
-        if s is None: continue
-        x1,x2,*_ = s
-        packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R,
-                                        n_slices=P["final_slices"], water=water)
-        if packD is None: continue
-        D_sum,_,_ = packD
-        T_req = max(0.0, (Fs_target - Fs)*D_sum)
-        refined.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
-    if not refined:
-        return dict(error="Refineで有効弧なし。設定/Qualityを見直してください。")
-    refined.sort(key=lambda d:d["Fs"])
-    idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
-    idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
-
-    centers_disp = grid_points(x_min, x_max, y_min, y_max, nx, ny)
-    centers_audit= grid_points(x_min_a, x_max_a, y_min_a, y_max_a, nx, ny)
-
-    return dict(center=(xc,yc), refined=refined,
-                idx_minFs=idx_minFs, idx_maxT=idx_maxT,
-                centers_disp=centers_disp, centers_audit=centers_audit,
-                expand_note=expand_note, water_mode=water_mode, water=water)
 
 # run
 if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
