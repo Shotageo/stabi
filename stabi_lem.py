@@ -1,4 +1,4 @@
-# stabi_lem.py — full module (centers→R生成/検査/FS評価＋内部自動ゲート)
+# stabi_lem.py — full module (centers→R生成/検査/FS評価まで一気通貫)
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Iterable
@@ -6,52 +6,6 @@ import numpy as np, math
 
 DEG = math.pi/180.0
 EPS = 1e-12
-
-# ----------------- 自動ゲート（UIに出さない） -----------------
-# 既存ソフトの“暗黙の足切り”を再現：短すぎ・薄すぎ・平坦すぎを除外
-def _gate_geometry_and_thickness(
-    ground, xc, yc, R, x1, x2, xs, ys, h, L_horiz: float
-) -> bool:
-    # 最小フェイス幅（弦長）: max(0.06*L, 3.0m)
-    y1 = float(ground.y_at(x1))
-    y2 = float(ground.y_at(x2))
-    chord = math.hypot(x2 - x1, y2 - y1)
-    lmin = max(0.06*L_horiz, 3.0)
-
-    if chord < lmin:
-        return False
-
-    # 中央角の下限: max(20°, 2*asin(lmin/(2R)))
-    if R <= 0.0:
-        return False
-    s = max(-1.0, min(1.0, chord/(2.0*R)))
-    theta = 2.0*math.asin(s)
-    s_l = max(-1.0, min(1.0, lmin/(2.0*R)))
-    theta_min = max(20.0*DEG, 2.0*math.asin(s_l))
-    if theta < theta_min:
-        return False
-
-    # 厚さの健全性＋被覆率（薄皮排除）
-    h = np.asarray(h, dtype=float)
-    if h.size == 0:
-        return False
-    hmax = float(np.max(h))
-    if not np.isfinite(hmax) or hmax <= 0.0:
-        return False
-
-    # 極端に薄い弧を除外
-    h_gate_min = max(0.30, 0.20*hmax)   # midスライス厚等の目安
-    if float(np.max(h)) < h_gate_min:
-        return False
-
-    # “十分な区間”で厚さが確保されていること（被覆率 75%以上）
-    cov_th = max(0.20, 0.10*hmax)
-    frac = float(np.mean(h >= cov_th))
-    if frac < 0.75:
-        return False
-
-    return True
-
 
 # ----------------- 基本データ構造 -----------------
 @dataclass
@@ -111,7 +65,11 @@ def circle_polyline_intersections(xc, yc, R, pl: GroundPL) -> List[Tuple[float,f
     return out
 
 # ----------------- 円弧サンプリング（最良の地表区間） -----------------
-def arc_sample_poly_best_pair(pl: GroundPL, xc, yc, R, n=241):
+def arc_sample_poly_best_pair(pl: GroundPL, xc, yc, R, n=241, y_floor: float = 0.0):
+    """
+    地表折れ線と円の交点列から、最良の区間 [x1,x2] を選びサンプルする。
+    y_floor で下限（既定: 0.0）を設定。弧が y_floor 未満に潜る区間は不採用。
+    """
     pts = circle_polyline_intersections(xc, yc, R, pl)
     if len(pts) < 2: return None
     best = None
@@ -124,6 +82,9 @@ def arc_sample_poly_best_pair(pl: GroundPL, xc, yc, R, n=241):
         if np.any(inside <= 0):
             continue
         ys = yc - np.sqrt(inside)
+        # 下限チェック：x軸の下へ潜る弧は不採用
+        if np.any(ys < y_floor - 1e-9):
+            continue
         h  = pl.y_at(xs) - ys
         if np.any(h <= 0) or np.any(~np.isfinite(h)):
             continue
@@ -194,7 +155,7 @@ def base_soil_vectors_multi(ground: GroundPL, interfaces: List[GroundPL], soils:
 # ----------------- Fs 計算 -----------------
 def fs_fellenius_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
                             xc, yc, R, n_slices=40) -> Optional[float]:
-    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
+    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201), y_floor=0.0)
     if s is None: return None
     x1, x2, xs, ys, h = s
     xs_e  = np.linspace(x1, x2, n_slices+1)
@@ -219,7 +180,7 @@ def fs_fellenius_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils:
 
 def fs_bishop_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
                          xc, yc, R, n_slices=40) -> Optional[float]:
-    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
+    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201), y_floor=0.0)
     if s is None: return None
     x1, x2, xs, ys, h = s
     xs_e  = np.linspace(x1, x2, n_slices+1)
@@ -258,7 +219,7 @@ def fs_given_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[S
 # 追加：必要抑止力計算で使う駆動項 D = Σ(W sinα)
 def driving_sum_for_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
                             xc, yc, R, n_slices=40) -> Optional[Tuple[float,float,float]]:
-    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201))
+    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201), y_floor=0.0)
     if s is None: return None
     x1, x2, xs, ys, h = s
     xs_e  = np.linspace(x1, x2, n_slices+1)
@@ -304,9 +265,8 @@ def arcs_from_center_by_entries_multi(
         return
 
     # x-サンプル（端を少し避ける）
-    x0, x1_edge = float(ground.X[0]), float(ground.X[-1])
-    xs = np.linspace(x0+1e-6, x1_edge-1e-6, n_entries)
-    L_horiz = x1_edge - x0  # UIのL相当（水平長）
+    x0, x1 = float(ground.X[0]), float(ground.X[-1])
+    xs = np.linspace(x0+1e-6, x1-1e-6, n_entries)
 
     # 深さサンプル（0は無意味。0.5m刻み相当を最低限確保）
     n_depth = max(5, int(round((depth_max - depth_min)/max(0.5, (depth_max - depth_min)/10))) + 1)
@@ -316,21 +276,14 @@ def arcs_from_center_by_entries_multi(
     for xi in xs:
         for h in hs:
             R = _R_from_x_and_depth(ground, xc, yc, float(xi), float(h))
-            if not (np.isfinite(R) and R > 0.5):
+            if not (np.isfinite(R) and R > 0.5):  # 小さ過ぎる半径は除外
                 continue
-
             # サンプル点数（表示の粗密に影響。quickでは抑制）
             n_probe = max(probe_n_min, 201) if not quick_mode else max(101, probe_n_min)
-            s = arc_sample_poly_best_pair(ground, xc, yc, R, n=n_probe)
+            s = arc_sample_poly_best_pair(ground, xc, yc, R, n=n_probe, y_floor=0.0)
             if s is None:
                 continue
             a_x1, a_x2, _xs, _ys, _h = s
-
-            # ▼▼ 内部の自動ゲート（UIに出さない） ▼▼
-            if not _gate_geometry_and_thickness(ground, xc, yc, R, a_x1, a_x2, _xs, _ys, _h, L_horiz):
-                continue
-            # ▲▲ ここまで ▼▼
-
             # Quick Fs（Fellenius固定が定石）
             Fs_q = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices_quick)
             if Fs_q is None:
