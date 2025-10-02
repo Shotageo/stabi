@@ -1,4 +1,4 @@
-# streamlit_app.py — 確定実行＋MinFs/MaxTにスライス線を重ね描画
+# streamlit_app.py — audit改善・端ヒット時の自動拡張・被覆率表示（Audit既定OFF/描画安全化+y>=0クリップ）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random
@@ -11,8 +11,8 @@ from stabi_lem import (
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
 )
 
-st.set_page_config(page_title="Stabi LEM｜確定実行＋スライス表示", layout="wide")
-st.title("Stabi LEM｜確定実行（Min-Fs / Max-T にスライス重ね描画）")
+st.set_page_config(page_title="Stabi LEM｜監査＆自動拡張", layout="wide")
+st.title("Stabi LEM｜全センター監査 & 端ヒット自動拡張")
 
 # ---------------- Quality ----------------
 QUALITY = {
@@ -66,160 +66,104 @@ def near_edge(xc, yc, x_min, x_max, y_min, y_max, tol=1e-9):
     at_top   = abs(yc - y_max) < tol
     return at_left or at_right or at_bottom or at_top, dict(left=at_left,right=at_right,bottom=at_bottom,top=at_top)
 
-# ===================== 確定実行モードのUI状態 =====================
-def _init_once():
-    ss = st.session_state
-    ss.setdefault("ui_H", 25.0)
-    ss.setdefault("ui_L", 60.0)
-    ss.setdefault("ui_layers", 3)
-    ss.setdefault("ui_soils", [(18.0,5.0,30.0),(19.0,8.0,28.0),(20.0,12.0,25.0)])  # (γ,c,φ)
-    ss.setdefault("ui_allow_cross", [True, True])
-    ss.setdefault("ui_Fs_target", 1.20)
-    ss.setdefault("ui_xmin_ratio", 0.25)
-    ss.setdefault("ui_xmax_ratio", 1.15)
-    ss.setdefault("ui_ymin_ratio", 1.60)
-    ss.setdefault("ui_ymax_ratio", 2.20)
-    ss.setdefault("ui_nx", 14)
-    ss.setdefault("ui_ny", 9)
-    ss.setdefault("ui_method", "Fellenius")
-    ss.setdefault("ui_quality_label", "Normal")
-    ss.setdefault("ui_override", False)
-    ss.setdefault("ui_depth_min", 0.5)
-    ss.setdefault("ui_depth_max", 4.0)
-    P0 = QUALITY[ss["ui_quality_label"]]
-    ss.setdefault("ui_quick_slices", P0["quick_slices"])
-    ss.setdefault("ui_final_slices", P0["final_slices"])
-    ss.setdefault("ui_n_entries_final", P0["n_entries_final"])
-    ss.setdefault("ui_probe_min_q", P0["probe_n_min_quick"])
-    ss.setdefault("ui_limit_arcs_q", P0["limit_arcs_quick"])
-    ss.setdefault("ui_budget_coarse", P0["budget_coarse_s"])
-    ss.setdefault("ui_budget_quick", P0["budget_quick_s"])
-    ss.setdefault("compute_request", False)
-    if "committed_params" not in ss:
-        params = build_params_from_ui()
-        ss["committed_params"] = params
-        ss["last_ui_hash"] = hash_params(params)
+def clip_yfloor(xs: np.ndarray, ys: np.ndarray, y_floor: float = 0.0):
+    """描画安全化：y>=y_floor の区間だけ残す。2点未満なら None を返す。"""
+    m = ys >= (y_floor - 1e-12)
+    if np.count_nonzero(m) < 2:
+        return None
+    return xs[m], ys[m]
 
-def build_params_from_ui():
-    ss = st.session_state
-    H = float(ss["ui_H"]); L = float(ss["ui_L"])
-    n_layers = int(ss["ui_layers"])
-    soils_tuple = ss["ui_soils"][:n_layers]
-    soils = [Soil(*t) for t in soils_tuple]
-    allow_cross = []
-    if n_layers>=2: allow_cross.append(bool(ss["ui_allow_cross"][0]))
-    if n_layers>=3: allow_cross.append(bool(ss["ui_allow_cross"][1]))
-    quality_label = ss["ui_quality_label"]
-    P = QUALITY[quality_label].copy()
-    if ss["ui_override"]:
-        P.update(dict(
-            quick_slices=int(ss["ui_quick_slices"]),
-            final_slices=int(ss["ui_final_slices"]),
-            n_entries_final=int(ss["ui_n_entries_final"]),
-            probe_n_min_quick=int(ss["ui_probe_min_q"]),
-            limit_arcs_quick=int(ss["ui_limit_arcs_q"]),
-            budget_coarse_s=float(ss["ui_budget_coarse"]),
-            budget_quick_s=float(ss["ui_budget_quick"]),
-        ))
-    x_min = float(ss["ui_xmin_ratio"] * L)
-    x_max = float(ss["ui_xmax_ratio"] * L)
-    y_min = float(ss["ui_ymin_ratio"] * H)
-    y_max = float(ss["ui_ymax_ratio"] * H)
+# ---------------- Inputs ----------------
+with st.form("params"):
+    A, B = st.columns(2)
+    with A:
+        st.subheader("Geometry")
+        H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5)
+        L = st.number_input("L (m)", 5.0, 400.0, 60.0, 0.5)
+        ground = make_ground_example(H, L)
+
+        st.subheader("Layers")
+        n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
+        interfaces = []
+        if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
+        if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
+
+        st.subheader("Soils (top→bottom)")
+        s1 = Soil(st.number_input("γ₁", 10.0, 25.0, 18.0, 0.5),
+                  st.number_input("c₁", 0.0, 200.0, 5.0, 0.5),
+                  st.number_input("φ₁", 0.0, 45.0, 30.0, 0.5))
+        soils = [s1]
+        if n_layers >= 2:
+            s2 = Soil(st.number_input("γ₂", 10.0, 25.0, 19.0, 0.5),
+                      st.number_input("c₂", 0.0, 200.0, 8.0, 0.5),
+                      st.number_input("φ₂", 0.0, 45.0, 28.0, 0.5))
+            soils.append(s2)
+        if n_layers >= 3:
+            s3 = Soil(st.number_input("γ₃", 10.0, 25.0, 20.0, 0.5),
+                      st.number_input("c₃", 0.0, 200.0, 12.0, 0.5),
+                      st.number_input("φ₃", 0.0, 45.0, 25.0, 0.5))
+            soils.append(s3)
+
+        st.subheader("Crossing control")
+        allow_cross=[]
+        if n_layers>=2: allow_cross.append(st.checkbox("Allow into Layer 2", True))
+        if n_layers>=3: allow_cross.append(st.checkbox("Allow into Layer 3", True))
+
+        st.subheader("Target safety")
+        Fs_target = st.number_input("Target FS", 1.00, 2.00, 1.20, 0.05)
+
+    with B:
+        st.subheader("Center grid")
+        x_min = st.number_input("x min", 0.20*L, 3.00*L, 0.25*L, 0.05*L)
+        x_max = st.number_input("x max", 0.30*L, 4.00*L, 1.15*L, 0.05*L)
+        y_min = st.number_input("y min", 0.80*H, 7.00*H, 1.60*H, 0.10*H)
+        y_max = st.number_input("y max", 1.00*H, 8.00*H, 2.20*H, 0.10*H)
+        nx = st.slider("nx", 6, 60, 14)
+        ny = st.slider("ny", 4, 40, 9)
+
+        st.subheader("Method / Quality")
+        method = st.selectbox("Method", ["Bishop (simplified)","Fellenius"])
+        quality = st.select_slider("Quality", options=list(QUALITY.keys()), value="Normal")
+        with st.expander("Advanced", expanded=False):
+            override = st.checkbox("Override Quality", value=False)
+            quick_slices_in  = st.slider("Quick slices", 6, 40, QUALITY[quality]["quick_slices"], 1, disabled=not override)
+            final_slices_in  = st.slider("Final slices", 20, 80, QUALITY[quality]["final_slices"], 2, disabled=not override)
+            n_entries_final_in = st.slider("Final n_entries", 200, 4000, QUALITY[quality]["n_entries_final"], 100, disabled=not override)
+            probe_min_q_in   = st.slider("Quick min probe", 41, 221, QUALITY[quality]["probe_n_min_quick"], 10, disabled=not override)
+            limit_arcs_q_in  = st.slider("Quick max arcs/center", 20, 400, QUALITY[quality]["limit_arcs_quick"], 10, disabled=not override)
+            budget_coarse_in = st.slider("Budget Coarse (s)", 0.1, 5.0, QUALITY[quality]["budget_coarse_s"], 0.1, disabled=not override)
+            budget_quick_in  = st.slider("Budget Quick (s)", 0.1, 5.0, QUALITY[quality]["budget_quick_s"], 0.1, disabled=not override)
+
+        st.subheader("Depth range (vertical)")
+        depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
+        depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5)
+
+    run = st.form_submit_button("▶ 計算開始")
+
+# ---------------- Quality expand ----------------
+P = QUALITY[quality].copy()
+if 'override' in locals() and override:
+    P.update(dict(
+        quick_slices=quick_slices_in, final_slices=final_slices_in,
+        n_entries_final=n_entries_final_in, probe_n_min_quick=probe_min_q_in,
+        limit_arcs_quick=limit_arcs_q_in,
+        budget_coarse_s=budget_coarse_in, budget_quick_s=budget_quick_in,
+    ))
+
+# ---------------- Keys ----------------
+def param_pack():
     return dict(
         H=H, L=L, n_layers=n_layers,
         soils=[(s.gamma, s.c, s.phi) for s in soils],
-        allow_cross=allow_cross, Fs_target=float(ss["ui_Fs_target"]),
-        center=[x_min, x_max, y_min, y_max, int(ss["ui_nx"]), int(ss["ui_ny"])],
-        method=str(ss["ui_method"]), quality=P, depth=[float(ss["ui_depth_min"]), float(ss["ui_depth_max"])],
-        quality_label=quality_label,
+        allow_cross=allow_cross, Fs_target=Fs_target,
+        center=[x_min, x_max, y_min, y_max, nx, ny],
+        method=method, quality=P, depth=[depth_min, depth_max],
     )
+param_key = hash_params(param_pack())
 
-_init_once()
-
-# ---- UI ----
-A, B = st.columns(2)
-with A:
-    st.subheader("Geometry")
-    st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="ui_H")
-    st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="ui_L")
-
-    st.subheader("Layers")
-    st.selectbox("Number of layers", [1,2,3], key="ui_layers")
-
-    st.subheader("Soils (top→bottom)")
-    for i in range(st.session_state["ui_layers"]):
-        g,c,phi = st.session_state["ui_soils"][i]
-        cols = st.columns(3)
-        st.session_state["ui_soils"][i] = (
-            cols[0].number_input(f"γ{i+1}", 10.0, 25.0, g, 0.5, key=f"ui_gamma_{i+1}"),
-            cols[1].number_input(f"c{i+1}", 0.0, 200.0, c, 0.5, key=f"ui_c_{i+1}"),
-            cols[2].number_input(f"φ{i+1}", 0.0, 45.0, phi, 0.5, key=f"ui_phi_{i+1}")
-        )
-
-    st.subheader("Crossing control")
-    if st.session_state["ui_layers"] >= 2:
-        st.session_state["ui_allow_cross"][0] = st.checkbox("Allow into Layer 2", st.session_state["ui_allow_cross"][0], key="ui_allow2")
-    if st.session_state["ui_layers"] >= 3:
-        st.session_state["ui_allow_cross"][1] = st.checkbox("Allow into Layer 3", st.session_state["ui_allow_cross"][1], key="ui_allow3")
-
-    st.subheader("Target safety")
-    st.number_input("Target FS", min_value=1.00, max_value=2.00, step=0.05, key="ui_Fs_target")
-
-with B:
-    st.subheader("Center grid（比率指定）")
-    st.number_input("x min / L", 0.20, 3.00, key="ui_xmin_ratio", step=0.05, format="%.2f")
-    st.number_input("x max / L", 0.30, 4.00, key="ui_xmax_ratio", step=0.05, format="%.2f")
-    st.number_input("y min / H", 0.80, 7.00, key="ui_ymin_ratio", step=0.10, format="%.2f")
-    st.number_input("y max / H", 1.00, 8.00, key="ui_ymax_ratio", step=0.10, format="%.2f")
-    st.slider("nx", 6, 60, key="ui_nx")
-    st.slider("ny", 4, 40, key="ui_ny")
-
-    st.subheader("Method / Quality")
-    st.selectbox("Method", ["Bishop (simplified)","Fellenius"], key="ui_method")
-    st.select_slider("Quality", options=list(QUALITY.keys()), key="ui_quality_label")
-    with st.expander("Advanced", expanded=False):
-        st.checkbox("Override Quality", key="ui_override")
-        Ptmp = QUALITY[st.session_state["ui_quality_label"]]
-        if st.session_state["ui_override"]:
-            st.slider("Quick slices", 6, 40, Ptmp["quick_slices"], 1, key="ui_quick_slices")
-            st.slider("Final slices", 20, 80, Ptmp["final_slices"], 2, key="ui_final_slices")
-            st.slider("Final n_entries", 200, 4000, Ptmp["n_entries_final"], 100, key="ui_n_entries_final")
-            st.slider("Quick min probe", 41, 221, Ptmp["probe_n_min_quick"], 10, key="ui_probe_min_q")
-            st.slider("Quick max arcs/center", 20, 400, Ptmp["limit_arcs_quick"], 10, key="ui_limit_arcs_q")
-            st.slider("Budget Coarse (s)", 0.1, 5.0, Ptmp["budget_coarse_s"], 0.1, key="ui_budget_coarse")
-            st.slider("Budget Quick (s)", 0.1, 5.0, Ptmp["budget_quick_s"], 0.1, key="ui_budget_quick")
-
-    st.subheader("Depth range (vertical)")
-    st.number_input("Depth min (m)", min_value=0.0, max_value=50.0, step=0.5, key="ui_depth_min")
-    st.number_input("Depth max (m)", min_value=0.5, max_value=50.0, step=0.5, key="ui_depth_max")
-
-# ---- 計算開始ボタン（on_clickでフラグだけ立てる） ----
-def _request_compute():
-    st.session_state["compute_request"] = True
-st.button("▶ 計算開始", type="primary", on_click=_request_compute)
-
-# ---- UI変更と未反映通知 ----
-ui_params = build_params_from_ui()
-ui_hash = hash_params(ui_params)
-if ui_hash != st.session_state.get("last_ui_hash", ""):
-    st.info("パラメータは変更されていますが、**まだ計算に反映されていません**。［▶ 計算開始］で確定します。")
-
-# ===================== 確定パラメータだけで計算 =====================
-def build_scene(H,L,n_layers):
-    ground = make_ground_example(H, L)
-    interfaces=[]
-    if n_layers>=2: interfaces.append(make_interface1_example(H, L))
-    if n_layers>=3: interfaces.append(make_interface2_example(H, L))
-    return ground, interfaces
-
-def compute_once(params):
-    H=params["H"]; L=params["L"]; n_layers=params["n_layers"]
-    ground, interfaces = build_scene(H,L,n_layers)
-    allow_cross=params["allow_cross"]; Fs_target=params["Fs_target"]
-    method=params["method"]; P=params["quality"]
-    x_min, x_max, y_min, y_max, nx, ny = params["center"]
-    depth_min, depth_max = params["depth"]
-
+# ---------------- Compute ----------------
+def compute_once():
+    # 1) Coarse: pick best center with time budget
     def subsampled_centers():
         xs = np.linspace(x_min, x_max, nx)
         ys = np.linspace(y_min, y_max, ny)
@@ -238,7 +182,7 @@ def compute_once(params):
         for (xc,yc) in subsampled_centers():
             cnt=0; Fs_min=None
             for _x1,_x2,_R,Fs in arcs_from_center_by_entries_multi(
-                ground, [Soil(*t) for t in params["soils"]], xc, yc,
+                ground, soils, xc, yc,
                 n_entries=P["coarse_entries"], method="Fellenius",
                 depth_min=depth_min, depth_max=depth_max,
                 interfaces=interfaces, allow_cross=allow_cross,
@@ -261,10 +205,10 @@ def compute_once(params):
             return dict(error="Coarseで候補なし。枠/深さを広げてください。")
     xc, yc = center
 
-    # 端ヒット時に監査枠だけ拡張
+    # 端ヒットなら監査用に外側へ一段拡張（計算枠はそのまま）
     hit, where = near_edge(xc,yc,x_min,x_max,y_min,y_max)
+    expand_note = None
     x_min_a, x_max_a, y_min_a, y_max_a = x_min, x_max, y_min, y_max
-    expand_note=None
     if hit:
         dx = (x_max - x_min); dy = (y_max - y_min)
         if where["left"]:  x_min_a = x_min - 0.20*dx
@@ -273,158 +217,87 @@ def compute_once(params):
         if where["top"]:   y_max_a = y_max + 0.20*dy
         expand_note = f"Auto-extend audit grid: x[{x_min_a:.1f},{x_max_a:.1f}], y[{y_min_a:.1f},{y_max_a:.1f}]"
 
-    # Quick（R候補抽出）
+    # 2) Quick at chosen center → R candidates
     with st.spinner("Quick（R候補抽出）"):
-        heap_R=[]; deadline=time.time()+params["quality"]["budget_quick_s"]
+        heap_R=[]; deadline=time.time()+P["budget_quick_s"]
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
-            ground, [Soil(*t) for t in params["soils"]], xc, yc,
-            n_entries=params["quality"]["n_entries_final"], method="Fellenius",
+            ground, soils, xc, yc,
+            n_entries=P["n_entries_final"], method="Fellenius",
             depth_min=depth_min, depth_max=depth_max,
             interfaces=interfaces, allow_cross=allow_cross,
-            quick_mode=True, n_slices_quick=params["quality"]["quick_slices"],
-            limit_arcs_per_center=params["quality"]["limit_arcs_quick"],
-            probe_n_min=params["quality"]["probe_n_min_quick"],
+            quick_mode=True, n_slices_quick=P["quick_slices"],
+            limit_arcs_per_center=P["limit_arcs_quick"],
+            probe_n_min=P["probe_n_min_quick"],
         ):
             heapq.heappush(heap_R, (-Fs, R))
-            if len(heap_R) > max(params["quality"]["show_k"], params["quality"]["top_thick"] + 20): heapq.heappop(heap_R)
+            if len(heap_R) > max(P["show_k"], P["top_thick"] + 20): heapq.heappop(heap_R)
             if time.time() > deadline: break
         R_candidates = [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
         if not R_candidates:
             return dict(error="Quickで円弧候補なし。深さ/進入可/Qualityを緩めてください。")
 
-    # Refine（interfacesを正しく渡す）
+    # 3) Refine for chosen center
     refined=[]
-    for R in R_candidates[:params["quality"]["show_k"]]:
-        Fs_val = fs_given_R_multi(
-            ground, interfaces, [Soil(*t) for t in params["soils"]],
-            allow_cross, params["method"], xc, yc, R, n_slices=params["quality"]["final_slices"]
-        )
-        if Fs_val is None: continue
-        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251)
+    for R in R_candidates[:P["show_k"]]:
+        Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
+        if Fs is None: continue
+        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
         if s is None: continue
         x1,x2,*_ = s
-        packD = driving_sum_for_R_multi(
-            ground, interfaces, [Soil(*t) for t in params["soils"]],
-            allow_cross, xc, yc, R, n_slices=params["quality"]["final_slices"]
-        )
+        packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
         if packD is None: continue
         D_sum,_,_ = packD
-        T_req = max(0.0, (params["Fs_target"] - Fs_val)*D_sum)
-        refined.append(dict(Fs=float(Fs_val), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
+        T_req = max(0.0, (Fs_target - Fs)*D_sum)
+        refined.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
     if not refined:
         return dict(error="Refineで有効弧なし。設定/Qualityを見直してください。")
     refined.sort(key=lambda d:d["Fs"])
     idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
     idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
 
+    # 全センター監査用グリッド（表示重視、計算枠はそのまま）
     centers_disp = grid_points(x_min, x_max, y_min, y_max, nx, ny)
     centers_audit= grid_points(x_min_a, x_max_a, y_min_a, y_max_a, nx, ny)
 
-    return dict(
-        params=params, ground=ground, interfaces=interfaces,
-        center=(xc,yc), refined=refined,
-        idx_minFs=idx_minFs, idx_maxT=idx_maxT,
-        centers_disp=centers_disp, centers_audit=centers_audit,
-        expand_note=expand_note
-    )
+    return dict(center=(xc,yc), tested_centers=tested, refined=refined,
+                idx_minFs=idx_minFs, idx_maxT=idx_maxT,
+                centers_disp=centers_disp, centers_audit=centers_audit,
+                expand_note=expand_note)
 
-# ---- 実行条件：初回 or compute_request=True のときだけ計算 ----
-if ("res" not in st.session_state) or st.session_state.get("compute_request", False):
-    if st.session_state.get("compute_request", False):
-        st.session_state["committed_params"] = ui_params
-        st.session_state["last_ui_hash"] = ui_hash
-        st.session_state["compute_request"] = False
-    res = compute_once(st.session_state["committed_params"])
+# run
+if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
+    res = compute_once()
     if "error" in res: st.error(res["error"]); st.stop()
+    st.session_state["last_key"] = param_key
     st.session_state["res"] = res
 
 res = st.session_state["res"]
-params = res["params"]
-ground = res["ground"]; interfaces = res["interfaces"]
 xc,yc = res["center"]
 refined = res["refined"]; idx_minFs = res["idx_minFs"]; idx_maxT=res["idx_maxT"]
 centers_disp = res["centers_disp"]; centers_audit = res["centers_audit"]
-Fs_target = params["Fs_target"]; method=params["method"]; n_layers=params["n_layers"]
-L=params["L"]; H=params["H"]
-quality_label = params["quality_label"]
-final_slices_vis = params["quality"]["final_slices"]
 
-# ---------------- 表示オプション ----------------
+# ---------------- After-run toggles ----------------
 st.subheader("表示オプション")
-c1,c2,c3,c4 = st.columns([1,1,2,2])
+c1,c2,c3,c4 = st.columns([1,1,1,2])
 with c1:
-    show_centers = st.checkbox("Show center-grid", True)
+    show_centers = st.checkbox("Show center-grid (all points)", True)
 with c2:
     show_all_refined = st.checkbox("Show refined arcs (Fs-colored)", True)
 with c3:
     show_minFs = st.checkbox("Show Min Fs", True)
-    show_minFs_slices = st.checkbox("Show slices on Min-Fs arc", True, disabled=not show_minFs)
-with c4:
     show_maxT  = st.checkbox("Show Max required T", True)
-    show_maxT_slices = st.checkbox("Show slices on Max-T arc", False, disabled=not show_maxT)
-
-# 監査（既定OFF）
-with st.expander("Audit (Quick arcs from all centers)", expanded=False):
-    audit_show = st.checkbox("Enable audit overlay", False)
-    audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality_label]["audit_limit_per_center"], 1, disabled=not audit_show)
-    audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality_label]["audit_budget_s"], 0.1, disabled=not audit_show)
+with c4:
+    # 既定OFF（重さの主犯を封じる）
+    audit_show = st.checkbox("Show arcs from ALL centers (Quick audit)", False)
+    audit_limit = st.slider("Audit: max arcs/center", 5, 40, QUALITY[quality]["audit_limit_per_center"], 1, disabled=not audit_show)
+    audit_budget = st.slider("Audit: total budget (sec)", 1.0, 6.0, QUALITY[quality]["audit_budget_s"], 0.1, disabled=not audit_show)
     audit_seed   = st.number_input("Audit seed", 0, 9999, 0, disabled=not audit_show)
 
-# ---------------- Audit computation ----------------
-def compute_audit_arcs(centers, per_center_limit, total_budget_s, seed=0):
-    rng = random.Random(int(seed))
-    order = list(range(len(centers)))
-    rng.shuffle(order)
-    deadline = time.time() + total_budget_s
-    arcs=[]; covered=set()
-    for idx in order:
-        if time.time() > deadline: break
-        cx,cy = centers[idx]
-        count=0
-        for a_x1,a_x2,R,Fs in arcs_from_center_by_entries_multi(
-            ground, [Soil(*t) for t in params["soils"]], cx, cy,
-            n_entries=min(params["quality"]["n_entries_final"], 1200), method="Fellenius",
-            depth_min=params["depth"][0], depth_max=params["depth"][1],
-            interfaces=interfaces, allow_cross=params["allow_cross"],
-            quick_mode=True, n_slices_quick=max(10, params["quality"]["quick_slices"]),
-            limit_arcs_per_center=per_center_limit,
-            probe_n_min=max(81, params["quality"]["probe_n_min_quick"]),
-        ):
-            arcs.append(dict(x1=a_x1,x2=a_x2,R=R,Fs=Fs,xc=cx,yc=cy))
-            count+=1
-            if count>=per_center_limit: break
-        if count>0: covered.add(idx)
-        if time.time() > deadline: break
-    return arcs, len(covered), len(centers)
-
-audit_arcs=[]; covered=0; total=0
-if audit_show:
-    akey = hash_params(dict(K=st.session_state["last_ui_hash"], limit=audit_limit, budget=round(audit_budget,2), seed=int(audit_seed)))
-    cache = st.session_state.get("audit_cache", {})
-    if cache.get("key")==akey and "arcs" in cache:
-        audit_arcs=cache["arcs"]; covered=cache["covered"]; total=cache["total"]
-    else:
-        with st.spinner("Audit（全センターQuick可視化）..."):
-            audit_arcs, covered, total = compute_audit_arcs(centers_audit, audit_limit, audit_budget, seed=audit_seed)
-        st.session_state["audit_cache"] = {"key": akey, "arcs": audit_arcs, "covered": covered, "total": total}
-
-# ---------------- スライス線の描画ヘルパ ----------------
-def draw_slice_lines(ax, x1, x2, xc, yc, R, ground: GroundPL, n_slices: int,
-                     color=(0.3,0.3,0.3), lw=0.8, alpha=0.8):
-    xs_e = np.linspace(float(x1), float(x2), int(n_slices)+1)
-    inside = np.maximum(0.0, R*R - (xs_e - xc)**2)
-    y_arc_e = yc - np.sqrt(inside)
-    y_g_e   = ground.y_at(xs_e)
-    # 安全側：厚みが正の区間のみ描画
-    for xe, ya, yg in zip(xs_e, y_arc_e, y_g_e):
-        if np.isfinite(ya) and np.isfinite(yg) and (yg - ya) >= 0:
-            ax.plot([xe, xe], [ya, yg], color=color, linewidth=lw, alpha=alpha)
-
-# ---------------- Plot（確定パラメータの地形で描画） ----------------
+# ---------------- Plot ----------------
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
 
-Xd = np.linspace(0.0, L, 600)
-Yg = ground.y_at(Xd)
+Xd = np.linspace(ground.X[0], ground.X[-1], 600)
+Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
 
 if n_layers==1:
     ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
@@ -433,7 +306,7 @@ elif n_layers==2:
     ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
     ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
 else:
-    Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0], interfaces[1]], Xd)
+    Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
     ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
     ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
     ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
@@ -442,8 +315,7 @@ ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if n_layers>=2:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
 if n_layers>=3:
-    ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0], interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
-
+    ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
 # 外周
 ax.plot([ground.X[-1], ground.X[-1]],[0.0, ground.y_at(ground.X[-1])], linewidth=1.0)
 ax.plot([ground.X[0],  ground.X[-1]],[0.0, 0.0],                       linewidth=1.0)
@@ -453,51 +325,59 @@ ax.plot([ground.X[0],  ground.X[0]], [0.0, ground.y_at(ground.X[0])],  linewidth
 if show_centers:
     xs=[c[0] for c in centers_disp]; ys=[c[1] for c in centers_disp]
     ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
+# chosen center
+ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
-# refined (chosen center)
+# audit arcs（描画時クリップ）
+if audit_show:
+    for a in st.session_state.get("audit_cache", {}).get("arcs", []):
+        cx,cy,R,x1,x2,Fs = a["xc"],a["yc"],a["R"],a["x1"],a["x2"],a["Fs"]
+        xs = np.linspace(x1, x2, 140)
+        ys = cy - np.sqrt(np.maximum(0.0, R*R - (xs - cx)**2))
+        clipped = clip_yfloor(xs, ys, y_floor=0.0)
+        if clipped is None: 
+            continue
+        xs_c, ys_c = clipped
+        ax.plot(xs_c, ys_c, linewidth=0.6, alpha=0.25, color=fs_to_color(Fs))
+
+# refined（描画時クリップ）
 if show_all_refined:
     for d in refined:
         xs=np.linspace(d["x1"], d["x2"], 200)
         ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
-        ax.plot(xs, ys, linewidth=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
+        clipped = clip_yfloor(xs, ys, y_floor=0.0)
+        if clipped is None: 
+            continue
+        xs_c, ys_c = clipped
+        ax.plot(xs_c, ys_c, linewidth=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
 
-# pick-ups + スライス線
-drawn_ids=set()
+# pick-ups（描画時クリップ）
 if show_minFs and 0<=idx_minFs<len(refined):
     d=refined[idx_minFs]
     xs=np.linspace(d["x1"], d["x2"], 400)
     ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
-    ax.plot(xs, ys, linewidth=3.0, color=(0.9,0.0,0.0), label=f"Min Fs = {d['Fs']:.3f}")
-    # 半径線
-    y1=float(ground.y_at(d["x1"])); y2=float(ground.y_at(d["x2"]))
-    ax.plot([xc,d["x1"]],[yc,y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
-    ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
-    if show_minFs_slices:
-        draw_slice_lines(ax, d["x1"], d["x2"], xc, yc, d["R"], ground, final_slices_vis, color=(0.2,0.2,0.2), lw=0.8, alpha=0.85)
-    drawn_ids.add(idx_minFs)
+    clipped = clip_yfloor(xs, ys, y_floor=0.0)
+    if clipped is not None:
+        xs_c, ys_c = clipped
+        ax.plot(xs_c, ys_c, linewidth=3.0, color=(0.9,0.0,0.0), label=f"Min Fs = {d['Fs']:.3f}")
+        y1=float(ground.y_at(xs_c[0])); y2=float(ground.y_at(xs_c[-1]))
+        ax.plot([xc,xs_c[0]],[yc,y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
+        ax.plot([xc,xs_c[-1]],[yc,y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
 
 if show_maxT and 0<=idx_maxT<len(refined):
     d=refined[idx_maxT]
     xs=np.linspace(d["x1"], d["x2"], 400)
     ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
-    ax.plot(xs, ys, linewidth=3.0, linestyle="--", color=(0.2,0.0,0.8),
-            label=f"Max required T = {d['T_req']:.1f} kN/m (Fs={d['Fs']:.3f})")
-    y1=float(ground.y_at(d["x1"])); y2=float(ground.y_at(d["x2"]))
-    ax.plot([xc,d["x1"]],[yc,y1], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
-    ax.plot([xc,d["x2"]],[yc,y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
-    if show_maxT_slices and (idx_maxT not in drawn_ids):
-        draw_slice_lines(ax, d["x1"], d["x2"], xc, yc, d["R"], ground, final_slices_vis, color=(0.25,0.25,0.25), lw=0.8, alpha=0.85)
+    clipped = clip_yfloor(xs, ys, y_floor=0.0)
+    if clipped is not None:
+        xs_c, ys_c = clipped
+        ax.plot(xs_c, ys_c, linewidth=3.0, linestyle="--", color=(0.2,0.0,0.8),
+                label=f"Max required T = {d['T_req']:.1f} kN/m (Fs={d['Fs']:.3f})")
+        y1=float(ground.y_at(xs_c[0])); y2=float(ground.y_at(xs_c[-1]))
+        ax.plot([xc,xs_c[0]],[yc,y1], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
+        ax.plot([xc,xs_c[-1]],[yc,y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
 
-# 監査オーバレイ
-if audit_show and audit_arcs:
-    for a in audit_arcs:
-        cx,cy,R,x1,x2,Fs = a["xc"],a["yc"],a["R"],a["x1"],a["x2"],a["Fs"]
-        xs = np.linspace(x1, x2, 140)
-        ys = cy - np.sqrt(np.maximum(0.0, R*R - (xs - cx)**2))
-        ax.plot(xs, ys, linewidth=0.6, alpha=0.25, color=fs_to_color(Fs))
-
-# 軸・凡例
-x_min, x_max, y_min, y_max, nx, ny = params["center"]
+# axis & legend
 x_upper = max(1.18*L, x_max + 0.05*L, 100.0)
 y_upper = max(2.30*H, y_max + 0.05*H, 100.0)
 ax.set_xlim(min(0.0 - 0.05*L, -2.0), x_upper)
@@ -513,9 +393,10 @@ h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
 title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}"]
-if res.get("expand_note"): title_tail.append(res["expand_note"])
-if 'audit_arcs' in locals() and audit_show:
-    title_tail.append(f"audit cover {covered}/{total} centers, arcs={len(audit_arcs)}")
+if "expand_note" in res and res["expand_note"]: title_tail.append(res["expand_note"])
+if 'audit_cache' in st.session_state and audit_show:
+    cache = st.session_state['audit_cache']
+    title_tail.append(f"audit cover {cache.get('covered',0)}/{cache.get('total',0)} centers, arcs={len(cache.get('arcs',[]))}")
 ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • Method={method} • " + " • ".join(title_tail))
 
 st.pyplot(fig, use_container_width=True); plt.close(fig)
