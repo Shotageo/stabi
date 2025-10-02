@@ -1,4 +1,4 @@
-# stabi_lem.py — full module (centers→R生成/検査/FS評価まで一気通貫) ［高速化・互換パッチ］
+# stabi_lem.py — full module (centers→R生成/検査/FS評価＋内部自動ゲート)
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Iterable
@@ -6,6 +6,52 @@ import numpy as np, math
 
 DEG = math.pi/180.0
 EPS = 1e-12
+
+# ----------------- 自動ゲート（UIに出さない） -----------------
+# 既存ソフトの“暗黙の足切り”を再現：短すぎ・薄すぎ・平坦すぎを除外
+def _gate_geometry_and_thickness(
+    ground, xc, yc, R, x1, x2, xs, ys, h, L_horiz: float
+) -> bool:
+    # 最小フェイス幅（弦長）: max(0.06*L, 3.0m)
+    y1 = float(ground.y_at(x1))
+    y2 = float(ground.y_at(x2))
+    chord = math.hypot(x2 - x1, y2 - y1)
+    lmin = max(0.06*L_horiz, 3.0)
+
+    if chord < lmin:
+        return False
+
+    # 中央角の下限: max(20°, 2*asin(lmin/(2R)))
+    if R <= 0.0:
+        return False
+    s = max(-1.0, min(1.0, chord/(2.0*R)))
+    theta = 2.0*math.asin(s)
+    s_l = max(-1.0, min(1.0, lmin/(2.0*R)))
+    theta_min = max(20.0*DEG, 2.0*math.asin(s_l))
+    if theta < theta_min:
+        return False
+
+    # 厚さの健全性＋被覆率（薄皮排除）
+    h = np.asarray(h, dtype=float)
+    if h.size == 0:
+        return False
+    hmax = float(np.max(h))
+    if not np.isfinite(hmax) or hmax <= 0.0:
+        return False
+
+    # 極端に薄い弧を除外
+    h_gate_min = max(0.30, 0.20*hmax)   # midスライス厚等の目安
+    if float(np.max(h)) < h_gate_min:
+        return False
+
+    # “十分な区間”で厚さが確保されていること（被覆率 75%以上）
+    cov_th = max(0.20, 0.10*hmax)
+    frac = float(np.mean(h >= cov_th))
+    if frac < 0.75:
+        return False
+
+    return True
+
 
 # ----------------- 基本データ構造 -----------------
 @dataclass
@@ -18,51 +64,20 @@ class Soil:
 class GroundPL:
     X: np.ndarray
     Y: np.ndarray
-
-    def __post_init__(self):
-        self.X = np.asarray(self.X, dtype=float)
-        self.Y = np.asarray(self.Y, dtype=float)
-        # 前処理（区間の傾きとオフセット）
-        dx = np.diff(self.X)
-        dy = np.diff(self.Y)
-        # 極小区間を避ける
-        dx = np.where(np.abs(dx) < 1e-12, np.sign(dx)*1e-12 + (dx==0)*1e-12, dx)
-        self._slope = dy / dx          # 区間の傾き
-        self._x0 = self.X[:-1]         # 各区間の左端x
-        self._y0 = self.Y[:-1]         # 各区間の左端y
-
     def y_at(self, x):
-        """
-        折れ線上の線形補間をベクトル化で計算。
-        範囲外は端点のyを返す（安定版と同じ挙動）。
-        """
-        xa = np.asarray(x, dtype=float)
-        # 出力配列
-        y = np.empty_like(xa, dtype=float)
-
-        # 左端/右端のマスク
-        mask_lo = xa <= self.X[0]
-        mask_hi = xa >= self.X[-1]
-        mask_mid = ~(mask_lo | mask_hi)
-
-        # 端は一定値
-        if np.any(mask_lo):
-            y[mask_lo] = self.Y[0]
-        if np.any(mask_hi):
-            y[mask_hi] = self.Y[-1]
-
-        # 中間は searchsorted で区間特定
-        if np.any(mask_mid):
-            xm = xa[mask_mid]
-            # 右側に挿入される位置-1 = 区間の左インデックス
-            idx = np.searchsorted(self.X, xm, side="right") - 1
-            # 範囲防御
-            idx = np.clip(idx, 0, len(self.X)-2)
-            # y = y0 + slope*(x - x0)
-            y[mask_mid] = self._y0[idx] + self._slope[idx]*(xm - self._x0[idx])
-
-        # スカラー入力対応
-        return float(y) if np.ndim(x) == 0 else y
+        x = np.asarray(x, dtype=float)
+        y = np.empty_like(x)
+        for i, xv in np.ndenumerate(x):
+            if xv <= self.X[0]:
+                y[i] = self.Y[0]; continue
+            if xv >= self.X[-1]:
+                y[i] = self.Y[-1]; continue
+            k = np.searchsorted(self.X, xv) - 1
+            x0, x1 = self.X[k], self.X[k+1]
+            y0, y1 = self.Y[k], self.Y[k+1]
+            t = (xv - x0) / max(x1 - x0, 1e-12)
+            y[i] = (1-t)*y0 + t*y1
+        return y if y.shape != () else float(y)
 
 # ----------------- 円×折れ線 交点 -----------------
 def circle_segment_intersections(xc, yc, R, x0, y0, x1, y1):
@@ -106,7 +121,7 @@ def arc_sample_poly_best_pair(pl: GroundPL, xc, yc, R, n=241):
             continue
         xs = np.linspace(x1, x2, n)
         inside = R*R - (xs - xc)**2
-        if np.any(inside <= 0): 
+        if np.any(inside <= 0):
             continue
         ys = yc - np.sqrt(inside)
         h  = pl.y_at(xs) - ys
@@ -142,6 +157,7 @@ def clip_interfaces_to_ground(ground: GroundPL, interfaces: List[GroundPL], x) -
 def barrier_y_from_flags(Yifs: List[np.ndarray], allow_cross: List[bool]) -> np.ndarray:
     if not Yifs or not allow_cross:
         return np.full_like(Yifs[0] if Yifs else np.array([0.0]), -1e9, dtype=float)
+    # allow_cross[j]==False の境界より下へは降りない
     blocked = [Yifs[j] for j in range(len(Yifs)) if not allow_cross[j]]
     if not blocked:
         return np.full_like(Yifs[0], -1e9, dtype=float)
@@ -264,6 +280,7 @@ def driving_sum_for_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils:
 # ----------------- 円弧候補の生成（中心→{x,depth}格子からRを作る） -----------------
 def _R_from_x_and_depth(ground: GroundPL, xc: float, yc: float, x: float, h: float) -> float:
     yg = float(ground.y_at(x))
+    # y_arc(x) = yg - h が成り立つ R を解く → R^2 = (yg - h - yc)^2 + (x - xc)^2
     return math.sqrt(max(0.0, (yg - h - yc)**2 + (x - xc)**2))
 
 def arcs_from_center_by_entries_multi(
@@ -274,16 +291,25 @@ def arcs_from_center_by_entries_multi(
     quick_mode: bool, n_slices_quick: int,
     limit_arcs_per_center: int, probe_n_min: int,
 ) -> Iterable[Tuple[float,float,float,float]]:
+    """
+    生成器: (x1, x2, R, Fs_quick) を yield
+      - ground.X[0]..ground.X[-1] を n_entries でサンプルした x と
+        depth ∈ [depth_min, depth_max]（等間隔）から R を作成。
+      - その R で arc_sample_poly_best_pair により (x1,x2) を決め、
+        quick（Fellenius / n_slices_quick）で Fs を評価。
+      - crossing/幾何/厚さの不適合は Fs=None となるため弾く。
+      - limit_arcs_per_center 本で打ち切り。
+    """
     if n_entries < 2 or depth_max <= 0 or depth_max < depth_min:
         return
 
     # x-サンプル（端を少し避ける）
-    x0, x1 = float(ground.X[0]), float(ground.X[-1])
-    xs = np.linspace(x0+1e-6, x1-1e-6, n_entries)
+    x0, x1_edge = float(ground.X[0]), float(ground.X[-1])
+    xs = np.linspace(x0+1e-6, x1_edge-1e-6, n_entries)
+    L_horiz = x1_edge - x0  # UIのL相当（水平長）
 
-    # 深さサンプル（0.5m相当の粗密確保）
-    step = max(0.5, (depth_max - depth_min)/10.0)
-    n_depth = max(5, int(round((depth_max - depth_min)/step)) + 1)
+    # 深さサンプル（0は無意味。0.5m刻み相当を最低限確保）
+    n_depth = max(5, int(round((depth_max - depth_min)/max(0.5, (depth_max - depth_min)/10))) + 1)
     hs = np.linspace(max(0.01, depth_min), depth_max, n_depth)
 
     count = 0
@@ -292,11 +318,20 @@ def arcs_from_center_by_entries_multi(
             R = _R_from_x_and_depth(ground, xc, yc, float(xi), float(h))
             if not (np.isfinite(R) and R > 0.5):
                 continue
+
+            # サンプル点数（表示の粗密に影響。quickでは抑制）
             n_probe = max(probe_n_min, 201) if not quick_mode else max(101, probe_n_min)
             s = arc_sample_poly_best_pair(ground, xc, yc, R, n=n_probe)
             if s is None:
                 continue
             a_x1, a_x2, _xs, _ys, _h = s
+
+            # ▼▼ 内部の自動ゲート（UIに出さない） ▼▼
+            if not _gate_geometry_and_thickness(ground, xc, yc, R, a_x1, a_x2, _xs, _ys, _h, L_horiz):
+                continue
+            # ▲▲ ここまで ▼▼
+
+            # Quick Fs（Fellenius固定が定石）
             Fs_q = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices_quick)
             if Fs_q is None:
                 continue
