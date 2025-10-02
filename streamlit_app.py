@@ -267,10 +267,16 @@ def param_pack():
 param_key = hash_params(param_pack())
 
 # ---------------- Compute ----------------
+# ---------------- Compute ----------------
 def compute_once():
-    def subsampled_centers():
-        xs = np.linspace(x_min, x_max, nx)
-        ys = np.linspace(y_min, y_max, ny)
+    # === パラメータ ===
+    EXT_FACTOR = 0.30   # 1回の拡張率（幅/高さの30%を外側へ足す）
+    MAX_EXT_ROUNDS = 2  # 最大拡張ラウンド数
+    FS_IMPROVE_TOL = 1e-4  # 改善がこの相対量未満なら打ち切り（0.01%）
+
+    def subsampled_centers(xmin, xmax, ymin, ymax):
+        xs = np.linspace(xmin, xmax, nx)
+        ys = np.linspace(ymin, ymax, ny)
         tag = P["coarse_subsample"]
         if tag == "every 3rd":
             xs = xs[::3] if len(xs)>2 else xs
@@ -280,10 +286,10 @@ def compute_once():
             ys = ys[::2] if len(ys)>1 else ys
         return [(float(xc), float(yc)) for yc in ys for xc in xs]
 
-    def pick_center(budget_s):
+    def pick_center(xmin, xmax, ymin, ymax, budget_s):
         deadline = time.time() + budget_s
         best = None; tested=[]
-        for (xc,yc) in subsampled_centers():
+        for (xc,yc) in subsampled_centers(xmin, xmax, ymin, ymax):
             cnt=0; Fs_min=None
             for _x1,_x2,_R,Fs in arcs_from_center_by_entries_multi(
                 ground, soils, xc, yc,
@@ -293,7 +299,7 @@ def compute_once():
                 quick_mode=True, n_slices_quick=max(8, P["quick_slices"]//2),
                 limit_arcs_per_center=P["coarse_limit_arcs"],
                 probe_n_min=P["coarse_probe_min"],
-                water=water
+                water=water,
             ):
                 cnt+=1
                 if (Fs_min is None) or (Fs < Fs_min): Fs_min = Fs
@@ -304,24 +310,8 @@ def compute_once():
             if time.time() > deadline: break
         return (best[1] if best else None), tested
 
-    with st.spinner("Coarse（最有望センター選抜）"):
-        center, tested = pick_center(P["budget_coarse_s"])
-        if center is None:
-            return dict(error="Coarseで候補なし。枠/深さを広げてください。")
-    xc, yc = center
-
-    hit, where = near_edge(xc,yc,x_min,x_max,y_min,y_max)
-    expand_note = None
-    x_min_a, x_max_a, y_min_a, y_max_a = x_min, x_max, y_min, y_max
-    if hit:
-        dx = (x_max - x_min); dy = (y_max - y_min)
-        if where["left"]:  x_min_a = x_min - 0.20*dx
-        if where["right"]: x_max_a = x_max + 0.20*dx
-        if where["bottom"]:y_min_a = y_min - 0.20*dy
-        if where["top"]:   y_max_a = y_max + 0.20*dy
-        expand_note = f"Auto-extend audit grid: x[{x_min_a:.1f},{x_max_a:.1f}], y[{y_min_a:.1f},{y_max_a:.1f}]"
-
-    with st.spinner("Quick（R候補抽出）"):
+    def refine_at_center(xc, yc):
+        # Quick: R 候補
         heap_R=[]; deadline=time.time()+P["budget_quick_s"]
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
             ground, soils, xc, yc,
@@ -331,14 +321,112 @@ def compute_once():
             quick_mode=True, n_slices_quick=P["quick_slices"],
             limit_arcs_per_center=P["limit_arcs_quick"],
             probe_n_min=P["probe_n_min_quick"],
-            water=water
+            water=water,
         ):
             heapq.heappush(heap_R, (-Fs, R))
             if len(heap_R) > max(P["show_k"], P["top_thick"] + 20): heapq.heappop(heap_R)
             if time.time() > deadline: break
         R_candidates = [r for _fsneg, r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
         if not R_candidates:
-            return dict(error="Quickで円弧候補なし。深さ/進入可/Qualityを緩めてください。")
+            return None, None
+
+        # Refine
+        refined_local=[]
+        for R in R_candidates[:P["show_k"]]:
+            Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R,
+                                  n_slices=P["final_slices"], water=water)
+            if Fs is None: continue
+            s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
+            if s is None: continue
+            x1,x2,*_ = s
+            packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R,
+                                            n_slices=P["final_slices"], water=water)
+            if packD is None: continue
+            D_sum,_,_ = packD
+            T_req = max(0.0, (Fs_target - Fs)*D_sum)
+            refined_local.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
+        if not refined_local:
+            return [], None
+        refined_local.sort(key=lambda d:d["Fs"])
+        return refined_local, float(refined_local[0]["Fs"])
+
+    # ====== ここから自動拡張ループ ======
+    # 初期グリッド
+    cur = dict(xmin=x_min, xmax=x_max, ymin=y_min, ymax=y_max)
+    history = []
+    best_pack = None  # (Fs_min, res_dict)
+
+    for round_id in range(MAX_EXT_ROUNDS + 1):
+        with st.spinner(("Coarse/Quick/Refine 実行中" if round_id==0 else f"再探索（拡張#{round_id}）")):
+            center, tested = pick_center(cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"], P["budget_coarse_s"])
+            if center is None:
+                # これまでのベストがあればそれを返す
+                if best_pack is not None:
+                    break
+                return dict(error="Coarseで候補なし。枠/深さを広げてください。")
+            xc, yc = center
+            refined, Fs_min = refine_at_center(xc, yc)
+            if not refined:
+                # ベストがあれば採用、なければエラー
+                if best_pack is not None:
+                    break
+                return dict(error="Refineで有効弧なし。設定/Qualityを見直してください。")
+
+        # 今回結果のまとめ
+        idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
+        idx_maxT  = int(np.argmax([d["T_req"] for d in refined]))
+        centers_disp  = grid_points(x_min, x_max, y_min, y_max, nx, ny)          # 表示用は元の範囲
+        centers_audit = grid_points(cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"], nx, ny)  # 監査は拡張後範囲
+
+        res_now = dict(center=(xc,yc), refined=refined,
+                       idx_minFs=idx_minFs, idx_maxT=idx_maxT,
+                       centers_disp=centers_disp, centers_audit=centers_audit)
+
+        # ベスト更新
+        if (best_pack is None) or (Fs_min < best_pack[0] - FS_IMPROVE_TOL*best_pack[0]):
+            best_pack = (Fs_min, res_now)
+
+        # 端ヒット判定（センターがグリッド外周に“貼り付いた”か）
+        hit, where = near_edge(xc, yc, cur["xmin"], cur["xmax"], cur["ymin"], cur["ymax"])
+        history.append(dict(round=round_id, grid=dict(**cur), center=(xc,yc), hit=where, Fs=Fs_min))
+
+        # 拡張する？（条件：ヒット & ラウンド余裕）
+        if (not hit) or (round_id >= MAX_EXT_ROUNDS):
+            break
+
+        # どの方向へ伸ばすか
+        dx = (cur["xmax"] - cur["xmin"])
+        dy = (cur["ymax"] - cur["ymin"])
+        grew = False
+        if where["left"]:
+            cur["xmin"] = cur["xmin"] - EXT_FACTOR*dx; grew=True
+        if where["right"]:
+            cur["xmax"] = cur["xmax"] + EXT_FACTOR*dx; grew=True
+        if where["bottom"]:
+            cur["ymin"] = cur["ymin"] - EXT_FACTOR*dy; grew=True
+        if where["top"]:
+            cur["ymax"] = cur["ymax"] + EXT_FACTOR*dy; grew=True
+
+        # 伸ばしたがさらに安全側に限る：下限など最小値の制約はお好みで
+        # ここでは下方向の下限を 0.5*H に制限しない（深い円弧も探索するため）
+        if not grew:
+            break
+
+    # ループ終了：ベストを採用
+    Fs_best, res_best = best_pack
+    # タイトル尾に履歴を短く付記
+    note = []
+    if len(history) > 1:
+        last = history[-1]
+        note.append(f"auto-extend {len(history)-1}x")
+        sides=[]
+        for k in ("left","right","bottom","top"):
+            if any(h["hit"][k] for h in history):
+                sides.append(k[0].upper())
+        if sides:
+            note.append("dirs=" + "".join(sides))
+    res_best["expand_note"] = " / ".join(note) if note else None
+    return res_best
 
     refined=[]
     for R in R_candidates[:P["show_k"]]:
