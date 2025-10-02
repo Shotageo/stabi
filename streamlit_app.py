@@ -1,7 +1,8 @@
-# streamlit_app.py — audit改善・端ヒット自動拡張・被覆率表示＋水位指定対応（全文差し替え）
+# streamlit_app.py — 水位表示/編集対応（Dry/Offset/CSV/ru）＋監査UI
 from __future__ import annotations
 import streamlit as st
-import numpy as np, heapq, time, hashlib, json, random, io, csv
+import numpy as np, heapq, time, hashlib, json, io, csv
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from stabi_lem import (
@@ -9,7 +10,6 @@ from stabi_lem import (
     make_ground_example, make_interface1_example, make_interface2_example,
     clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
-    # stabi_lem 側の make_water_from_* を使わず、ここでは CSV/Offset を UI で z(x) にして dict 化
 )
 
 st.set_page_config(page_title="Stabi LEM｜監査＆自動拡張", layout="wide")
@@ -73,6 +73,19 @@ def clip_yfloor(xs: np.ndarray, ys: np.ndarray, y_floor: float = 0.0):
     if np.count_nonzero(m) < 2:
         return None
     return xs[m], ys[m]
+
+def build_linear_interpolator(xp: np.ndarray, yp: np.ndarray):
+    xp = np.asarray(xp, dtype=float); yp = np.asarray(yp, dtype=float)
+    order = np.argsort(xp); xp = xp[order]; yp = yp[order]
+    def zfun(x):
+        x = np.asarray(x, dtype=float)
+        out = np.empty_like(x)
+        out[x <= xp[0]] = yp[0]
+        out[x >= xp[-1]] = yp[-1]
+        mid = (x > xp[0]) & (x < xp[-1])
+        out[mid] = np.interp(x[mid], xp, yp)
+        return out
+    return zfun
 
 # ---------------- Inputs ----------------
 with st.form("params"):
@@ -139,43 +152,91 @@ with st.form("params"):
         depth_min = st.number_input("Depth min (m)", 0.0, 50.0, 0.5, 0.5)
         depth_max = st.number_input("Depth max (m)", 0.5, 50.0, 4.0, 0.5)
 
+        # ==== Water UI ====
         st.subheader("Water")
-        water_mode = st.radio("Water model", ["Dry", "Offset from ground", "CSV (x,z)", "ru model"], index=0, horizontal=True)
-        water = None
+        water_mode = st.radio("Water model", ["Dry", "Offset from ground", "CSV (x,z)", "ru model"],
+                              index=0, horizontal=True)
+        water = {"type":"dry"}
+        editable_points_json = None  # パラメータキー用
+
         if water_mode == "Offset from ground":
             offset = st.number_input("Offset (m): +above / -below ground", -50.0, 50.0, -1.5, 0.1)
-            def zfun(x):
-                return np.asarray(ground.y_at(x), dtype=float) + float(offset)
-            water = {"type":"WT","z": zfun, "meta":{"source":"offset","offset":float(offset)}}
+            # 初期点を地表+offset から作成し、表で編集
+            n_init = st.slider("Initial control points", 4, 40, 12, 1)
+            xp0 = np.linspace(float(0.0), float(L), n_init)
+            yp0 = np.array([float(ground.y_at(x)) + float(offset) for x in xp0], dtype=float)
+            df0 = pd.DataFrame({"x": xp0, "z": yp0})
+            st.caption("Offset から初期化した水位線の制御点（行の追加/削除・x,zの修正が可能）")
+            edited = st.data_editor(
+                df0, use_container_width=True,
+                num_rows="dynamic", key="wt_offset_editor",
+                column_config={
+                    "x": st.column_config.NumberColumn(format="%.3f", step=0.1, help="水平位置（地表xと同じ単位）"),
+                    "z": st.column_config.NumberColumn(format="%.3f", step=0.1, help="標高")
+                }
+            )
+            # 入力の正規化：x は [0, L] にクリップ
+            if len(edited) >= 2:
+                xp = np.clip(edited["x"].to_numpy(dtype=float), 0.0, float(L))
+                yp = edited["z"].to_numpy(dtype=float)
+                editable_points_json = edited.to_json()  # 再計算トリガ
+                zfun = build_linear_interpolator(xp, yp)
+                water = {"type":"WT", "z": zfun, "meta":{"source":"offset+edit", "n": int(len(xp))}}
+            else:
+                st.warning("水位線の制御点は2点以上必要です。")
+                zfun = build_linear_interpolator(np.array([0.0, L]), np.array([yp0[0], yp0[-1]]))
+                water = {"type":"WT", "z": zfun, "meta":{"source":"offset+edit(fallback)", "n": 2}}
+
         elif water_mode == "CSV (x,z)":
             up = st.file_uploader("Upload waterline CSV (columns: x,z)", type=["csv"])
             if up is not None:
                 data = up.read().decode("utf-8")
-                xs, zs = [], []
-                snif = csv.Sniffer()
-                has_header = snif.has_header(data[:1024])
                 rd = csv.reader(io.StringIO(data))
-                if has_header: next(rd, None)
+                # ヘッダ自動判定
+                try:
+                    snif = csv.Sniffer()
+                    if snif.has_header(data[:1024]): next(rd, None)
+                except Exception:
+                    pass
+                xs, zs = [], []
                 for row in rd:
                     if len(row) < 2: continue
                     try:
                         xs.append(float(row[0])); zs.append(float(row[1]))
-                    except: pass
+                    except:
+                        pass
                 if len(xs) >= 2:
-                    xp = np.array(xs, dtype=float)
-                    yp = np.array(zs, dtype=float)
-                    def zfun(x):
-                        x = np.asarray(x, dtype=float)
-                        out = np.empty_like(x)
-                        out[x <= xp[0]] = yp[0]
-                        out[x >= xp[-1]] = yp[-1]
-                        mid = (x > xp[0]) & (x < xp[-1])
-                        out[mid] = np.interp(x[mid], xp, yp)
-                        return out
-                    water = {"type":"WT","z": zfun, "meta":{"source":"csv","n":len(xp)}}
+                    df0 = pd.DataFrame({"x": xs, "z": zs})
+                    st.caption("CSV 読み込み後、必要なら制御点を編集してください（行の追加/削除・x,z修正可）")
+                    edited = st.data_editor(
+                        df0, use_container_width=True,
+                        num_rows="dynamic", key="wt_csv_editor",
+                        column_config={
+                            "x": st.column_config.NumberColumn(format="%.3f", step=0.1),
+                            "z": st.column_config.NumberColumn(format="%.3f", step=0.1)
+                        }
+                    )
+                    if len(edited) >= 2:
+                        xp = edited["x"].to_numpy(dtype=float)
+                        yp = edited["z"].to_numpy(dtype=float)
+                        editable_points_json = edited.to_json()
+                        zfun = build_linear_interpolator(xp, yp)
+                        water = {"type":"WT", "z": zfun, "meta":{"source":"csv+edit", "n": int(len(xp))}}
+                    else:
+                        st.warning("水位線の制御点は2点以上必要です。")
+                        water = {"type":"dry"}
+                else:
+                    st.warning("CSV は少なくとも2点 (x,z) が必要です。")
+                    water = {"type":"dry"}
+            else:
+                st.info("CSV をアップロードしてください。")
+
         elif water_mode == "ru model":
-            ru = st.number_input("ru value", 0.0, 1.0, 0.3, 0.05)
-            water = {"type":"ru","ru": float(ru)}
+            # ← 要望どおり「水位線は描かない」。係数のみ。
+            ru = st.slider("ru (0.0–1.0)", 0.0, 1.0, 0.30, 0.01,
+                           help="底面有効法を N'=(1-ru)N と近似。一般に 0.1〜0.5 程度で感度検討。")
+            water = {"type":"ru", "ru": float(ru)}
+
         else:
             water = {"type":"dry"}
 
@@ -199,7 +260,9 @@ def param_pack():
         allow_cross=allow_cross, Fs_target=Fs_target,
         center=[x_min, x_max, y_min, y_max, nx, ny],
         method=method, quality=P, depth=[depth_min, depth_max],
-        water_mode=water_mode
+        water_mode=water_mode,
+        # 編集表がある場合は内容でキーを変えて再計算をトリガ
+        editable_points=st.session_state.get("wt_offset_editor") or st.session_state.get("wt_csv_editor")
     )
 param_key = hash_params(param_pack())
 
@@ -282,7 +345,7 @@ def compute_once():
         Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, xc, yc, R,
                               n_slices=P["final_slices"], water=water)
         if Fs is None: continue
-        # span 取得（描画都合。計算は stabi_lem 内で y_floor=-inf で評価される）
+        # span（描画用, 計算は stabi_lem 内で y_floor=-inf 前提）
         s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
         if s is None: continue
         x1,x2,*_ = s
@@ -304,7 +367,7 @@ def compute_once():
     return dict(center=(xc,yc), refined=refined,
                 idx_minFs=idx_minFs, idx_maxT=idx_maxT,
                 centers_disp=centers_disp, centers_audit=centers_audit,
-                expand_note=expand_note, water_mode=water_mode)
+                expand_note=expand_note, water_mode=water_mode, water=water)
 
 # run
 if run or ("last_key" not in st.session_state) or (st.session_state["last_key"] != param_key):
@@ -317,6 +380,8 @@ res = st.session_state["res"]
 xc,yc = res["center"]
 refined = res["refined"]; idx_minFs = res["idx_minFs"]; idx_maxT=res["idx_maxT"]
 centers_disp = res["centers_disp"]; centers_audit = res["centers_audit"]
+water_mode = res.get("water_mode","Dry")
+water = res.get("water", {"type":"dry"})
 
 # ---------------- After-run toggles ----------------
 st.subheader("表示オプション")
@@ -337,7 +402,7 @@ with c4:
 # ---------------- Plot ----------------
 fig, ax = plt.subplots(figsize=(10.5, 7.5))
 
-Xd = np.linspace(ground.X[0], ground.X[-1], 600)
+Xd = np.linspace(0.0, float(ground.X[-1]), 600)
 Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
 
 if n_layers==1:
@@ -352,11 +417,18 @@ else:
     ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
     ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
 
+# 地表・層
 ax.plot(ground.X, ground.Y, linewidth=2.2, label="Ground")
 if n_layers>=2:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.2, label="Interface 1")
 if n_layers>=3:
     ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.2, label="Interface 2")
+
+# 水位線（WTのみ描画。ru/dry は描かない）
+if water.get("type") == "WT":
+    zfun = water["z"]
+    Zw = zfun(Xd) if callable(zfun) else np.full_like(Xd, float(zfun))
+    ax.plot(Xd, Zw, color="tab:blue", linewidth=1.6, alpha=0.85, label="Water table")
 
 # 外周
 ax.plot([ground.X[-1], ground.X[-1]],[0.0, ground.y_at(ground.X[-1])], linewidth=1.0)
@@ -369,18 +441,6 @@ if show_centers:
     ax.scatter(xs, ys, s=12, c="k", alpha=0.25, marker=".", label="Center grid")
 # chosen center
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
-
-# audit arcs（描画時クリップ）— 監査機能は別途キャッシュ構成に依存するため省略維持
-if audit_show and "audit_cache" in st.session_state:
-    for a in st.session_state.get("audit_cache", {}).get("arcs", []):
-        cx,cy,R,x1,x2,Fs = a["xc"],a["yc"],a["R"],a["x1"],a["x2"],a["Fs"]
-        xs = np.linspace(x1, x2, 140)
-        ys = cy - np.sqrt(np.maximum(0.0, R*R - (xs - cx)**2))
-        clipped = clip_yfloor(xs, ys, y_floor=0.0)
-        if clipped is None: 
-            continue
-        xs_c, ys_c = clipped
-        ax.plot(xs_c, ys_c, linewidth=0.6, alpha=0.25, color=fs_to_color(Fs))
 
 # refined（描画時クリップ）
 if show_all_refined:
@@ -420,9 +480,9 @@ if show_maxT and 0<=idx_maxT<len(refined):
         ax.plot([xc,xs_c[-1]],[yc,y2], linewidth=1.1, linestyle="--", color=(0.2,0.0,0.8), alpha=0.9)
 
 # axis & legend
-x_upper = max(1.18*L, x_max + 0.05*L, 100.0)
+x_upper = max(1.18*float(ground.X[-1]), x_max + 0.05*float(ground.X[-1]), 100.0)
 y_upper = max(2.30*H, y_max + 0.05*H, 100.0)
-ax.set_xlim(min(0.0 - 0.05*L, -2.0), x_upper)
+ax.set_xlim(min(0.0 - 0.05*float(ground.X[-1]), -2.0), x_upper)
 ax.set_ylim(0.0, y_upper)
 ax.set_aspect("equal", adjustable="box")
 ax.grid(True); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
@@ -434,12 +494,9 @@ legend_patches=[Patch(color=(0.85,0,0),label="Fs<1.0"),
 h,l = ax.get_legend_handles_labels()
 ax.legend(h+legend_patches, l+[p.get_label() for p in legend_patches], loc="upper right", fontsize=9)
 
-title_tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}", f"Water={res['water_mode']}"]
-if "expand_note" in res and res["expand_note"]: title_tail.append(res["expand_note"])
-if 'audit_cache' in st.session_state and audit_show:
-    cache = st.session_state['audit_cache']
-    title_tail.append(f"audit cover {cache.get('covered',0)}/{cache.get('total',0)} centers, arcs={len(cache.get('arcs',[]))}")
-ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • Method={method} • " + " • ".join(title_tail))
+tail=[f"MinFs={refined[idx_minFs]['Fs']:.3f}", f"TargetFs={Fs_target:.2f}", f"Water={water_mode}"]
+if water.get("type")=="ru": tail.append(f"ru={water.get('ru'):.2f}")
+st.caption(" / ".join(tail))
 
 st.pyplot(fig, use_container_width=True); plt.close(fig)
 
