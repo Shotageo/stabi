@@ -558,6 +558,7 @@ if show_centers:
 # chosen center
 ax.scatter([xc],[yc], s=70, marker="s", color="tab:blue", label="Chosen center")
 
+
 # refined（描画時クリップ）
 if show_all_refined:
     for d in refined:
