@@ -1,7 +1,7 @@
-# streamlit_app.py — Stabi LEM 多段UI（安定・保存・水位クリップ・円弧プレビュー・補強後ボタン）
+# streamlit_app.py — Stabi LEM 多段UI（安定・保存・水位クリップ・円弧プレビュー・補強後ボタン・揺れ止め）
 from __future__ import annotations
 import streamlit as st
-import numpy as np, heapq, time, hashlib, json, math
+import numpy as np, heapq, time, json, math
 import matplotlib.pyplot as plt
 
 from stabi_lem import (
@@ -11,7 +11,7 @@ from stabi_lem import (
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
 )
 
-# --- （任意）教授コメントモジュールが手元にある場合だけ読み込む ---
+# --- 教授コメント（任意モジュール）。無ければ黙ってスキップ ---
 try:
     from stabi_suggest import (
         lint_geometry_and_water, lint_soils_and_materials, lint_arc_and_slices, lint_nails_layout,
@@ -30,7 +30,7 @@ st.set_page_config(page_title="Stabi LEM｜安定UI", layout="wide")
 st.title("Stabi LEM｜多段UI（安定版ベース）")
 
 # =========================
-# 1) Session State 初期化
+# 1) Session State 初期化（1回だけ）
 # =========================
 def _ss_default(key, val):
     if key not in st.session_state:
@@ -61,7 +61,7 @@ def init_defaults():
     _ss_default("gamma_m", 1.20)
     _ss_default("mu", 0.0)
 
-    # Page3: grid & method
+    # Page3: grid & method（絶対値で保持）
     _ss_default("x_min_abs", 0.25 * st.session_state["L"])
     _ss_default("x_max_abs", 1.15 * st.session_state["L"])
     _ss_default("y_min_abs", 1.60 * st.session_state["H"])
@@ -91,7 +91,9 @@ def init_defaults():
     _ss_default("res3", None)
     _ss_default("result_reinforced", None)
 
-init_defaults()
+if "_initialized" not in st.session_state:
+    init_defaults()
+    st.session_state["_initialized"] = True
 
 # =========================
 # 2) ユーティリティ
@@ -115,9 +117,6 @@ def set_axes_fixed(ax, H: float, L: float, ground: GroundPL):
     ax.set_ylim(0.0, y_upper)
     ax.set_aspect("equal", adjustable="box")
 
-# =========================
-# 3) 画面ナビ
-# =========================
 QUALITY = {
     "Coarse": dict(quick_slices=10, final_slices=30, n_entries_final=900,  probe_n_min_quick=81,
                    limit_arcs_quick=80,  show_k=60,  coarse_subsample="every 3rd",
@@ -137,6 +136,9 @@ QUALITY = {
                       budget_coarse_s=1.8, budget_quick_s=2.6),
 }
 
+# =========================
+# 3) 画面ナビ
+# =========================
 page = st.sidebar.radio(
     "Pages",
     ["1) 地形・水位", "2) 地層・材料", "3) 円弧探索（未補強）", "4) ネイル配置", "5) 補強後解析"],
@@ -149,8 +151,8 @@ if page.startswith("1"):
     colL, colR = st.columns([3,1])
     with colL:
         st.subheader("Geometry")
-        H = st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="H")
-        L = st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="L")
+        st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="H")
+        st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="L")
         ground = make_ground_example(st.session_state["H"], st.session_state["L"])
 
         st.subheader("Water")
@@ -188,16 +190,15 @@ if page.startswith("1"):
 elif page.startswith("2"):
     st.subheader("Layers & Materials")
 
-    # H/L（共有キー）
-    H = st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="H")
-    L = st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="L")
-    ground = make_ground_example(H, L)
+    st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="H")
+    st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="L")
+    ground = make_ground_example(st.session_state["H"], st.session_state["L"])
 
-    st.selectbox("Number of layers", [1,2,3], index=st.session_state["n_layers"]-1, key="n_layers")
+    st.selectbox("Number of layers", [1,2,3], key="n_layers")
 
     interfaces = []
-    if st.session_state["n_layers"] >= 2: interfaces.append(make_interface1_example(H, L))
-    if st.session_state["n_layers"] >= 3: interfaces.append(make_interface2_example(H, L))
+    if st.session_state["n_layers"] >= 2: interfaces.append(make_interface1_example(st.session_state["H"], st.session_state["L"]))
+    if st.session_state["n_layers"] >= 3: interfaces.append(make_interface2_example(st.session_state["H"], st.session_state["L"]))
 
     cols = st.columns(4)
     soils_tbl = []
@@ -252,7 +253,7 @@ elif page.startswith("2"):
     ax.plot(ground.X, ground.Y, linewidth=2.0, label="Ground")
     if st.session_state["n_layers"]>=2: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.0)
     if st.session_state["n_layers"]>=3: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.0)
-    set_axes_fixed(ax, H, L, ground)
+    set_axes_fixed(ax, st.session_state["H"], st.session_state["L"], ground)
     ax.grid(True); ax.legend(); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     st.pyplot(fig); plt.close(fig)
 
@@ -267,15 +268,14 @@ elif page.startswith("2"):
 elif page.startswith("3"):
     st.subheader("円弧探索（未補強）")
 
-    H = st.session_state["H"]; L = st.session_state["L"]
-    ground = make_ground_example(H, L)
+    ground = make_ground_example(st.session_state["H"], st.session_state["L"])
 
     colA, colB = st.columns([1.3, 1])
     with colA:
-        st.number_input("x min", 0.20*L, 3.00*L, step=0.05*L, key="x_min_abs")
-        st.number_input("x max", 0.30*L, 4.00*L, step=0.05*L, key="x_max_abs")
-        st.number_input("y min", 0.80*H, 7.00*H, step=0.10*H, key="y_min_abs")
-        st.number_input("y max", 1.00*H, 8.00*H, step=0.10*H, key="y_max_abs")
+        st.number_input("x min", 0.20*st.session_state["L"], 3.00*st.session_state["L"], step=0.05*st.session_state["L"], key="x_min_abs")
+        st.number_input("x max", 0.30*st.session_state["L"], 4.00*st.session_state["L"], step=0.05*st.session_state["L"], key="x_max_abs")
+        st.number_input("y min", 0.80*st.session_state["H"], 7.00*st.session_state["H"], step=0.10*st.session_state["H"], key="y_min_abs")
+        st.number_input("y max", 1.00*st.session_state["H"], 8.00*st.session_state["H"], step=0.10*st.session_state["H"], key="y_max_abs")
     with colB:
         st.slider("nx", 6, 60, key="nx"); st.slider("ny", 4, 40, key="ny")
         st.selectbox("Method", ["Bishop (simplified)","Fellenius"], key="method")
@@ -292,10 +292,9 @@ elif page.startswith("3"):
 
     # プレビュー（地形・層・水位・センターグリッド）
     st.markdown("**設定プレビュー（横断図）**")
-    # interfaces は Page2で毎回生成していたのでここで再作成
     interfaces = []
-    if st.session_state["n_layers"] >= 2: interfaces.append(make_interface1_example(H, L))
-    if st.session_state["n_layers"] >= 3: interfaces.append(make_interface2_example(H, L))
+    if st.session_state["n_layers"] >= 2: interfaces.append(make_interface1_example(st.session_state["H"], st.session_state["L"]))
+    if st.session_state["n_layers"] >= 3: interfaces.append(make_interface2_example(st.session_state["H"], st.session_state["L"]))
 
     Xd = np.linspace(ground.X[0], ground.X[-1], 600)
     Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
@@ -316,22 +315,19 @@ elif page.startswith("3"):
     if st.session_state["n_layers"]>=3: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.0)
     if st.session_state["water_mode"].startswith("WT") and st.session_state["wl_points"] is not None:
         wl = st.session_state["wl_points"]; ax.plot(wl[:,0], wl[:,1], linestyle="-.", color="tab:blue", alpha=0.8, label="WT (clipped)")
-    # center grid preview
     gx = np.linspace(st.session_state["x_min_abs"], st.session_state["x_max_abs"], st.session_state["nx"])
     gy = np.linspace(st.session_state["y_min_abs"], st.session_state["y_max_abs"], st.session_state["ny"])
     xs = [float(x) for x in gx for _ in gy]; ys=[float(y) for y in gy for _ in gx]
     ax.scatter(xs, ys, s=10, c="k", alpha=0.25, marker=".", label="Center grid (preview)")
-    # 外枠
     ax.plot([st.session_state["x_min_abs"], st.session_state["x_max_abs"], st.session_state["x_max_abs"], st.session_state["x_min_abs"], st.session_state["x_min_abs"]],
             [st.session_state["y_min_abs"], st.session_state["y_min_abs"], st.session_state["y_max_abs"], st.session_state["y_max_abs"], st.session_state["y_min_abs"]],
             color="k", linewidth=1.0, alpha=0.4)
-    set_axes_fixed(ax, H, L, ground)
+    set_axes_fixed(ax, st.session_state["H"], st.session_state["L"], ground)
     ax.grid(True); ax.legend(loc="upper right"); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     st.pyplot(fig); plt.close(fig)
 
-    # Soils（stabi_lem.Soil は 3引数版に合わせる）
-    soils = []
-    soils.append(Soil(st.session_state["gamma1"], st.session_state["c1"], st.session_state["phi1"]))
+    # Soils（stabi_lem.Soil は 3引数版）
+    soils = [Soil(st.session_state["gamma1"], st.session_state["c1"], st.session_state["phi1"])]
     if st.session_state["n_layers"] >= 2:
         soils.append(Soil(st.session_state["gamma2"], st.session_state["c2"], st.session_state["phi2"]))
     if st.session_state["n_layers"] >= 3:
@@ -341,7 +337,11 @@ elif page.startswith("3"):
     P = QUALITY[st.session_state["quality"]].copy()
 
     def compute_once():
-        # 1) Coarse: best center
+        ground_local = make_ground_example(st.session_state["H"], st.session_state["L"])  # 念のため都度生成
+        interfaces_local = []
+        if st.session_state["n_layers"] >= 2: interfaces_local.append(make_interface1_example(st.session_state["H"], st.session_state["L"]))
+        if st.session_state["n_layers"] >= 3: interfaces_local.append(make_interface2_example(st.session_state["H"], st.session_state["L"]))
+
         def subsampled_centers():
             xs = np.linspace(st.session_state["x_min_abs"], st.session_state["x_max_abs"], st.session_state["nx"])
             ys = np.linspace(st.session_state["y_min_abs"], st.session_state["y_max_abs"], st.session_state["ny"])
@@ -354,14 +354,14 @@ elif page.startswith("3"):
 
         def pick_center(budget_s):
             deadline = time.time() + budget_s
-            best = None; tested=[]
+            best = None
             for (xc,yc) in subsampled_centers():
                 cnt=0; Fs_min=None
                 for _x1,_x2,_R,Fs in arcs_from_center_by_entries_multi(
-                    ground, soils, xc, yc,
+                    ground_local, soils, xc, yc,
                     n_entries=P["coarse_entries"], method="Fellenius",
                     depth_min=0.5, depth_max=4.0,
-                    interfaces=interfaces, allow_cross=allow_cross,
+                    interfaces=interfaces_local, allow_cross=allow_cross,
                     quick_mode=True, n_slices_quick=max(8, P["quick_slices"]//2),
                     limit_arcs_per_center=P["coarse_limit_arcs"],
                     probe_n_min=P["coarse_probe_min"],
@@ -369,24 +369,22 @@ elif page.startswith("3"):
                     cnt+=1
                     if (Fs_min is None) or (Fs < Fs_min): Fs_min = Fs
                     if time.time() > deadline: break
-                tested.append((xc,yc))
                 score = (cnt, - (Fs_min if Fs_min is not None else 1e9))
                 if (best is None) or (score > best[0]): best = (score, (xc,yc))
                 if time.time() > deadline: break
-            return (best[1] if best else None), tested
+            return (best[1] if best else None)
 
-        center, _tested = pick_center(P["budget_coarse_s"])
+        center = pick_center(P["budget_coarse_s"])
         if center is None:
             return dict(error="Coarseで候補なし。枠/深さを広げてください。")
         xc, yc = center
 
-        # 2) Quick for R candidates
         heap_R=[]; deadline=time.time()+P["budget_quick_s"]
         for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
-            ground, soils, xc, yc,
+            ground_local, soils, xc, yc,
             n_entries=P["n_entries_final"], method="Fellenius",
             depth_min=0.5, depth_max=4.0,
-            interfaces=interfaces, allow_cross=allow_cross,
+            interfaces=interfaces_local, allow_cross=allow_cross,
             quick_mode=True, n_slices_quick=P["quick_slices"],
             limit_arcs_per_center=P["limit_arcs_quick"],
             probe_n_min=P["probe_n_min_quick"],
@@ -398,15 +396,14 @@ elif page.startswith("3"):
         if not R_candidates:
             return dict(error="Quickで円弧候補なし。深さ/進入可/Qualityを緩めてください。")
 
-        # 3) Refine
         refined=[]
         for R in R_candidates[:P["show_k"]]:
-            Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, st.session_state["method"], xc, yc, R, n_slices=P["final_slices"])
+            Fs = fs_given_R_multi(ground_local, interfaces_local, soils, allow_cross, st.session_state["method"], xc, yc, R, n_slices=P["final_slices"])
             if Fs is None: continue
-            s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
+            s = arc_sample_poly_best_pair(ground_local, xc, yc, R, n=251, y_floor=0.0)
             if s is None: continue
             x1,x2,*_ = s
-            packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
+            packD = driving_sum_for_R_multi(ground_local, interfaces_local, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
             if packD is None: continue
             D_sum,_,_ = packD
             T_req = max(0.0, (st.session_state["Fs_target"] - Fs)*D_sum)
@@ -431,12 +428,12 @@ elif page.startswith("3"):
         xc,yc = res["center"]; refined=res["refined"]; idx_minFs=res["idx_minFs"]
 
         fig, ax = plt.subplots(figsize=(10.0, 7.0))
+        # 背景
         if st.session_state["n_layers"]==1:
             ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
         elif st.session_state["n_layers"]==2:
             Y1 = clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
-            ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
-            ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
+            ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1"); ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
         else:
             Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
             ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
@@ -444,6 +441,7 @@ elif page.startswith("3"):
             ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
         ax.plot(ground.X, ground.Y, linewidth=2.0, label="Ground")
 
+        # Refined arcs
         for d in refined[:30]:
             xs=np.linspace(d["x1"], d["x2"], 200)
             ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
@@ -452,7 +450,7 @@ elif page.startswith("3"):
             xs_c, ys_c = clipped
             ax.plot(xs_c, ys_c, linewidth=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
 
-        # pick min Fs
+        # Min Fs
         d=refined[idx_minFs]
         xs=np.linspace(d["x1"], d["x2"], 400)
         ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
@@ -464,12 +462,11 @@ elif page.startswith("3"):
             ax.plot([xc,xs_c[0]],[yc,y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
             ax.plot([xc,xs_c[-1]],[yc,y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
 
-        set_axes_fixed(ax, H, L, ground)
+        set_axes_fixed(ax, st.session_state["H"], st.session_state["L"], ground)
         ax.grid(True); ax.legend()
         ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={st.session_state['Fs_target']:.2f}")
         st.pyplot(fig); plt.close(fig)
 
-        # コメント
         if HAS_SUGG:
             render_suggestions(lint_arc_and_slices(hit_edge=False, n_slices=QUALITY[st.session_state["quality"]]["final_slices"]),
                                key_prefix="p3", dispatcher=default_dispatcher)
@@ -482,11 +479,10 @@ elif page.startswith("4"):
     if not st.session_state["chosen_arc"]:
         st.info("Page3で補強対象の円弧（Min Fs）を確定させてから来てください。"); st.stop()
 
-    H = st.session_state["H"]; L = st.session_state["L"]
-    ground = make_ground_example(H, L)
+    ground = make_ground_example(st.session_state["H"], st.session_state["L"])
     arc = st.session_state["chosen_arc"]
 
-    # 入力
+    # 斜面測線
     Xd = np.linspace(ground.X[0], ground.X[-1], 1200)
     Yg = np.array([float(ground.y_at(x)) for x in Xd])
     seglen = np.sqrt(np.diff(Xd)**2 + np.diff(Yg)**2)
@@ -509,7 +505,7 @@ elif page.startswith("4"):
     elif st.session_state["L_mode"] == "パターン2：すべり面より +Δm":
         st.slider("すべり面より +Δm (m)", 0.0, 5.0, step=0.5, key="d_embed")
 
-    # s 等間隔座標
+    # s→x の補間
     def x_at_s(s_val: float) -> float:
         idx = np.searchsorted(s_cum, s_val, side="right")-1
         idx = max(0, min(idx, len(Xd)-2))
@@ -528,10 +524,10 @@ elif page.startswith("4"):
     if st.session_state["n_layers"]==1:
         ax.fill_between(Xp, 0.0, Yp, alpha=0.12, label="Layer1")
     elif st.session_state["n_layers"]==2:
-        Y1 = clip_interfaces_to_ground(ground, [make_interface1_example(H, L)], Xp)[0]
+        Y1 = clip_interfaces_to_ground(ground, [make_interface1_example(st.session_state["H"], st.session_state["L"])], Xp)[0]
         ax.fill_between(Xp, Y1, Yp, alpha=0.12, label="Layer1"); ax.fill_between(Xp, 0.0, Y1, alpha=0.12, label="Layer2")
     else:
-        Y1,Y2 = clip_interfaces_to_ground(ground, [make_interface1_example(H, L), make_interface2_example(H, L)], Xp)
+        Y1,Y2 = clip_interfaces_to_ground(ground, [make_interface1_example(st.session_state["H"], st.session_state["L"]), make_interface2_example(st.session_state["H"], st.session_state["L"])], Xp)
         ax.fill_between(Xp, Y1, Yp, alpha=0.12, label="Layer1")
         ax.fill_between(Xp, Y2, Y1, alpha=0.12, label="Layer2")
         ax.fill_between(Xp, 0.0, Y2, alpha=0.12, label="Layer3")
@@ -543,23 +539,21 @@ elif page.startswith("4"):
     # ネイル頭
     ax.scatter([p[0] for p in nail_heads], [p[1] for p in nail_heads], s=30, color="tab:blue", label=f"Nail heads ({len(nail_heads)})")
 
-    set_axes_fixed(ax, H, L, ground)
+    set_axes_fixed(ax, st.session_state["H"], st.session_state["L"], ground)
     ax.grid(True); ax.legend()
     ax.set_title("配置プレビュー（Phase-1：頭位置のみ）")
     st.pyplot(fig); plt.close(fig)
 
-    # 教授コメント（あれば）
     if HAS_SUGG:
         stats = dict(has_outward=False, too_dense=False, n_Lo_short=0, dominant_mode="pullout")
         render_suggestions(lint_nails_layout(dict(S_surf=st.session_state["S_surf"],S_row=st.session_state["S_row"],
                                                   mode=st.session_state["angle_mode"],Lo_min=1.0), stats),
                            key_prefix="p4", dispatcher=default_dispatcher)
 
-    # Page5で使うため一応保存
-    st.session_state["nail_heads"] = nail_heads
+    st.session_state["nail_heads"] = nail_heads  # Page5用
 
 # =========================
-# Page 5: 補強後解析（ボタン追加）
+# Page 5: 補強後解析（ボタンあり）
 # =========================
 elif page.startswith("5"):
     st.subheader("補強後解析（Phase-2でFS連成予定）")
@@ -567,7 +561,6 @@ elif page.startswith("5"):
     ok_arc = st.session_state["chosen_arc"] is not None
     ok_heads = "nail_heads" in st.session_state and st.session_state["nail_heads"]
 
-    # ボタン（要件：補強後の計算開始）
     btn_disabled = not (ok_arc and ok_heads)
     btn = st.button("▶ 補強後の計算を実行", disabled=btn_disabled)
 
@@ -578,7 +571,6 @@ elif page.startswith("5"):
         st.warning("実行に必要な情報が足りません：" + "、".join(missing))
     elif btn:
         with st.spinner("補強後FS（試作）を計算中…"):
-            # Phase-2で本実装：ここではプレースホルダの指標だけ出す
             res = {
                 "n_nails": len(st.session_state.get("nail_heads", [])),
                 "arc_Fs_unreinforced": st.session_state["chosen_arc"]["Fs"],
@@ -586,7 +578,6 @@ elif page.startswith("5"):
             }
             st.session_state["result_reinforced"] = res
 
-    # 表示
     if st.session_state["result_reinforced"]:
         r = st.session_state["result_reinforced"]
         st.success("補強後計算（試作）を実行しました。")
