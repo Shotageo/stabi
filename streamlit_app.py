@@ -1,4 +1,4 @@
-# streamlit_app.py — 安定版vFinal（初期化は一度だけ／保存でリセットしない／横断図あり／計算前同期）
+# streamlit_app.py — 安定版fix（KeyError対策・安全初期化・横断図あり・保存前後でリセットなし）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time
@@ -14,7 +14,14 @@ from stabi_lem import (
 st.set_page_config(page_title="Stabi LEM｜安定UI", layout="wide")
 st.title("Stabi LEM｜多段UI（安定版）")
 
-# =========================== 初期化（絶対に一度だけ） ===========================
+# ============ 安全アクセサ ============
+def ss_get(k, default):
+    """存在しなければ default で作って返す。"""
+    if k not in st.session_state:
+        st.session_state[k] = default
+    return st.session_state[k]
+
+# ============ 初期化（基本は一度だけ） ============
 def init_session_defaults():
     # Page1
     st.session_state["H"] = 25.0
@@ -59,14 +66,47 @@ def init_session_defaults():
     st.session_state["nail_heads"]=[]
     st.session_state["result_reinforced"]=None
 
+# 欠損を“毎リランで”埋める保険（上書きしない）
+def ensure_missing_defaults():
+    ss_get("H", 25.0); ss_get("L", 60.0)
+    ss_get("water_mode", "WT"); ss_get("ru", 0.0); ss_get("wt_offset", -2.0); ss_get("wl_points", None)
+    ss_get("n_layers", 3)
+    ss_get("gamma1",18.0); ss_get("c1",5.0);  ss_get("phi1",30.0); ss_get("tau1",150.0)
+    ss_get("gamma2",19.0); ss_get("c2",8.0);  ss_get("phi2",28.0); ss_get("tau2",180.0)
+    ss_get("gamma3",20.0); ss_get("c3",12.0); ss_get("phi3",25.0); ss_get("tau3",200.0)
+    ss_get("tau_grout_cap_kPa",150.0)
+    ss_get("d_g",0.125); ss_get("d_s",0.022)
+    ss_get("d_g_mm", int(round(st.session_state["d_g"]*1000)))
+    ss_get("d_s_mm", int(round(st.session_state["d_s"]*1000)))
+    ss_get("fy",1000.0); ss_get("gamma_m",1.20); ss_get("mu",0.0)
+    H=float(st.session_state["H"]); L=float(st.session_state["L"])
+    ss_get("x_min_abs", 0.25*L); ss_get("x_max_abs", 1.15*L)
+    ss_get("y_min_abs", 1.60*H); ss_get("y_max_abs", 2.20*H)
+    ss_get("grid_pitch_m", 5.0)
+    ss_get("method", "Bishop (simplified)")
+    ss_get("quality", "Normal")
+    ss_get("Fs_target", 1.20)
+    ss_get("allow_cross2", True); ss_get("allow_cross3", True)
+    ss_get("s_start",5.0); ss_get("s_end",35.0)
+    ss_get("S_surf",2.0);  ss_get("S_row",2.0)
+    ss_get("tiers",1)
+    ss_get("angle_mode","Slope-Normal (⊥斜面)")
+    ss_get("beta_deg",15.0); ss_get("delta_beta",0.0)
+    ss_get("L_mode","パターン1：固定長"); ss_get("L_nail",5.0); ss_get("d_embed",1.0)
+    ss_get("res3", None); ss_get("chosen_arc", None); ss_get("nail_heads", []); ss_get("result_reinforced", None)
+
+# 起動時だけフル初期化
 if "BOOTED" not in st.session_state:
     init_session_defaults()
-    st.session_state["BOOTED"]=True
+    st.session_state["BOOTED"] = True
+# 毎リランで欠損を保険的に補う
+ensure_missing_defaults()
 
-# =========================== 共通ヘルパ ===========================
+# ============ 共通ヘルパ ============
 def HL_ground():
-    H=float(st.session_state["H"]); L=float(st.session_state["L"])
-    return H, L, make_ground_example(H,L)
+    H = float(ss_get("H", 25.0))
+    L = float(ss_get("L", 60.0))
+    return H, L, make_ground_example(H, L)
 
 def set_axes(ax, H, L, ground):
     x_upper = max(1.18*L, float(ground.X[-1])+0.05*L, 100.0)
@@ -105,7 +145,7 @@ QUALITY = {
                       budget_coarse_s=1.8, budget_quick_s=2.6),
 }
 
-# =========================== サイドバー ===========================
+# ============ サイドバー ============
 with st.sidebar:
     st.header("Pages")
     page = st.radio(
@@ -115,13 +155,14 @@ with st.sidebar:
     )
     st.caption("※セッション維持：保存でリセットは起きません。")
     if st.button("⚠ すべてリセット（初期値に戻す）"):
+        keep = {"__page__"}
         for k in list(st.session_state.keys()):
-            if k != "__page__":
+            if k not in keep:
                 del st.session_state[k]
         init_session_defaults()
         st.success("初期化しました。")
 
-# =========================== Page1: 地形・水位 ===========================
+# ============ Page1: 地形・水位 ============
 if page.startswith("1"):
     H,L,ground = HL_ground()
 
@@ -150,12 +191,11 @@ if page.startswith("1"):
     ax.grid(True); ax.legend(); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     st.pyplot(fig); plt.close(fig)
 
-# =========================== Page2: 地層・材料 ===========================
+# ============ Page2: 地層・材料 ============
 elif page.startswith("2"):
     H,L,ground = HL_ground()
     st.subheader("Layers & Materials")
 
-    # H/L はここでも編集できる（保存で維持）
     st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="H")
     st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="L")
     H,L,ground = HL_ground()
@@ -197,7 +237,7 @@ elif page.startswith("2"):
         st.number_input("材料安全率 γ_m", 1.00, 2.00, step=0.05, key="gamma_m")
         st.select_slider("逓減係数 μ（0〜0.9, 0.1刻み）", options=[round(0.1*i,1) for i in range(10)], key="mu")
 
-    # プレビュー
+    # preview
     Xd = np.linspace(ground.X[0], ground.X[-1], 600)
     Yg = np.array([float(ground.y_at(x)) for x in Xd])
     fig,ax = plt.subplots(figsize=(9.5,5.8))
@@ -218,12 +258,12 @@ elif page.startswith("2"):
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
 
-# =========================== Page3: 円弧探索 ===========================
+# ============ Page3: 円弧探索 ============
 elif page.startswith("3"):
     H,L,ground = HL_ground()
     st.subheader("円弧探索（未補強）")
 
-    # ---- p3_* バッファ（初回のみ本キーからコピー）
+    # p3_* バッファ（初回のみ本キーからコピー）
     def seed_once(k_ui, v):
         if k_ui not in st.session_state: st.session_state[k_ui] = v
     seed_once("p3_x_min", float(st.session_state["x_min_abs"]))
@@ -256,7 +296,7 @@ elif page.startswith("3"):
             st.checkbox("Allow into Layer 3", key="p3_allow3")
         submitted = st.form_submit_button("💾 設定を確定（保存）")
 
-    # ---- p3_* → 本キー 同期（保存と計算直前の2か所で使う）
+    # p3_* → 本キー 同期
     def sync_p3_to_main():
         x_min = float(st.session_state["p3_x_min"]); x_max = float(st.session_state["p3_x_max"])
         y_min = float(st.session_state["p3_y_min"]); y_max = float(st.session_state["p3_y_max"])
@@ -275,7 +315,7 @@ elif page.startswith("3"):
         sync_p3_to_main()
         st.success("設定を保存しました。")
 
-    # ---- 横断図（必ず表示）
+    # 横断図（必ず表示）
     x_min = float(st.session_state["x_min_abs"]); x_max = float(st.session_state["x_max_abs"])
     y_min = float(st.session_state["y_min_abs"]); y_max = float(st.session_state["y_max_abs"])
     pitch = float(st.session_state["grid_pitch_m"])
@@ -314,7 +354,7 @@ elif page.startswith("3"):
     ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     st.pyplot(fig); plt.close(fig)
 
-    # ---- soils & allow_cross
+    # soils & allow_cross
     soils=[Soil(st.session_state["gamma1"],st.session_state["c1"],st.session_state["phi1"])]
     allow_cross=[]
     if st.session_state["n_layers"]>=2:
@@ -325,9 +365,9 @@ elif page.startswith("3"):
         allow_cross.append(bool(st.session_state["allow_cross3"]))
     P = QUALITY[quality].copy()
 
-    # ---- compute_once（ボタンより前に定義）
+    # 計算コア（ボタンより前に定義）
     def compute_once():
-        Hc,Lc = float(st.session_state["H"]), float(st.session_state["L"])
+        Hc,Lc = float(ss_get("H",25.0)), float(ss_get("L",60.0))
         groundL = make_ground_example(Hc, Lc)
         ifaces=[]
         if st.session_state["n_layers"]>=2: ifaces.append(make_interface1_example(Hc,Lc))
@@ -402,7 +442,7 @@ elif page.startswith("3"):
         idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
         return dict(center=(xc,yc), refined=refined, idx_minFs=idx_minFs)
 
-    # ---- 計算ボタン（押下時は必ず同期→計算）
+    # 計算ボタン（押下時は必ず同期→計算）
     if st.button("▶ 計算開始（未補強）"):
         sync_p3_to_main()
         res = compute_once()
@@ -411,7 +451,7 @@ elif page.startswith("3"):
         xc,yc = res["center"]; d = res["refined"][res["idx_minFs"]]
         st.session_state["chosen_arc"] = dict(xc=xc,yc=yc,R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"])
 
-    # ---- 結果図
+    # 結果図
     if st.session_state["res3"]:
         res = st.session_state["res3"]
         xc,yc = res["center"]; refined=res["refined"]; idx_minFs=res["idx_minFs"]
@@ -452,7 +492,7 @@ elif page.startswith("3"):
         ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={Fs_t:.2f} • pitch={pitch:.2f}m")
         st.pyplot(fig); plt.close(fig)
 
-# =========================== Page4: ネイル配置 ===========================
+# ============ Page4: ネイル配置 ============
 elif page.startswith("4"):
     H,L,ground = HL_ground()
     st.subheader("ソイルネイル配置（試作：頭位置のみ）")
@@ -515,7 +555,7 @@ elif page.startswith("4"):
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
 
-# =========================== Page5: 補強後解析 ===========================
+# ============ Page5: 補強後解析 ============
 elif page.startswith("5"):
     H,L,ground = HL_ground()
     st.subheader("補強後解析（試作）")
