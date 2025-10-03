@@ -1,4 +1,4 @@
-# streamlit_app.py — 安定版（保存でリセットしない・水位クリップ・ピッチ[m]・径mm・Page3バッファ保存）
+# streamlit_app.py — 安定版（KeyError根絶／value/index撤去／水位クリップ／ピッチ[m]／径mm／保存でリセットなし）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time
@@ -14,46 +14,70 @@ from stabi_lem import (
 st.set_page_config(page_title="Stabi LEM｜安定UI", layout="wide")
 st.title("Stabi LEM｜多段UI（安定版）")
 
-# ---------------- Session init (一度だけ) ----------------
-def _def(k, v):
-    if k not in st.session_state: st.session_state[k] = v
+# =====================================================
+# セッション初期化（不足キーは毎回補填。既存値は上書きしない）
+# =====================================================
+def ss_default(k, v):
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-if "_inited" not in st.session_state:
-    # Page1
-    _def("H", 25.0); _def("L", 60.0)
-    _def("water_mode", "WT"); _def("ru", 0.0)
-    _def("wt_offset", -2.0); _def("wl_points", None)
-    # Page2
-    _def("n_layers", 3)
-    _def("gamma1",18.0); _def("c1",5.0);  _def("phi1",30.0); _def("tau1",150.0)
-    _def("gamma2",19.0); _def("c2",8.0);  _def("phi2",28.0); _def("tau2",180.0)
-    _def("gamma3",20.0); _def("c3",12.0); _def("phi3",25.0); _def("tau3",200.0)
-    _def("tau_grout_cap_kPa", 150.0)
-    _def("d_g", 0.125); _def("d_s", 0.022); _def("fy", 1000.0); _def("gamma_m", 1.20); _def("mu", 0.0)
-    _def("d_g_mm", int(round(st.session_state["d_g"]*1000)))
-    _def("d_s_mm", int(round(st.session_state["d_s"]*1000)))
-    # Page3（絶対値で保持）
-    _def("x_min_abs", 0.25*st.session_state["L"])
-    _def("x_max_abs", 1.15*st.session_state["L"])
-    _def("y_min_abs", 1.60*st.session_state["H"])
-    _def("y_max_abs", 2.20*st.session_state["H"])
-    _def("grid_pitch_m", 5.0)
-    _def("method", "Bishop (simplified)")
-    _def("quality", "Normal")
-    _def("Fs_target", 1.20)
-    _def("allow_cross2", True); _def("allow_cross3", True)
-    # Page4/5
-    _def("s_start", 5.0); _def("s_end", 35.0)
-    _def("S_surf", 2.0); _def("S_row", 2.0)
-    _def("tiers", 1)
-    _def("angle_mode", "Slope-Normal (⊥斜面)")
-    _def("beta_deg", 15.0); _def("delta_beta", 0.0)
-    _def("L_mode", "パターン1：固定長"); _def("L_nail", 5.0); _def("d_embed", 1.0)
-    _def("chosen_arc", None); _def("res3", None); _def("nail_heads", [])
-    _def("result_reinforced", None)
-    st.session_state["_inited"] = True
+def ensure_all_keys():
+    # Page1: geometry & water
+    ss_default("H", 25.0)
+    ss_default("L", 60.0)
+    ss_default("water_mode", "WT")   # "WT" | "ru" | "WT+ru"
+    ss_default("ru", 0.0)            # 0..0.9
+    ss_default("wt_offset", -2.0)    # m（地表からの相対）
+    ss_default("wl_points", None)    # np.ndarray[[x,y],...]
 
-# ---------------- Helpers ----------------
+    # Page2: layers & materials
+    ss_default("n_layers", 3)
+    ss_default("gamma1", 18.0); ss_default("c1", 5.0);  ss_default("phi1", 30.0); ss_default("tau1", 150.0)
+    ss_default("gamma2", 19.0); ss_default("c2", 8.0);  ss_default("phi2", 28.0); ss_default("tau2", 180.0)
+    ss_default("gamma3", 20.0); ss_default("c3", 12.0); ss_default("phi3", 25.0); ss_default("tau3", 200.0)
+    ss_default("tau_grout_cap_kPa", 150.0)
+    ss_default("d_g", 0.125)  # m
+    ss_default("d_s", 0.022)  # m
+    ss_default("d_g_mm", int(round(st.session_state["d_g"] * 1000)))
+    ss_default("d_s_mm", int(round(st.session_state["d_s"] * 1000)))
+    ss_default("fy", 1000.0)
+    ss_default("gamma_m", 1.20)
+    ss_default("mu", 0.0)     # 0..0.9
+
+    # Page3: grid & method（絶対値で保持）
+    ss_default("x_min_abs", 0.25 * st.session_state["L"])
+    ss_default("x_max_abs", 1.15 * st.session_state["L"])
+    ss_default("y_min_abs", 1.60 * st.session_state["H"])
+    ss_default("y_max_abs", 2.20 * st.session_state["H"])
+    ss_default("grid_pitch_m", 5.0)
+    ss_default("method", "Bishop (simplified)")
+    ss_default("quality", "Normal")
+    ss_default("Fs_target", 1.20)
+    ss_default("allow_cross2", True)
+    ss_default("allow_cross3", True)
+
+    # Page4/5: nails
+    ss_default("s_start", 5.0)
+    ss_default("s_end", 35.0)
+    ss_default("S_surf", 2.0)
+    ss_default("S_row", 2.0)
+    ss_default("tiers", 1)
+    ss_default("angle_mode", "Slope-Normal (⊥斜面)")
+    ss_default("beta_deg", 15.0)
+    ss_default("delta_beta", 0.0)
+    ss_default("L_mode", "パターン1：固定長")
+    ss_default("L_nail", 5.0)
+    ss_default("d_embed", 1.0)
+
+    # results
+    ss_default("res3", None)
+    ss_default("chosen_arc", None)
+    ss_default("nail_heads", [])
+    ss_default("result_reinforced", None)
+
+ensure_all_keys()
+
+# ============= 共通ユーティリティ =============
 def HL_ground():
     H = float(st.session_state["H"]); L = float(st.session_state["L"])
     return H, L, make_ground_example(H, L)
@@ -95,61 +119,54 @@ QUALITY = {
                       budget_coarse_s=1.8, budget_quick_s=2.6),
 }
 
-# ---------------- Nav ----------------
-page = st.sidebar.radio("Pages",
-    ["1) 地形・水位", "2) 地層・材料", "3) 円弧探索（未補強）", "4) ネイル配置", "5) 補強後解析"]
+# ===================== ナビ =====================
+page = st.sidebar.radio(
+    "Pages",
+    ["1) 地形・水位", "2) 地層・材料", "3) 円弧探索（未補強）", "4) ネイル配置", "5) 補強後解析"],
 )
 
-# ================= Page1 =================
+# ================= Page1: 地形・水位 =================
 if page.startswith("1"):
     H,L,ground = HL_ground()
+
     colL,colR = st.columns([3,1])
     with colL:
         st.subheader("Geometry")
-        st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5,
-                        value=st.session_state["H"], key="H")
-        st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5,
-                        value=st.session_state["L"], key="L")
+        # 既定値はセッションにのみ保持。widgetは key のみ（value/index 不使用）
+        st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="H")
+        st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="L")
         H,L,ground = HL_ground()
 
         st.subheader("Water")
-        st.selectbox("Water model", ["WT","ru","WT+ru"],
-                     index=["WT","ru","WT+ru"].index(st.session_state["water_mode"]), key="water_mode")
-        st.slider("r_u (if ru mode)", 0.0, 0.9, step=0.05,
-                  value=float(st.session_state["ru"]), key="ru")
+        st.selectbox("Water model", ["WT","ru","WT+ru"], key="water_mode")
+        st.slider("r_u (if ru mode)", 0.0, 0.9, step=0.05, key="ru")
+        st.slider("Water level offset from ground (m, negative=below)", -30.0, 5.0, step=0.5, key="wt_offset")
 
-        st.slider("Water level offset from ground (m, negative=below)",
-                  -30.0, 5.0, step=0.5, value=float(st.session_state["wt_offset"]), key="wt_offset")
-
-        # オフセットWT：0..地表にクリップ
+        # オフセットWT：0..地表にクリップ（突き抜け＆軸暴れ防止）
         Xd = np.linspace(ground.X[0], ground.X[-1], 200)
         Yg = np.array([float(ground.y_at(x)) for x in Xd])
-        Yw = np.clip(Yg + st.session_state["wt_offset"], 0.0, Yg)
+        Yw = np.clip(Yg + float(st.session_state["wt_offset"]), 0.0, Yg)
         st.session_state["wl_points"] = np.vstack([Xd, Yw]).T
 
         fig,ax = plt.subplots(figsize=(9.5,5.8))
         ax.plot(ground.X, ground.Y, linewidth=2.0, label="Ground")
         ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Soil")
-        if st.session_state["water_mode"].startswith("WT"):
+        if str(st.session_state.get("water_mode","WT")).startswith("WT"):
             ax.plot(Xd, Yw, linestyle="-.", color="tab:blue", label="WT (offset, clipped)")
         set_axes(ax, H, L, ground)
         ax.grid(True); ax.legend(); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
         st.pyplot(fig); plt.close(fig)
 
-# ================= Page2 =================
+# ================= Page2: 地層・材料 =================
 elif page.startswith("2"):
     H,L,ground = HL_ground()
     st.subheader("Layers & Materials")
 
-    # H/Lもvalue指定で固定
-    st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5,
-                    value=st.session_state["H"], key="H")
-    st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5,
-                    value=st.session_state["L"], key="L")
+    st.number_input("H (m)", min_value=5.0, max_value=200.0, step=0.5, key="H")
+    st.number_input("L (m)", min_value=5.0, max_value=400.0, step=0.5, key="L")
     H,L,ground = HL_ground()
 
-    st.selectbox("Number of layers", [1,2,3],
-                 index=[1,2,3].index(st.session_state["n_layers"]), key="n_layers")
+    st.selectbox("Number of layers", [1,2,3], key="n_layers")
 
     interfaces=[]
     if st.session_state["n_layers"]>=2: interfaces.append(make_interface1_example(H,L))
@@ -158,43 +175,37 @@ elif page.startswith("2"):
     cols = st.columns(4)
     with cols[0]:
         st.markdown("**Layer1 (top)**")
-        st.number_input("γ₁", 10.0, 25.0, step=0.5, value=st.session_state["gamma1"], key="gamma1")
-        st.number_input("c₁", 0.0, 200.0, step=0.5, value=st.session_state["c1"], key="c1")
-        st.number_input("φ₁", 0.0, 45.0, step=0.5, value=st.session_state["phi1"], key="phi1")
-        st.number_input("τ₁ (kPa)", 0.0, 1000.0, step=10.0, value=st.session_state["tau1"], key="tau1")
+        st.number_input("γ₁", 10.0, 25.0, step=0.5, key="gamma1")
+        st.number_input("c₁", 0.0, 200.0, step=0.5, key="c1")
+        st.number_input("φ₁", 0.0, 45.0, step=0.5, key="phi1")
+        st.number_input("τ₁ (kPa)", 0.0, 1000.0, step=10.0, key="tau1")
     if st.session_state["n_layers"]>=2:
         with cols[1]:
             st.markdown("**Layer2**")
-            st.number_input("γ₂", 10.0, 25.0, step=0.5, value=st.session_state["gamma2"], key="gamma2")
-            st.number_input("c₂", 0.0, 200.0, step=0.5, value=st.session_state["c2"], key="c2")
-            st.number_input("φ₂", 0.0, 45.0, step=0.5, value=st.session_state["phi2"], key="phi2")
-            st.number_input("τ₂ (kPa)", 0.0, 1000.0, step=10.0, value=st.session_state["tau2"], key="tau2")
+            st.number_input("γ₂", 10.0, 25.0, step=0.5, key="gamma2")
+            st.number_input("c₂", 0.0, 200.0, step=0.5, key="c2")
+            st.number_input("φ₂", 0.0, 45.0, step=0.5, key="phi2")
+            st.number_input("τ₂ (kPa)", 0.0, 1000.0, step=10.0, key="tau2")
     if st.session_state["n_layers"]>=3:
         with cols[2]:
             st.markdown("**Layer3 (bottom)**")
-            st.number_input("γ₃", 10.0, 25.0, step=0.5, value=st.session_state["gamma3"], key="gamma3")
-            st.number_input("c₃", 0.0, 200.0, step=0.5, value=st.session_state["c3"], key="c3")
-            st.number_input("φ₃", 0.0, 45.0, step=0.5, value=st.session_state["phi3"], key="phi3")
-            st.number_input("τ₃ (kPa)", 0.0, 1000.0, step=10.0, value=st.session_state["tau3"], key="tau3")
+            st.number_input("γ₃", 10.0, 25.0, step=0.5, key="gamma3")
+            st.number_input("c₃", 0.0, 200.0, step=0.5, key="c3")
+            st.number_input("φ₃", 0.0, 45.0, step=0.5, key="phi3")
+            st.number_input("τ₃ (kPa)", 0.0, 1000.0, step=10.0, key="tau3")
     with cols[-1]:
         st.markdown("**Grout / Nail**")
-        st.number_input("τ_grout_cap (kPa)", 0.0, 2000.0, step=10.0,
-                        value=st.session_state["tau_grout_cap_kPa"], key="tau_grout_cap_kPa")
-        st.number_input("削孔(=グラウト)径 d_g (mm)", 50, 300, step=1,
-                        value=st.session_state["d_g_mm"], key="d_g_mm")
-        st.session_state["d_g"] = st.session_state["d_g_mm"]/1000.0
-        st.number_input("鉄筋径 d_s (mm)", 10, 50, step=1,
-                        value=st.session_state["d_s_mm"], key="d_s_mm")
-        st.session_state["d_s"] = st.session_state["d_s_mm"]/1000.0
-        st.number_input("引張強さ fy (MPa)", 200.0, 2000.0, step=50.0,
-                        value=st.session_state["fy"], key="fy")
-        st.number_input("材料安全率 γ_m", 1.00, 2.00, step=0.05,
-                        value=st.session_state["gamma_m"], key="gamma_m")
-        st.select_slider("逓減係数 μ（0〜0.9, 0.1刻み）",
-                         options=[round(0.1*i,1) for i in range(10)],
-                         value=float(st.session_state["mu"]), key="mu")
+        st.number_input("τ_grout_cap (kPa)", 0.0, 2000.0, step=10.0, key="tau_grout_cap_kPa")
+        # mm入力→m同期（value/indexは使わない）
+        st.number_input("削孔(=グラウト)径 d_g (mm)", 50, 300, step=1, key="d_g_mm")
+        st.number_input("鉄筋径 d_s (mm)", 10, 50, step=1, key="d_s_mm")
+        st.session_state["d_g"] = float(st.session_state["d_g_mm"]) / 1000.0
+        st.session_state["d_s"] = float(st.session_state["d_s_mm"]) / 1000.0
+        st.number_input("引張強さ fy (MPa)", 200.0, 2000.0, step=50.0, key="fy")
+        st.number_input("材料安全率 γ_m", 1.00, 2.00, step=0.05, key="gamma_m")
+        st.select_slider("逓減係数 μ（0〜0.9, 0.1刻み）", options=[round(0.1*i,1) for i in range(10)], key="mu")
 
-    # 図
+    # プレビュー
     Xd = np.linspace(ground.X[0], ground.X[-1], 600)
     Yg = np.array([float(ground.y_at(x)) for x in Xd])
     fig,ax = plt.subplots(figsize=(9.5,5.8))
@@ -215,12 +226,12 @@ elif page.startswith("2"):
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
 
-# ================= Page3 =================
+# ================= Page3: 円弧探索（未補強） =================
 elif page.startswith("3"):
     H,L,ground = HL_ground()
     st.subheader("円弧探索（未補強）")
 
-    # --- UIバッファキー（初回だけ正式値をコピー）
+    # UIバッファキー（初回だけ本キー→p3_*にコピー）
     def seed_once(k_ui, v):
         if k_ui not in st.session_state: st.session_state[k_ui] = v
     seed_once("p3_x_min", float(st.session_state["x_min_abs"]))
@@ -234,36 +245,27 @@ elif page.startswith("3"):
     seed_once("p3_allow2", bool(st.session_state["allow_cross2"]))
     seed_once("p3_allow3", bool(st.session_state["allow_cross3"]))
 
-    # ---- フォーム（UIは常に p3_* を読み書き）----
+    # フォーム（value/indexは使わず key のみ）
     with st.form("arc_params"):
         colA,colB = st.columns([1.3,1])
         with colA:
-            st.number_input("x min (m)", value=st.session_state["p3_x_min"],
-                            step=max(0.1,0.05*L), format="%.3f", key="p3_x_min")
-            st.number_input("x max (m)", value=st.session_state["p3_x_max"],
-                            step=max(0.1,0.05*L), format="%.3f", key="p3_x_max")
-            st.number_input("y min (m)", value=st.session_state["p3_y_min"],
-                            step=max(0.1,0.10*H), format="%.3f", key="p3_y_min")
-            st.number_input("y max (m)", value=st.session_state["p3_y_max"],
-                            step=max(0.1,0.10*H), format="%.3f", key="p3_y_max")
-            st.number_input("Center-grid ピッチ (m)", min_value=0.1, step=0.1, format="%.2f",
-                            value=st.session_state["p3_pitch"], key="p3_pitch")
+            st.number_input("x min (m)", step=max(0.1,0.05*L), format="%.3f", key="p3_x_min")
+            st.number_input("x max (m)", step=max(0.1,0.05*L), format="%.3f", key="p3_x_max")
+            st.number_input("y min (m)", step=max(0.1,0.10*H), format="%.3f", key="p3_y_min")
+            st.number_input("y max (m)", step=max(0.1,0.10*H), format="%.3f", key="p3_y_max")
+            st.number_input("Center-grid ピッチ (m)", min_value=0.1, step=0.1, format="%.2f", key="p3_pitch")
             st.caption(f"ヒント: 参考 x∈[{0.2*L:.1f},{4.0*L:.1f}], y∈[{0.8*H:.1f},{8.0*H:.1f}]")
         with colB:
-            st.selectbox("Method", ["Bishop (simplified)","Fellenius"],
-                         index=["Bishop (simplified)","Fellenius"].index(st.session_state["p3_method"]),
-                         key="p3_method")
-            st.select_slider("Quality", options=list(QUALITY.keys()),
-                             value=st.session_state["p3_quality"], key="p3_quality")
-            st.number_input("Target FS", min_value=1.00, max_value=2.00, step=0.05, format="%.2f",
-                            value=st.session_state["p3_Fs_t"], key="p3_Fs_t")
+            st.selectbox("Method", ["Bishop (simplified)","Fellenius"], key="p3_method")
+            st.select_slider("Quality", options=list(QUALITY.keys()), key="p3_quality")
+            st.number_input("Target FS", min_value=1.00, max_value=2.00, step=0.05, format="%.2f", key="p3_Fs_t")
         if st.session_state["n_layers"]>=2:
-            st.checkbox("Allow into Layer 2", value=st.session_state["p3_allow2"], key="p3_allow2")
+            st.checkbox("Allow into Layer 2", key="p3_allow2")
         if st.session_state["n_layers"]>=3:
-            st.checkbox("Allow into Layer 3", value=st.session_state["p3_allow3"], key="p3_allow3")
+            st.checkbox("Allow into Layer 3", key="p3_allow3")
         submitted = st.form_submit_button("🔁 設定を確定（保存）")
 
-    # ---- 保存時のみ 正式キーへコピー（この順序が重要！）----
+    # 保存時のみ 正式キーへ反映
     if submitted:
         x_min = float(st.session_state["p3_x_min"]); x_max = float(st.session_state["p3_x_max"])
         y_min = float(st.session_state["p3_y_min"]); y_max = float(st.session_state["p3_y_max"])
@@ -279,7 +281,7 @@ elif page.startswith("3"):
         st.session_state["allow_cross3"] = bool(st.session_state["p3_allow3"])
         st.success("設定を保存しました。")
 
-    # 以降は正式キーで固定描画
+    # 保存済みの値で描画
     x_min = float(st.session_state["x_min_abs"]); x_max = float(st.session_state["x_max_abs"])
     y_min = float(st.session_state["y_min_abs"]); y_max = float(st.session_state["y_max_abs"])
     pitch = float(st.session_state["grid_pitch_m"])
@@ -308,16 +310,20 @@ elif page.startswith("3"):
         ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
     ax.plot(ground.X, ground.Y, lw=2.0, label="Ground")
 
-    if st.session_state["water_mode"].startswith("WT"):
-        wl = st.session_state.get("wl_points", None)
+    wm = str(st.session_state.get("water_mode","WT"))
+    wl = st.session_state.get("wl_points", None)
+    if wm.startswith("WT"):
         if wl is None:
-            Yw = np.clip(Yg + st.session_state["wt_offset"], 0.0, Yg)
+            # Page1を経由せずPage3から入った場合も安全
+            Yw = np.clip(Yg + float(st.session_state.get("wt_offset",-2.0)), 0.0, Yg)
             wl = np.vstack([Xd, Yw]).T
             st.session_state["wl_points"] = wl
         ax.plot(wl[:,0], wl[:,1], "-.", color="tab:blue", alpha=0.8, label="WT (clipped)")
 
     gx = np.arange(x_min, x_max+1e-9, pitch)
     gy = np.arange(y_min, y_max+1e-9, pitch)
+    if gx.size<1: gx=np.array([x_min]); 
+    if gy.size<1: gy=np.array([y_min])
     xs=[float(x) for x in gx for _ in gy]; ys=[float(y) for y in gy for _ in gx]
     ax.scatter(xs, ys, s=10, c="k", alpha=0.25, marker=".", label=f"Center grid (pitch={pitch:.2f} m)")
     ax.plot([x_min,x_max,x_max,x_min,x_min],[y_min,y_min,y_max,y_max,y_min], c="k", lw=1.0, alpha=0.4)
@@ -420,6 +426,7 @@ elif page.startswith("3"):
     if st.session_state["res3"]:
         res = st.session_state["res3"]
         xc,yc = res["center"]; refined=res["refined"]; idx_minFs=res["idx_minFs"]
+
         fig,ax = plt.subplots(figsize=(10.0,7.0))
         # 背景
         if st.session_state["n_layers"]==1:
@@ -433,6 +440,7 @@ elif page.startswith("3"):
             ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
             ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
         ax.plot(ground.X, ground.Y, lw=2.0, label="Ground")
+
         # refined
         for d in refined[:30]:
             xs=np.linspace(d["x1"], d["x2"], 200)
@@ -441,6 +449,7 @@ elif page.startswith("3"):
             if clipped is None: continue
             xs_c,ys_c = clipped
             ax.plot(xs_c, ys_c, lw=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
+
         # minFs
         d=refined[idx_minFs]
         xs=np.linspace(d["x1"], d["x2"], 400)
@@ -452,11 +461,12 @@ elif page.startswith("3"):
             y1=float(ground.y_at(xs_c[0])); y2=float(ground.y_at(xs_c[-1]))
             ax.plot([xc,xs_c[0]],[yc,y1], lw=1.1, color=(0.9,0,0), alpha=0.9)
             ax.plot([xc,xs_c[-1]],[yc,y2], lw=1.1, color=(0.9,0,0), alpha=0.9)
+
         set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
         ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={Fs_t:.2f} • pitch={pitch:.2f}m")
         st.pyplot(fig); plt.close(fig)
 
-# ================= Page4 =================
+# ================= Page4: ネイル配置 =================
 elif page.startswith("4"):
     H,L,ground = HL_ground()
     st.subheader("ソイルネイル配置（試作：頭位置のみ）")
@@ -470,23 +480,22 @@ elif page.startswith("4"):
     s_cum = np.concatenate([[0.0], np.cumsum(seg)])
     s_total = float(s_cum[-1])
 
-    st.slider("s_start (m)", 0.0, s_total, step=0.5, value=st.session_state["s_start"], key="s_start")
-    st.slider("s_end (m)", st.session_state["s_start"], s_total, step=0.5, value=st.session_state["s_end"], key="s_end")
-    st.slider("斜面ピッチ S_surf (m)", 0.5, 5.0, step=0.1, value=st.session_state["S_surf"], key="S_surf")
-    st.slider("段間隔 S_row (法線方向 m) [未実装]", 0.5, 5.0, step=0.5, value=st.session_state["S_row"], key="S_row")
-    st.number_input("段数（表示のみ）", 1, 5, step=1, value=st.session_state["tiers"], key="tiers")
+    st.slider("s_start (m)", 0.0, s_total, step=0.5, key="s_start")
+    st.slider("s_end (m)", st.session_state["s_start"], s_total, step=0.5, key="s_end")
+    st.slider("斜面ピッチ S_surf (m)", 0.5, 5.0, step=0.1, key="S_surf")
+    st.slider("段間隔 S_row (法線方向 m) [未実装]", 0.5, 5.0, step=0.5, key="S_row")
+    st.number_input("段数（表示のみ）", 1, 5, step=1, key="tiers")
     st.radio("角度モード", ["Slope-Normal (⊥斜面)", "Horizontal-Down (β°)"],
-             index=0 if st.session_state["angle_mode"].startswith("Slope") else 1, key="angle_mode")
+             key="angle_mode")
     if st.session_state["angle_mode"].endswith("β°"):
-        st.slider("β（水平から下向き °）", 0.0, 45.0, step=1.0, value=st.session_state["beta_deg"], key="beta_deg")
+        st.slider("β（水平から下向き °）", 0.0, 45.0, step=1.0, key="beta_deg")
     else:
-        st.slider("法線からの微調整 ±Δβ（°）", -10.0, 10.0, step=1.0, value=st.session_state["delta_beta"], key="delta_beta")
-    st.radio("長さモード", ["パターン1：固定長", "パターン2：すべり面より +Δm", "パターン3：FS目標で自動"],
-             index=["パターン1：固定長","パターン2：すべり面より +Δm","パターン3：FS目標で自動"].index(st.session_state["L_mode"]), key="L_mode")
+        st.slider("法線からの微調整 ±Δβ（°）", -10.0, 10.0, step=1.0, key="delta_beta")
+    st.radio("長さモード", ["パターン1：固定長", "パターン2：すべり面より +Δm", "パターン3：FS目標で自動"], key="L_mode")
     if st.session_state["L_mode"]=="パターン1：固定長":
-        st.slider("ネイル長 L (m)", 1.0, 15.0, step=0.5, value=st.session_state["L_nail"], key="L_nail")
+        st.slider("ネイル長 L (m)", 1.0, 15.0, step=0.5, key="L_nail")
     elif st.session_state["L_mode"]=="パターン2：すべり面より +Δm":
-        st.slider("すべり面より +Δm (m)", 0.0, 5.0, step=0.5, value=st.session_state["d_embed"], key="d_embed")
+        st.slider("すべり面より +Δm (m)", 0.0, 5.0, step=0.5, key="d_embed")
 
     def x_at_s(sv):
         idx = np.searchsorted(s_cum, sv, side="right")-1
@@ -521,13 +530,13 @@ elif page.startswith("4"):
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
 
-# ================= Page5 =================
+# ================= Page5: 補強後解析 =================
 elif page.startswith("5"):
     H,L,ground = HL_ground()
     st.subheader("補強後解析（試作）")
     ok_arc = st.session_state["chosen_arc"] is not None
     ok_heads = bool(st.session_state.get("nail_heads", []))
-    btn = st.button("▶ 補強後の計算を実行", disabled=not(ok_arc and ok_heads))
+    btn = st.button("▶ 補強後の計算を実行", disabled=not (ok_arc and ok_heads))
     if not (ok_arc and ok_heads):
         missing=[]
         if not ok_arc: missing.append("Page3のMin Fs円弧")
