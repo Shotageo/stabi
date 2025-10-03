@@ -1,4 +1,4 @@
-# streamlit_app.py — 5ページ構成＋教授コメント（Phase-1：補強FSはプレースホルダ）
+# streamlit_app.py — 多段UI + 教授コメント（Page3に設定中の横断図を追加／WTクリップ／H/L共有）
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random, math
@@ -18,6 +18,15 @@ from stabi_suggest import (
 
 st.set_page_config(page_title="Stabi LEM｜多段UI+教授コメント", layout="wide")
 st.title("Stabi LEM｜多段UI + 教授コメント（Phase-1）")
+
+# ---------------- 共有セッションの初期化（H/L 共有など） ----------------
+if "H" not in st.session_state: st.session_state["H"] = 25.0
+if "L" not in st.session_state: st.session_state["L"] = 60.0
+if "water_mode" not in st.session_state: st.session_state["water_mode"] = "WT"  # or "ru" or "WT+ru"
+if "tau_grout_cap_kPa" not in st.session_state: st.session_state["tau_grout_cap_kPa"] = None
+if "mu" not in st.session_state: st.session_state["mu"] = 0.0
+if "ru" not in st.session_state: st.session_state["ru"] = 0.0
+if "wl_points" not in st.session_state: st.session_state["wl_points"] = None
 
 # ---------------- Utils ----------------
 def fs_to_color(fs: float):
@@ -49,13 +58,11 @@ QUALITY = {
                    coarse_limit_arcs=70, coarse_probe_min=81,
                    budget_coarse_s=0.8, budget_quick_s=1.2),
     "Fine": dict(quick_slices=16, final_slices=50, n_entries_final=1700, probe_n_min_quick=121,
-                 limit_arcs_quick=160, show_k=180, top_thick=16,
-                 coarse_subsample="full", coarse_entries=320,
+                 limit_arcs_quick=160, show_k=180, coarse_subsample="full", coarse_entries=320,
                  coarse_limit_arcs=100, coarse_probe_min=101,
                  budget_coarse_s=1.2, budget_quick_s=1.8),
     "Very-fine": dict(quick_slices=20, final_slices=60, n_entries_final=2200, probe_n_min_quick=141,
-                      limit_arcs_quick=220, show_k=240, top_thick=20,
-                      coarse_subsample="full", coarse_entries=420,
+                      limit_arcs_quick=220, show_k=240, coarse_subsample="full", coarse_entries=420,
                       coarse_limit_arcs=140, coarse_probe_min=121,
                       budget_coarse_s=1.8, budget_quick_s=2.6),
 }
@@ -63,31 +70,28 @@ QUALITY = {
 # ---------------- Sidebar nav ----------------
 page = st.sidebar.radio("Pages", ["1) 地形・水位", "2) 地層・材料", "3) 円弧探索（未補強）", "4) ネイル配置", "5) 補強後解析"])
 
-# 共有セッションの初期化
-if "water_mode" not in st.session_state: st.session_state["water_mode"] = "WT"  # or "ru" or "WT+ru"
-if "tau_grout_cap_kPa" not in st.session_state: st.session_state["tau_grout_cap_kPa"] = None
-if "mu" not in st.session_state: st.session_state["mu"] = 0.0
-
 # ---------------- Page 1: 地形・水位 ----------------
 if page.startswith("1"):
     colL, colR = st.columns([3,1])
     with colL:
         st.subheader("Geometry")
-        H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5)
-        L = st.number_input("L (m)", 5.0, 400.0, 60.0, 0.5)
-        ground = make_ground_example(H, L)
+        H = st.number_input("H (m)", 5.0, 200.0, st.session_state["H"], 0.5, key="H")
+        L = st.number_input("L (m)", 5.0, 400.0, st.session_state["L"], 0.5, key="L")
+        ground = make_ground_example(st.session_state["H"], st.session_state["L"])
 
         st.subheader("Water")
-        water_mode = st.selectbox("Water model", ["WT", "ru", "WT+ru"], index=["WT","ru","WT+ru"].index(st.session_state["water_mode"]))
+        water_mode = st.selectbox("Water model", ["WT", "ru", "WT+ru"],
+                                  index=["WT","ru","WT+ru"].index(st.session_state["water_mode"]))
         st.session_state["water_mode"] = water_mode
-        ru_val = st.slider("r_u (if ru mode)", 0.0, 0.9, 0.0, 0.05)
+        ru_val = st.slider("r_u (if ru mode)", 0.0, 0.9, st.session_state.get("ru", 0.0), 0.05)
         st.session_state["ru"] = ru_val
 
-        # 仮の水位線（例：地表からのオフセット）
+        # オフセットWT（地表にクリップ）
         offset = st.slider("Water level offset from ground (m, negative=below)", -30.0, 5.0, -2.0, 0.5)
         Xd = np.linspace(ground.X[0], ground.X[-1], 200)
         Yg = np.array([float(ground.y_at(x)) for x in Xd])
-        Yw = Yg + offset
+        Yw_raw = Yg + offset
+        Yw = np.minimum(Yw_raw, Yg)  # ★地表越え防止
         st.session_state["wl_points"] = np.vstack([Xd, Yw]).T
 
         # プロット
@@ -95,7 +99,7 @@ if page.startswith("1"):
         ax.plot(ground.X, ground.Y, linewidth=2.0, label="Ground")
         ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Soil")
         if water_mode.startswith("WT"):
-            ax.plot(Xd, Yw, linestyle="-.", color="tab:blue", label="WT (offset)")
+            ax.plot(Xd, Yw, linestyle="-.", color="tab:blue", label="WT (offset, clipped)")
         ax.set_aspect("equal", adjustable="box")
         ax.grid(True); ax.legend(); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
         st.pyplot(fig); plt.close(fig)
@@ -108,9 +112,12 @@ if page.startswith("1"):
 # ---------------- Page 2: 地層・材料 ----------------
 elif page.startswith("2"):
     st.subheader("Layers & Materials")
-    H = st.number_input("H (m)", 5.0, 200.0, 25.0, 0.5, key="H2")
-    L = st.number_input("L (m)", 5.0, 400.0, 60.0, 0.5, key="L2")
-    ground = make_ground_example(H, L)
+
+    # Page1 と同じキーで H/L を共有（ここでも変更可）
+    H = st.number_input("H (m)", 5.0, 200.0, st.session_state["H"], 0.5, key="H")
+    L = st.number_input("L (m)", 5.0, 400.0, st.session_state["L"], 0.5, key="L")
+    ground = make_ground_example(st.session_state["H"], st.session_state["L"])
+
     n_layers = st.selectbox("Number of layers", [1,2,3], index=2)
     interfaces = []
     if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
@@ -149,7 +156,8 @@ elif page.startswith("2"):
         d_s = st.number_input("鉄筋径 d_s (m)", 0.010, 0.050, 0.022, 0.001)
         fy  = st.number_input("引張強さ fy (MPa=kN/m²)", 200.0, 2000.0, 1000.0, 50.0)
         gamma_m = st.number_input("材料安全率 γ_m", 1.00, 2.00, 1.20, 0.05)
-        mu = st.select_slider("逓減係数 μ（0〜0.9, 0.1刻み。μ=1.0はStrip無視）", options=[round(0.1*i,1) for i in range(10)], value=float(st.session_state.get("mu",0.0)))
+        mu = st.select_slider("逓減係数 μ（0〜0.9, 0.1刻み。μ=1.0はStrip無視）",
+                              options=[round(0.1*i,1) for i in range(10)], value=float(st.session_state.get("mu",0.0)))
         st.session_state["mu"] = mu
 
     # 可視化（層線）
@@ -178,7 +186,7 @@ elif page.startswith("2"):
     soils_table = [dict(gamma=s.gamma, c=s.c, phi=s.phi, tau_kPa=getattr(s, "tau_kPa", 0.0)) for s in soils]
     render_suggestions(lint_soils_and_materials(soils_table, st.session_state.get("tau_grout_cap_kPa")), key_prefix="p2", dispatcher=default_dispatcher)
 
-    # 保存
+    # 保存（Page3以降で使用）
     st.session_state["ground_pack"] = dict(H=H,L=L,n_layers=n_layers,interfaces=interfaces,soils=soils)
 
 # ---------------- Page 3: 円弧探索（未補強） ----------------
@@ -191,20 +199,63 @@ elif page.startswith("3"):
     ground = make_ground_example(H, L)
 
     # Center grid & Quality
-    x_min = st.number_input("x min", 0.20*L, 3.00*L, 0.25*L, 0.05*L)
-    x_max = st.number_input("x max", 0.30*L, 4.00*L, 1.15*L, 0.05*L)
-    y_min = st.number_input("y min", 0.80*H, 7.00*H, 1.60*H, 0.10*H)
-    y_max = st.number_input("y max", 1.00*H, 8.00*H, 2.20*H, 0.10*H)
-    nx = st.slider("nx", 6, 60, 14); ny = st.slider("ny", 4, 40, 9)
-    method = st.selectbox("Method", ["Bishop (simplified)","Fellenius"])
-    quality = st.select_slider("Quality", options=list(QUALITY.keys()), value="Normal")
-    P = QUALITY[quality].copy()
-    Fs_target = st.number_input("Target FS", 1.00, 2.00, 1.20, 0.05)
+    colA, colB = st.columns([1.3, 1])
+    with colA:
+        x_min = st.number_input("x min", 0.20*L, 3.00*L, 0.25*L, 0.05*L)
+        x_max = st.number_input("x max", 0.30*L, 4.00*L, 1.15*L, 0.05*L)
+        y_min = st.number_input("y min", 0.80*H, 7.00*H, 1.60*H, 0.10*H)
+        y_max = st.number_input("y max", 1.00*H, 8.00*H, 2.20*H, 0.10*H)
+    with colB:
+        nx = st.slider("nx", 6, 60, 14); ny = st.slider("ny", 4, 40, 9)
+        method = st.selectbox("Method", ["Bishop (simplified)","Fellenius"])
+        quality = st.select_slider("Quality", options=list(QUALITY.keys()), value="Normal")
+        P = QUALITY[quality].copy()
+        Fs_target = st.number_input("Target FS", 1.00, 2.00, 1.20, 0.05)
 
     allow_cross=[]
     if n_layers>=2: allow_cross.append(st.checkbox("Allow into Layer 2", True))
     if n_layers>=3: allow_cross.append(st.checkbox("Allow into Layer 3", True))
 
+    # ---- 設定プレビュー：横断図＋水位＋地層＋センターグリッド（設定中でも見える） ----
+    st.markdown("**設定プレビュー（横断図）**")
+    Xd = np.linspace(ground.X[0], ground.X[-1], 600)
+    Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(10.0, 6.8))
+    # 層塗り
+    if n_layers==1:
+        ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
+    elif n_layers==2:
+        Y1 = clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
+        ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
+        ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
+    else:
+        Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
+        ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
+        ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
+        ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
+    # 地表線
+    ax.plot(ground.X, ground.Y, linewidth=2.0, label="Ground")
+    if n_layers>=2: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.0)
+    if n_layers>=3: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.0)
+    # 水位（Page1で設定されていれば表示）
+    if st.session_state.get("water_mode","WT").startswith("WT") and st.session_state.get("wl_points") is not None:
+        wl = st.session_state["wl_points"]
+        ax.plot(wl[:,0], wl[:,1], linestyle="-.", color="tab:blue", alpha=0.8, label="WT (clipped)")
+    # センターグリッドの点群（設定値でプレビュー）
+    grid_xs = np.linspace(x_min, x_max, nx)
+    grid_ys = np.linspace(y_min, y_max, ny)
+    gx = [float(x) for x in grid_xs for _ in grid_ys]
+    gy = [float(y) for y in grid_ys for _ in grid_xs]
+    ax.scatter(gx, gy, s=10, c="k", alpha=0.25, marker=".", label="Center grid (preview)")
+    # 外周枠
+    ax.plot([x_min,x_max,x_max,x_min,x_min], [y_min,y_min,y_max,y_max,y_min], color="k", linewidth=1.0, alpha=0.4)
+    # 軸・凡例
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True); ax.legend(loc="upper right"); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+    st.pyplot(fig); plt.close(fig)
+
+    # ---- ここから計算本体 ----
     def compute_once():
         def subsampled_centers():
             xs = np.linspace(x_min, x_max, nx)
@@ -286,7 +337,7 @@ elif page.startswith("3"):
     if "res3" in st.session_state:
         res = st.session_state["res3"]
         xc,yc = res["center"]; refined=res["refined"]; idx_minFs=res["idx_minFs"]
-        # Plot
+        # Plot（結果）
         Xd = np.linspace(ground.X[0], ground.X[-1], 600); Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
         fig, ax = plt.subplots(figsize=(10.0, 7.0))
         if n_layers==1:
@@ -370,7 +421,6 @@ elif page.startswith("4"):
 
     # s 等間隔の x を取る関数
     def x_at_s(s_val: float) -> float:
-        # s_cum は単調増加、区分線形で逆写像
         idx = np.searchsorted(s_cum, s_val, side="right")-1
         idx = max(0, min(idx, len(Xd)-2))
         ds = s_val - s_cum[idx]
@@ -424,16 +474,15 @@ elif page.startswith("5"):
 # ---------------- 共通：教授コメントのアクション反映ハブ ----------------
 if st.session_state.get("_recompute", False):
     st.session_state["_recompute"] = False
-    # ここで _cmd_* を拾って各値に適用（必要に応じて整備）
     if st.session_state.get("_cmd_pitch_delta") is not None:
-        # このデモではピッチ値を実変数に直結していないため、何もしない
         st.session_state["_cmd_pitch_delta"] = None
     if st.session_state.get("_cmd_length_delta") is not None:
         st.session_state["_cmd_length_delta"] = None
     if st.session_state.get("_cmd_scale_xy") is not None:
-        # データ保持の都合で未実装（本番は ground.X/Y を更新）
+        # （本番は ground.X/Y を更新する処理をここへ）
         st.session_state["_cmd_scale_xy"] = None
     if st.session_state.get("_cmd_wl_clip"):
+        # 既にPage1で地表クリップしているためここではフラグを落とすだけ
         st.session_state["_cmd_wl_clip"] = None
     if st.session_state.get("_cmd_expand_grid") is not None:
         st.session_state["_cmd_expand_grid"] = None
