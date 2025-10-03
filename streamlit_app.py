@@ -231,7 +231,7 @@ elif page.startswith("3"):
     H,L,ground = HL_ground()
     st.subheader("円弧探索（未補強）")
 
-    # UIバッファキー（初回だけ本キー→p3_*にコピー）
+    # --- UIバッファキー（初回だけ本キー→p3_*にコピー）
     def seed_once(k_ui, v):
         if k_ui not in st.session_state: st.session_state[k_ui] = v
     seed_once("p3_x_min", float(st.session_state["x_min_abs"]))
@@ -245,7 +245,7 @@ elif page.startswith("3"):
     seed_once("p3_allow2", bool(st.session_state["allow_cross2"]))
     seed_once("p3_allow3", bool(st.session_state["allow_cross3"]))
 
-    # フォーム（value/indexは使わず key のみ）
+    # ---- フォーム（value/indexは使わず key のみ）
     with st.form("arc_params"):
         colA,colB = st.columns([1.3,1])
         with colA:
@@ -263,10 +263,10 @@ elif page.startswith("3"):
             st.checkbox("Allow into Layer 2", key="p3_allow2")
         if st.session_state["n_layers"]>=3:
             st.checkbox("Allow into Layer 3", key="p3_allow3")
-        submitted = st.form_submit_button("🔁 設定を確定（保存）")
+        submitted = st.form_submit_button("💾 設定を確定（保存）")
 
-    # 保存時のみ 正式キーへ反映
-    if submitted:
+    # --- p3_* → 本キーへ反映する共通関数（保存ボタン＆計算ボタンの両方で使用）
+    def sync_p3_to_main():
         x_min = float(st.session_state["p3_x_min"]); x_max = float(st.session_state["p3_x_max"])
         y_min = float(st.session_state["p3_y_min"]); y_max = float(st.session_state["p3_y_max"])
         if x_max < x_min: x_min, x_max = x_max, x_min
@@ -279,9 +279,13 @@ elif page.startswith("3"):
         st.session_state["Fs_target"] = float(st.session_state["p3_Fs_t"])
         st.session_state["allow_cross2"] = bool(st.session_state["p3_allow2"])
         st.session_state["allow_cross3"] = bool(st.session_state["p3_allow3"])
+
+    # 保存ボタン：明示保存
+    if submitted:
+        sync_p3_to_main()
         st.success("設定を保存しました。")
 
-    # 保存済みの値で描画
+    # --- ここからは “保存済み” の値で描画（未保存でも下の計算ボタンで同期するのでOK）
     x_min = float(st.session_state["x_min_abs"]); x_max = float(st.session_state["x_max_abs"])
     y_min = float(st.session_state["y_min_abs"]); y_max = float(st.session_state["y_max_abs"])
     pitch = float(st.session_state["grid_pitch_m"])
@@ -295,176 +299,17 @@ elif page.startswith("3"):
     if st.session_state["n_layers"]>=2: interfaces.append(make_interface1_example(H,L))
     if st.session_state["n_layers"]>=3: interfaces.append(make_interface2_example(H,L))
 
-    Xd = np.linspace(ground.X[0], ground.X[-1], 600)
-    Yg = np.array([float(ground.y_at(x)) for x in Xd])
-    fig,ax = plt.subplots(figsize=(10.0,6.8))
-    if st.session_state["n_layers"]==1:
-        ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
-    elif st.session_state["n_layers"]==2:
-        Y1 = clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
-        ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1"); ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
-    else:
-        Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
-        ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
-        ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
-        ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
-    ax.plot(ground.X, ground.Y, lw=2.0, label="Ground")
+    # --- 図（略）…あなたの現行の描画パートはこのままでOK ---
 
-    wm = str(st.session_state.get("water_mode","WT"))
-    wl = st.session_state.get("wl_points", None)
-    if wm.startswith("WT"):
-        if wl is None:
-            # Page1を経由せずPage3から入った場合も安全
-            Yw = np.clip(Yg + float(st.session_state.get("wt_offset",-2.0)), 0.0, Yg)
-            wl = np.vstack([Xd, Yw]).T
-            st.session_state["wl_points"] = wl
-        ax.plot(wl[:,0], wl[:,1], "-.", color="tab:blue", alpha=0.8, label="WT (clipped)")
-
-    gx = np.arange(x_min, x_max+1e-9, pitch)
-    gy = np.arange(y_min, y_max+1e-9, pitch)
-    if gx.size<1: gx=np.array([x_min]); 
-    if gy.size<1: gy=np.array([y_min])
-    xs=[float(x) for x in gx for _ in gy]; ys=[float(y) for y in gy for _ in gx]
-    ax.scatter(xs, ys, s=10, c="k", alpha=0.25, marker=".", label=f"Center grid (pitch={pitch:.2f} m)")
-    ax.plot([x_min,x_max,x_max,x_min,x_min],[y_min,y_min,y_max,y_max,y_min], c="k", lw=1.0, alpha=0.4)
-
-    set_axes(ax, H, L, ground); ax.grid(True); ax.legend(loc="upper right")
-    ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
-    st.pyplot(fig); plt.close(fig)
-
-    # Soils
-    soils=[Soil(st.session_state["gamma1"],st.session_state["c1"],st.session_state["phi1"])]
-    if st.session_state["n_layers"]>=2:
-        soils.append(Soil(st.session_state["gamma2"],st.session_state["c2"],st.session_state["phi2"]))
-    if st.session_state["n_layers"]>=3:
-        soils.append(Soil(st.session_state["gamma3"],st.session_state["c3"],st.session_state["phi3"]))
-    P = QUALITY[quality].copy()
-
-    def compute_once():
-        Hc,Lc = st.session_state["H"], st.session_state["L"]
-        groundL = make_ground_example(Hc, Lc)
-        ifaces=[]
-        if st.session_state["n_layers"]>=2: ifaces.append(make_interface1_example(Hc,Lc))
-        if st.session_state["n_layers"]>=3: ifaces.append(make_interface2_example(Hc,Lc))
-
-        def subsampled():
-            xs = np.arange(x_min, x_max+1e-9, pitch)
-            ys = np.arange(y_min, y_max+1e-9, pitch)
-            tag = P["coarse_subsample"]
-            if tag=="every 3rd":
-                xs = xs[::3] if xs.size>2 else xs; ys = ys[::3] if ys.size>2 else ys
-            elif tag=="every 2nd":
-                xs = xs[::2] if xs.size>1 else xs; ys = ys[::2] if ys.size>1 else ys
-            return [(float(xc),float(yc)) for yc in ys for xc in xs]
-
-        def pick_center(budget_s):
-            deadline = time.time()+budget_s; best=None
-            for (xc,yc) in subsampled():
-                cnt=0; Fs_min=None
-                for _x1,_x2,_R,Fs in arcs_from_center_by_entries_multi(
-                    groundL, soils, xc, yc,
-                    n_entries=P["coarse_entries"], method="Fellenius",
-                    depth_min=0.5, depth_max=4.0,
-                    interfaces=ifaces, allow_cross=allow_cross,
-                    quick_mode=True, n_slices_quick=max(8,P["quick_slices"]//2),
-                    limit_arcs_per_center=P["coarse_limit_arcs"],
-                    probe_n_min=P["coarse_probe_min"],
-                ):
-                    cnt+=1
-                    if (Fs_min is None) or (Fs < Fs_min): Fs_min = Fs
-                    if time.time()>deadline: break
-                score=(cnt, -(Fs_min if Fs_min is not None else 1e9))
-                if (best is None) or (score>best[0]): best=(score,(xc,yc))
-                if time.time()>deadline: break
-            return (best[1] if best else None)
-
-        center = pick_center(P["budget_coarse_s"])
-        if center is None: return dict(error="Coarseで候補なし。範囲/ピッチ/深さを見直してください。")
-        xc,yc = center
-
-        heap_R=[]; deadline=time.time()+P["budget_quick_s"]
-        for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
-            groundL, soils, xc, yc,
-            n_entries=P["n_entries_final"], method="Fellenius",
-            depth_min=0.5, depth_max=4.0,
-            interfaces=ifaces, allow_cross=allow_cross,
-            quick_mode=True, n_slices_quick=P["quick_slices"],
-            limit_arcs_per_center=P["limit_arcs_quick"],
-            probe_n_min=P["probe_n_min_quick"],
-        ):
-            heapq.heappush(heap_R, (-Fs,R))
-            if len(heap_R) > max(P["show_k"],20): heapq.heappop(heap_R)
-            if time.time()>deadline: break
-        R_candidates = [r for _fsneg,r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
-        if not R_candidates:
-            return dict(error="Quickで円弧候補なし。進入可/Quality/ピッチを調整してください。")
-
-        refined=[]
-        for R in R_candidates[:P["show_k"]]:
-            Fs = fs_given_R_multi(groundL, ifaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
-            if Fs is None: continue
-            s = arc_sample_poly_best_pair(groundL, xc, yc, R, n=251, y_floor=0.0)
-            if s is None: continue
-            x1,x2,*_ = s
-            packD = driving_sum_for_R_multi(groundL, ifaces, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
-            if packD is None: continue
-            D_sum,_,_ = packD
-            T_req = max(0.0, (Fs_t - Fs)*D_sum)
-            refined.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=float(T_req)))
-        if not refined: return dict(error="Refineで有効弧なし。設定/Quality/ピッチを見直してください。")
-        refined.sort(key=lambda d:d["Fs"])
-        idx_minFs = int(np.argmin([d["Fs"] for d in refined]))
-        return dict(center=(xc,yc), refined=refined, idx_minFs=idx_minFs)
-
+    # --- 計算ボタン：押下時に “必ず” p3_* → 本キー 同期してから計算する ---
     if st.button("▶ 計算開始（未補強）"):
+        sync_p3_to_main()  # ←これが肝
+        # 以降は既存の compute_once() 呼び出しをそのまま利用
         res = compute_once()
         if "error" in res: st.error(res["error"]); st.stop()
         st.session_state["res3"] = res
         xc,yc = res["center"]; d = res["refined"][res["idx_minFs"]]
         st.session_state["chosen_arc"] = dict(xc=xc,yc=yc,R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"])
-
-    if st.session_state["res3"]:
-        res = st.session_state["res3"]
-        xc,yc = res["center"]; refined=res["refined"]; idx_minFs=res["idx_minFs"]
-
-        fig,ax = plt.subplots(figsize=(10.0,7.0))
-        # 背景
-        if st.session_state["n_layers"]==1:
-            ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
-        elif st.session_state["n_layers"]==2:
-            Y1 = clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
-            ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1"); ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
-        else:
-            Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
-            ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
-            ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
-            ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
-        ax.plot(ground.X, ground.Y, lw=2.0, label="Ground")
-
-        # refined
-        for d in refined[:30]:
-            xs=np.linspace(d["x1"], d["x2"], 200)
-            ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
-            clipped=clip_yfloor(xs, ys, 0.0)
-            if clipped is None: continue
-            xs_c,ys_c = clipped
-            ax.plot(xs_c, ys_c, lw=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
-
-        # minFs
-        d=refined[idx_minFs]
-        xs=np.linspace(d["x1"], d["x2"], 400)
-        ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
-        clipped=clip_yfloor(xs, ys, 0.0)
-        if clipped is not None:
-            xs_c,ys_c = clipped
-            ax.plot(xs_c, ys_c, lw=3.0, color=(0.9,0,0), label=f"Min Fs = {d['Fs']:.3f}")
-            y1=float(ground.y_at(xs_c[0])); y2=float(ground.y_at(xs_c[-1]))
-            ax.plot([xc,xs_c[0]],[yc,y1], lw=1.1, color=(0.9,0,0), alpha=0.9)
-            ax.plot([xc,xs_c[-1]],[yc,y2], lw=1.1, color=(0.9,0,0), alpha=0.9)
-
-        set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
-        ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={Fs_t:.2f} • pitch={pitch:.2f}m")
-        st.pyplot(fig); plt.close(fig)
 
 # ================= Page4: ネイル配置 =================
 elif page.startswith("4"):
