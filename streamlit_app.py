@@ -1,4 +1,9 @@
-# streamlit_app.py — 多段UI + 教授コメント（Page3に設定中の横断図を追加／WTクリップ／H/L共有）
+# streamlit_app.py — 多段UI + 教授コメント
+# 修正点：
+#  - WTオフセットを「0〜地表」の範囲にクリップ（突き抜け防止）
+#  - Page1/3 の図で座標軸レンジを固定（自動スケール暴走防止）
+#  - H/L をセッション共有、Page3 に設定プレビューあり
+
 from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time, hashlib, json, random, math
@@ -19,7 +24,7 @@ from stabi_suggest import (
 st.set_page_config(page_title="Stabi LEM｜多段UI+教授コメント", layout="wide")
 st.title("Stabi LEM｜多段UI + 教授コメント（Phase-1）")
 
-# ---------------- 共有セッションの初期化（H/L 共有など） ----------------
+# ---------------- 共有セッション初期化 ----------------
 if "H" not in st.session_state: st.session_state["H"] = 25.0
 if "L" not in st.session_state: st.session_state["L"] = 60.0
 if "water_mode" not in st.session_state: st.session_state["water_mode"] = "WT"  # or "ru" or "WT+ru"
@@ -36,14 +41,22 @@ def fs_to_color(fs: float):
         return (1.0, 0.50 + 0.50*t, 0.0)
     return (0.0, 0.55, 0.0)
 
-def hash_params(obj) -> str:
-    s = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=float)
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
-
 def clip_yfloor(xs: np.ndarray, ys: np.ndarray, y_floor: float = 0.0):
     m = ys >= (y_floor - 1e-12)
     if np.count_nonzero(m) < 2: return None
     return xs[m], ys[m]
+
+def set_axes_fixed(ax, H: float, L: float, ground: GroundPL):
+    # 既定の表示枠（以前の安定版と同等の考え方）
+    x_upper = max(1.18*L, float(ground.X[-1]) + 0.05*L, 100.0)
+    y_upper = max(2.30*H, 0.05*H + H*2.0, 100.0)
+    ax.set_xlim(min(0.0 - 0.05*L, -2.0), x_upper)
+    ax.set_ylim(0.0, y_upper)
+    ax.set_aspect("equal", adjustable="box")
+
+def hash_params(obj) -> str:
+    s = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=float)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 # ---------------- Global quality presets ----------------
 QUALITY = {
@@ -86,12 +99,14 @@ if page.startswith("1"):
         ru_val = st.slider("r_u (if ru mode)", 0.0, 0.9, st.session_state.get("ru", 0.0), 0.05)
         st.session_state["ru"] = ru_val
 
-        # オフセットWT（地表にクリップ）
+        # オフセットWT：地表を越えず、かつ y>=0 にもクリップ（軸暴走防止）
         offset = st.slider("Water level offset from ground (m, negative=below)", -30.0, 5.0, -2.0, 0.5)
         Xd = np.linspace(ground.X[0], ground.X[-1], 200)
         Yg = np.array([float(ground.y_at(x)) for x in Xd])
         Yw_raw = Yg + offset
-        Yw = np.minimum(Yw_raw, Yg)  # ★地表越え防止
+        Yw = np.clip(Yw_raw, 0.0, Yg)  # ★ 上下両方向でクリップ
+
+        # セッション保存（他ページでも使う）
         st.session_state["wl_points"] = np.vstack([Xd, Yw]).T
 
         # プロット
@@ -99,8 +114,8 @@ if page.startswith("1"):
         ax.plot(ground.X, ground.Y, linewidth=2.0, label="Ground")
         ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Soil")
         if water_mode.startswith("WT"):
-            ax.plot(Xd, Yw, linestyle="-.", color="tab:blue", label="WT (offset, clipped)")
-        ax.set_aspect("equal", adjustable="box")
+            ax.plot(Xd, Yw, linestyle="-.", color="tab:blue", label="WT (offset, clipped 0..Ground)")
+        set_axes_fixed(ax, st.session_state["H"], st.session_state["L"], ground)
         ax.grid(True); ax.legend(); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
         st.pyplot(fig); plt.close(fig)
 
@@ -178,7 +193,8 @@ elif page.startswith("2"):
     ax.plot(ground.X, ground.Y, linewidth=2.0, label="Ground")
     if n_layers>=2: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.0)
     if n_layers>=3: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.0)
-    ax.set_aspect("equal"); ax.grid(True); ax.legend(); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+    set_axes_fixed(ax, H, L, ground)
+    ax.grid(True); ax.legend(); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     st.pyplot(fig); plt.close(fig)
 
     # 教授コメント
@@ -216,7 +232,7 @@ elif page.startswith("3"):
     if n_layers>=2: allow_cross.append(st.checkbox("Allow into Layer 2", True))
     if n_layers>=3: allow_cross.append(st.checkbox("Allow into Layer 3", True))
 
-    # ---- 設定プレビュー：横断図＋水位＋地層＋センターグリッド（設定中でも見える） ----
+    # ---- 設定プレビュー（横断図） ----
     st.markdown("**設定プレビュー（横断図）**")
     Xd = np.linspace(ground.X[0], ground.X[-1], 600)
     Yg = np.array([float(ground.y_at(float(x))) for x in Xd], dtype=float)
@@ -238,20 +254,22 @@ elif page.startswith("3"):
     ax.plot(ground.X, ground.Y, linewidth=2.0, label="Ground")
     if n_layers>=2: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0], linestyle="--", linewidth=1.0)
     if n_layers>=3: ax.plot(Xd, clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)[1], linestyle="--", linewidth=1.0)
-    # 水位（Page1で設定されていれば表示）
+    # 水位（Page1で設定されていれば表示） — ここも 0..地表 に収まっている
     if st.session_state.get("water_mode","WT").startswith("WT") and st.session_state.get("wl_points") is not None:
         wl = st.session_state["wl_points"]
         ax.plot(wl[:,0], wl[:,1], linestyle="-.", color="tab:blue", alpha=0.8, label="WT (clipped)")
+
     # センターグリッドの点群（設定値でプレビュー）
     grid_xs = np.linspace(x_min, x_max, nx)
     grid_ys = np.linspace(y_min, y_max, ny)
     gx = [float(x) for x in grid_xs for _ in grid_ys]
     gy = [float(y) for y in grid_ys for _ in grid_xs]
     ax.scatter(gx, gy, s=10, c="k", alpha=0.25, marker=".", label="Center grid (preview)")
+
     # 外周枠
     ax.plot([x_min,x_max,x_max,x_min,x_min], [y_min,y_min,y_max,y_max,y_min], color="k", linewidth=1.0, alpha=0.4)
-    # 軸・凡例
-    ax.set_aspect("equal", adjustable="box")
+
+    set_axes_fixed(ax, H, L, ground)
     ax.grid(True); ax.legend(loc="upper right"); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     st.pyplot(fig); plt.close(fig)
 
@@ -370,11 +388,12 @@ elif page.startswith("3"):
             y1=float(ground.y_at(xs_c[0])); y2=float(ground.y_at(xs_c[-1]))
             ax.plot([xc,xs_c[0]],[yc,y1], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
             ax.plot([xc,xs_c[-1]],[yc,y2], linewidth=1.1, color=(0.9,0.0,0.0), alpha=0.9)
-        ax.set_aspect("equal"); ax.grid(True); ax.legend()
+        set_axes_fixed(ax, H, L, ground)
+        ax.grid(True); ax.legend()
         ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • MinFs={refined[idx_minFs]['Fs']:.3f} • TargetFs={Fs_target:.2f}")
         st.pyplot(fig); plt.close(fig)
 
-        # 教授コメント（端ヒット検知は簡略：ここでは常時 False）
+        # 教授コメント
         render_suggestions(lint_arc_and_slices(hit_edge=False, n_slices=P["final_slices"]), key_prefix="p3", dispatcher=default_dispatcher)
 
         # 採用円弧の保存（Page4で使う）
@@ -455,7 +474,9 @@ elif page.startswith("4"):
     # ネイル頭の表示
     xs_h = [p[0] for p in pts]; ys_h=[p[1] for p in pts]
     ax.scatter(xs_h, ys_h, s=30, color="tab:blue", label=f"Nail heads ({len(pts)})")
-    ax.set_aspect("equal"); ax.grid(True); ax.legend()
+
+    set_axes_fixed(ax, H, L, ground)
+    ax.grid(True); ax.legend()
     ax.set_title("Phase-1：配置プレビュー（頭位置のみ）")
     st.pyplot(fig); plt.close(fig)
 
@@ -471,7 +492,7 @@ elif page.startswith("5"):
     st.write("ここでは、補強前後の比較表・図、サジェストカード（最小コスト案/最短L案/余裕10%案）を表示する予定です。")
     st.success("Phase-1 は「UIと教授コメント」を完成させる到達点です。補強FSの厳密連成は次段で差し込みます。")
 
-# ---------------- 共通：教授コメントのアクション反映ハブ ----------------
+# ---------------- 教授コメントアクション反映 ----------------
 if st.session_state.get("_recompute", False):
     st.session_state["_recompute"] = False
     if st.session_state.get("_cmd_pitch_delta") is not None:
@@ -479,10 +500,8 @@ if st.session_state.get("_recompute", False):
     if st.session_state.get("_cmd_length_delta") is not None:
         st.session_state["_cmd_length_delta"] = None
     if st.session_state.get("_cmd_scale_xy") is not None:
-        # （本番は ground.X/Y を更新する処理をここへ）
         st.session_state["_cmd_scale_xy"] = None
     if st.session_state.get("_cmd_wl_clip"):
-        # 既にPage1で地表クリップしているためここではフラグを落とすだけ
         st.session_state["_cmd_wl_clip"] = None
     if st.session_state.get("_cmd_expand_grid") is not None:
         st.session_state["_cmd_expand_grid"] = None
