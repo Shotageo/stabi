@@ -1,3 +1,8 @@
+import os, numpy as np, matplotlib
+matplotlib.use("Agg")  # ← 追加：CIのヘッドレス環境で描画
+import matplotlib.pyplot as plt
+import stabi_lem as lem
+
 import os, numpy as np, matplotlib.pyplot as plt
 import stabi_lem as lem
 
