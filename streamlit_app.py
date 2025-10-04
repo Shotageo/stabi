@@ -375,16 +375,24 @@ elif page.startswith("2"):
 
 # ===================== Page3: 円弧探索（未補強） =====================
 elif page.startswith("3"):
-    H,L,ground = make_ground_from_cfg()
-    n_layers = int(cfg_get("layers.n"))
-    interfaces=[]
-    if n_layers>=2: interfaces.append(make_interface1_example(H,L))
-    if n_layers>=3: interfaces.append(make_interface2_example(H,L))
+    # ...省略...
+    ax.plot([xc, xs_c[-1]], [yc, y2], lw=1.1, color=(0.9, 0, 0), alpha=0.9)
+    set_axes(ax, H, L, ground)
+    ax.grid(True)
+    ax.legend()
+    ax.set_title(
+        f"Center=({xc:.2f},{yc:.2f}) • MinFs={refined[idx_minFs]['Fs']:.3f} • "
+        f"TargetFs={Fs_t:.2f} • pitch={pitch:.2f}m"
+    )
+    st.pyplot(fig)
+    plt.close(fig)
 
-    # 初期枠（未設定なら H/L から種）
-    if cfg_get("grid.x_min") is None:
-        cfg_set("grid.x_min", 0.25*L); cfg_set("grid.x_max", 1.15*L)
-        cfg_set("grid.y_min", 1.60*H); cfg_set("grid.y_max", 2.20*H)
+    res = cfg_get("results.unreinforced")
+    if res:
+        xc, yc = res["center"]
+        refined = res["refined"]
+        idx_minFs = res["idx_minFs"]
+        # ...（中略：横断図描画）...
 
     # UI seed
     ui_seed("p3_x_min", cfg_get("grid.x_min"))
