@@ -1,8 +1,9 @@
 # streamlit_app.py — ソイルネイル統合・最小円弧オート保存版（フル）
 
 from __future__ import annotations
+
+# --- パッケージ解決（stabi を親ディレクトリから見つける） ---
 import os, sys
-# パッケージ（stabi）を親ディレクトリから解決できるようにする
 _PKG_DIR = os.path.dirname(__file__)          # .../stabi
 _PARENT  = os.path.dirname(_PKG_DIR)          # .../
 if _PARENT not in sys.path:
@@ -14,13 +15,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ===== stabiパッケージのコア =====
-from stabi.stabi_lem import (
-    Soil, GroundPL,
-    make_ground_example, make_interface1_example, make_interface2_example,
-    clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
-    fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
-)
+# ===== stabi コアは“丸ごと”読み込んで属性参照に統一 =====
+import stabi.stabi_lem as lem
+
+# 以降の既存コードで使っている名前に合わせてエイリアスを定義
+Soil                      = lem.Soil
+GroundPL                  = lem.GroundPL
+make_ground_example       = lem.make_ground_example
+make_interface1_example   = lem.make_interface1_example
+make_interface2_example   = lem.make_interface2_example
+clip_interfaces_to_ground = lem.clip_interfaces_to_ground
+arcs_from_center_by_entries_multi = lem.arcs_from_center_by_entries_multi
+fs_given_R_multi          = lem.fs_given_R_multi
+arc_sample_poly_best_pair = lem.arc_sample_poly_best_pair
+driving_sum_for_R_multi   = lem.driving_sum_for_R_multi
+
 
 # ===== Streamlit 基本設定 =====
 st.set_page_config(page_title="Stabi LEM (Nails integrated)", layout="wide")
