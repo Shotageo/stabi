@@ -1,3 +1,20 @@
+# streamlit_app.py — cfg一本化 + 数値キー対応 + UI値プレビュー（安定版・パッチ適用）
+
+from __future__ import annotations
+
+import streamlit as st
+import numpy as np, heapq, time
+import matplotlib.pyplot as plt
+
+# ---- stabiパッケージ（__init__.py作成済）から正規インポート ----
+from stabi.stabi_lem import (
+    Soil, GroundPL,
+    make_ground_example, make_interface1_example, make_interface2_example,
+    clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
+    fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
+)
+
+
 # ================================================================
 # Soil Nail Integration (UI drop-in) v1.2 + Cross-section v1.3
 #   - stabi_lem.py は改変不要
