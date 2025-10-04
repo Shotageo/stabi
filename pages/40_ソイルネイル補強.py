@@ -11,27 +11,38 @@ from stabi_lem import (
     bishop_fs_unreinforced, bishop_fs_with_nails,
 )
 
-# ---------- Plot style ----------
+# ===== Plot style =====
 st.set_page_config(page_title="Stabi｜安定板２｜ソイルネイル補強", layout="wide")
 st.sidebar.header("Plot style")
 theme = st.sidebar.selectbox("Theme", ["default", "dark_background"])
-tight = st.sidebar.checkbox("Tight layout", value=True)
-show_legend = st.sidebar.checkbox("Show legend", value=True)
+tight = st.sidebar.checkbox("Tight layout", True)
+show_legend = st.sidebar.checkbox("Show legend", True)
 plt.style.use("dark_background" if theme == "dark_background" else "default")
-# --------------------------------
 
 st.title("Stabi｜安定板２：ソイルネイル補強（“選択円弧”に適用）")
 
-# ==== 既存ページが保存した状態を取得 ====
-H = float(st.session_state.get("H", 12.0))
+# Debugパネル（任意）
+with st.sidebar.expander("Debug / 状態", expanded=False):
+    ss = st.session_state
+    st.write({
+        "selected_slip": ss.get("selected_slip"),
+        "H": ss.get("H"), "beta_deg": ss.get("beta_deg"),
+        "gamma": ss.get("gamma"), "c": ss.get("c"), "phi": ss.get("phi"),
+        "x_left": ss.get("x_left"), "x_right": ss.get("x_right"),
+        "nails_count": len(ss.get("nails", [])),
+    })
+    if st.button("selected_slip をクリア"): ss.pop("selected_slip", None)
+    if st.button("nails を全消去"): ss["nails"] = []
+
+# ==== 既存ステップの状態 ====
+H    = float(st.session_state.get("H", 12.0))
 beta = float(st.session_state.get("beta_deg", 35.0))
-gamma = float(st.session_state.get("gamma", 18.0))
-c = float(st.session_state.get("c", 10.0))
-phi = float(st.session_state.get("phi", 30.0))
+gamma= float(st.session_state.get("gamma", 18.0))
+c    = float(st.session_state.get("c", 10.0))
+phi  = float(st.session_state.get("phi", 30.0))
 soil = Soil(gamma=gamma, c=c, phi=phi)
 
-beta_rad = math.radians(beta)
-tanb = math.tan(beta_rad)
+beta_rad = math.radians(beta); tanb = math.tan(beta_rad)
 def ground_y_at(X: np.ndarray) -> np.ndarray:
     return H - tanb * X
 
@@ -41,15 +52,31 @@ x_right = float(st.session_state.get("x_right",  1.1 * x_top))
 y_min   = float(st.session_state.get("y_min", -1.2 * H))
 y_max   = float(st.session_state.get("y_max",  1.2 * H))
 
-# ==== 選択円弧の受け取り（必須） ====
+# ==== 選択円弧の受け取り（なければ臨時UI） ====
 sel = st.session_state.get("selected_slip", None)
-if isinstance(sel, CircleSlip):
-    slip = sel
-elif isinstance(sel, dict) and {"xc","yc","R"} <= sel.keys():
-    slip = CircleSlip(xc=float(sel["xc"]), yc=float(sel["yc"]), R=float(sel["R"]))
-else:
-    st.error("まずメインページ（無補強解析）で円弧を確定してください。selected_slip が未設定です。")
-    st.stop()
+
+def _to_slip_dict(sel_obj):
+    if sel_obj is None:
+        return None
+    if isinstance(sel_obj, dict) and {"xc","yc","R"} <= set(sel_obj.keys()):
+        return {"xc": float(sel_obj["xc"]), "yc": float(sel_obj["yc"]), "R": float(sel_obj["R"])}
+    try:
+        return {"xc": float(sel_obj.xc), "yc": float(sel_obj.yc), "R": float(sel_obj.R)}
+    except Exception:
+        return None
+
+slip_dict = _to_slip_dict(sel)
+if slip_dict is None:
+    st.warning("無補強ページで“最小Fs円弧”を確定していないか、セッションが切れています。ここで一時指定できます。")
+    c1, c2, c3 = st.columns(3)
+    with c1: xc = st.number_input("円弧中心 xc [m]", -200.0, 200.0, x_top*0.25, 0.5)
+    with c2: yc = st.number_input("円弧中心 yc [m]", -200.0, 200.0, -H*0.8, 0.5)
+    with c3: R  = st.number_input("半径 R [m]", 0.5, 300.0, H*1.4, 0.5)
+    slip_dict = {"xc": xc, "yc": yc, "R": R}
+    if st.button("この円弧を一時的に採用"):
+        st.session_state["selected_slip"] = slip_dict
+
+slip = CircleSlip(**slip_dict)
 
 # ==== ソイルネイル入力 ====
 st.subheader("ソイルネイル（線分で表現）")
@@ -99,10 +126,13 @@ with c2: st.metric("補強後 Fs", f"{Fs_re:.3f}" if slices else "—")
 fig, ax = plt.subplots(figsize=(9, 6))
 Xg = np.linspace(x_left, x_right, 400)
 ax.plot(Xg, ground_y_at(Xg), label="Ground", linewidth=2)
+
 th = np.linspace(0, 2*math.pi, 400)
 ax.plot(slip.xc + slip.R*np.cos(th), slip.yc + slip.R*np.sin(th), "--", label="Selected slip circle")
+
 for i, nl in enumerate(st.session_state.nails):
     ax.plot([nl.x1, nl.x2], [nl.y1, nl.y2], linewidth=2, label=f"Nail {i}" if show_legend else None)
+
 ax.set_aspect('equal', 'box')
 ax.set_xlim(x_left, x_right); ax.set_ylim(y_min, y_max)
 ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
