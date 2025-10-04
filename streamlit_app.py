@@ -578,56 +578,88 @@ elif page.startswith("3"):
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend(loc="upper right")
     st.pyplot(fig); plt.close(fig)
 
-    # ▶ 計算開始（未補強）ボタン — ここで初めて保存＆描画
+       # ▶ 計算開始（未補強）ボタン — ここで保存＆描画
     if st.button("▶ 計算開始（未補強）"):
         sync_grid_ui_to_cfg()
-        # いったん簡易：中心1点から円弧サンプル→Fs算定→保存
         method = cfg_get("grid.method")
-        xc = 0.5*(x_min+x_max); yc = 0.5*(y_min+y_max)
-        R  = max(5.0, 0.25*((x_max-x_min)+(y_max-y_min)))
-        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
-        if s is None:
-            st.error("この中心・半径では有効な円弧が得られません。範囲やピッチを見直してください。")
-        else:
-            x1,x2,*_ = s
-            # 代表として Layer1 でFs算定（多層化は今後の拡張でOK）
-            mats = cfg_get("layers.mat")
-            soil1 = Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])
-            Fs = fs_given_R_multi(ground, interfaces, [soil1], [], method, xc, yc, R, n_slices=40)
-            if Fs is None: Fs = 1.00
-            res = dict(center=(xc,yc),
-                       refined=[dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=0.0)],
-                       idx_minFs=0)
-            cfg_set("results.unreinforced", res)
-            cfg_set("results.chosen_arc", dict(xc=xc,yc=yc,R=float(R), x1=float(x1), x2=float(x2), Fs=float(Fs)))
-            st.success(f"未補強の結果を保存しました（Fs={Fs:.3f}）。")
 
-    # 保存済みを描画
-    res = cfg_get("results.unreinforced")
-    if res:
-        xc,yc = res["center"]; refined=res["refined"]; idx_minFs=res["idx_minFs"]
-        fig,ax = plt.subplots(figsize=(10.0,7.0))
-        Xd,Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
-        draw_water(ax, ground, Xd, Yg)
-        for d in refined[:30]:
-            xs=np.linspace(d["x1"], d["x2"], 200); ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
-            clipped=clip_yfloor(xs, ys, 0.0)
-            if clipped is None: continue
-            xs_c,ys_c = clipped
-            ax.plot(xs_c, ys_c, lw=0.9, alpha=0.75, color=fs_to_color(d["Fs"]))
-        d=refined[idx_minFs]
-        xs=np.linspace(d["x1"], d["x2"], 400); ys=yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
-        clipped=clip_yfloor(xs, ys, 0.0)
-        if clipped is not None:
-            xs_c,ys_c = clipped
-            ax.plot(xs_c, ys_c, lw=3.0, color=(0.9,0,0), label=f"Min Fs = {d['Fs']:.3f}")
-            y1=float(ground.y_at(xs_c[0])); y2=float(ground.y_at(xs_c[-1]))
-            ax.plot([xc,xs_c[0]],[yc,y1], lw=1.1, color=(0.9,0,0), alpha=0.9)
-            ax.plot([xc,xs_c[-1]],[yc,y2], lw=1.1, color=(0.9,0,0), alpha=0.9)
-        set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
-        ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • MinFs={refined[idx_minFs]['Fs']:.3f}")
-        st.pyplot(fig); plt.close(fig)
-# ===================== Page4: ネイル配置 =====================
+        # 層構成（代表値）：いまは上から順に最大3層を許容
+        mats = cfg_get("layers.mat")
+        n_layers = int(cfg_get("layers.n"))
+        soils = [Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
+        allow_cross = []
+        if n_layers >= 2:
+            soils.append(Soil(mats[2]["gamma"], mats[2]["c"], mats[2]["phi"]))
+            allow_cross.append(bool(cfg_get("grid.allow_cross2")))
+        if n_layers >= 3:
+            soils.append(Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
+            allow_cross.append(bool(cfg_get("grid.allow_cross3")))
+
+        # 中心候補を複数サンプリング（範囲の 7×5 格子）
+        xs_c = np.linspace(x_min, x_max, 7)
+        ys_c = np.linspace(y_min, y_max, 5)
+
+        # 走査パラメータ（“安定板２”のクイック探索近似）
+        quick_slices = 12
+        n_entries    = 240       # 円弧エントリ数（x側サンプリング密度）
+        depth_min    = 0.5
+        depth_max    = 4.0       # 必要なら 6.0〜8.0 に上げると当たりやすい
+        limit_arcs   = 160       # 中心1点あたりの最大本数
+        probe_n_min  = 101
+
+        best = None  # (Fs, pack) を保持
+        # interfaces は描画用に既に用意済み
+        interfaces=[]
+        if n_layers>=2: interfaces.append(make_interface1_example(H,L))
+        if n_layers>=3: interfaces.append(make_interface2_example(H,L))
+
+        # 複数中心を走査して、成立する円弧の中から最小Fsを選ぶ
+        for yc_try in ys_c:
+            for xc_try in xs_c:
+                # クイック探索：この中心で候補Rを大量に生成
+                R_list = []
+                for _x1,_x2,R,Fs_q in lem.arcs_from_center_by_entries_multi(
+                        ground, soils, float(xc_try), float(yc_try),
+                        n_entries=n_entries, method="Fellenius",
+                        depth_min=depth_min, depth_max=depth_max,
+                        interfaces=interfaces, allow_cross=allow_cross,
+                        quick_mode=True, n_slices_quick=quick_slices,
+                        limit_arcs_per_center=limit_arcs, probe_n_min=probe_n_min):
+                    R_list.append(R)
+
+                if not R_list:
+                    continue  # この中心では円弧が作れない→次の中心へ
+
+                # 候補Rで本計算（指定法）→最小Fsを採用
+                refined=[]
+                for R in R_list:
+                    Fs = fs_given_R_multi(ground, interfaces, soils, allow_cross, method, float(xc_try), float(yc_try), float(R), n_slices=40)
+                    if Fs is None: 
+                        continue
+                    s = arc_sample_poly_best_pair(ground, float(xc_try), float(yc_try), float(R), n=251, y_floor=0.0)
+                    if s is None: 
+                        continue
+                    x1,x2,*_ = s
+                    refined.append(dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2)))
+
+                if not refined:
+                    continue
+
+                refined.sort(key=lambda d: d["Fs"])
+                cand = refined[0]
+                score = cand["Fs"]
+                if (best is None) or (score < best[0]):
+                    best = (score, dict(center=(float(xc_try), float(yc_try)), refined=refined, idx_minFs=0))
+
+        if best is None:
+            st.error("この設定では有効な円弧が見つかりませんでした。中心範囲やdepth_max（例: 6〜8m）、Allow into Layer を見直してください。")
+        else:
+            Fs_min, pack = best
+            cfg_set("results.unreinforced", pack)
+            xc,yc = pack["center"]; d = pack["refined"][pack["idx_minFs"]]
+            cfg_set("results.chosen_arc", dict(xc=xc,yc=yc,R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"]))
+            st.success(f"未補強の結果を保存しました（Fs={d['Fs']:.3f} @ Center=({xc:.2f},{yc:.2f})）。")
+
 
 
 # ===================== Page4: ネイル配置 =====================
