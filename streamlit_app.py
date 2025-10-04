@@ -684,27 +684,67 @@ elif page.startswith("4"):
     st.pyplot(fig); plt.close(fig)
 
 # ===================== Page5: 補強後解析 =====================
+# ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
-    H,L,ground = make_ground_from_cfg()
+    H, L, ground = make_ground_from_cfg()
+    n_layers = int(cfg_get("layers.n"))
+    interfaces = []
+    if n_layers >= 2:
+        interfaces.append(make_interface1_example(H, L))
+    if n_layers >= 3:
+        interfaces.append(make_interface2_example(H, L))
+
     st.subheader("補強後解析（試作）")
+
     arc = cfg_get("results.chosen_arc")
-    NH = cfg_get("results.nail_heads", [])
+    NH  = cfg_get("results.nail_heads", [])
+
     btn = st.button("▶ 補強後の計算を実行", disabled=not (arc and NH))
     if not (arc and NH):
         missing=[]
         if not arc: missing.append("Page3のMin Fs円弧")
-        if not NH: missing.append("Page4のネイル頭配置")
+        if not NH:  missing.append("Page4のネイル頭配置")
         st.info("必要情報: " + "、".join(missing))
     elif btn:
         with st.spinner("（将来）ネイル効果を連成計算中…"):
+            # いまは数値合成は未実装（Phase-2予定）。メタ情報だけ保存。
             cfg_set("results.reinforced", {
                 "n_nails": len(NH),
                 "arc_Fs_unreinforced": arc["Fs"],
+                # 実装後：ここに Fs_after などを追加していく
                 "note": "Phase-2で Tpullout/Tstrip(μ)/Ttens → Tt/Tn投影 → FS更新を実装予定。",
             })
+
     r = cfg_get("results.reinforced")
+
+    # ── 上段：メトリクス表示 ──────────────────────
     if r:
-        col1,col2 = st.columns(2)
+        col1, col2 = st.columns(2)
         with col1: st.metric("ネイル本数", f"{r['n_nails']}")
         with col2: st.metric("未補強Fs（参照）", f"{r['arc_Fs_unreinforced']:.3f}")
         st.caption(r["note"])
+
+    # ── 下段：横断図（地形＋水位＋最小円弧＋ネイル頭） ───────────
+    fig, ax = plt.subplots(figsize=(10.0, 7.0))
+    Xd, Yg  = draw_layers_and_ground(ax, ground, n_layers, interfaces)
+    draw_water(ax, ground, Xd, Yg)
+
+    if arc:
+        xc, yc, R = arc["xc"], arc["yc"], arc["R"]
+        xs = np.linspace(arc["x1"], arc["x2"], 400)
+        ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
+        ax.plot(xs, ys, lw=2.5, color="tab:red",
+                label=f"Slip arc（未補強Fs={arc['Fs']:.3f}）")
+
+    if NH:
+        ax.scatter([p[0] for p in NH], [p[1] for p in NH],
+                   s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+
+    # タイトル（補強後Fsは未実装なので参照値のみ表示）
+    if arc:
+        ax.set_title(f"横断図｜未補強 Fs = {arc['Fs']:.3f}（補強効果の数値合成は次段で実装）")
+
+    set_axes(ax, H, L, ground)
+    ax.grid(True); ax.legend()
+    ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+    st.pyplot(fig); plt.close(fig)
