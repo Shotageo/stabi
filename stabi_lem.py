@@ -10,8 +10,7 @@ import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ---- 必要インポート：stabi_lem の D_sum 取得・円弧サンプル ----
-from stabi_lem import driving_sum_for_R_multi, arc_sample_poly_best_pair
+
 
 # ================================================================
 # Plot style（Theme/Tight layout/Legend切替）— ユーザー希望ブロック
