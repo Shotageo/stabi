@@ -44,8 +44,8 @@ def circle_theta_from_x(slip: CircleSlip, x: np.ndarray):
     return np.arccos(v)
 
 def line_circle_intersections_segment(x1, y1, x2, y2, slip: CircleSlip) -> List[Tuple[float,float]]:
-    dx, dy = (x2-x1), (y2-y1)
-    fx, fy = (x1-slip.xc), (y1-slip.yc)
+    dx, dy = (x2 - x1), (y2 - y1)
+    fx, fy = (x1 - slip.xc), (y1 - slip.yc)
     A = dx*dx + dy*dy
     B = 2*(fx*dx + fy*dy)
     C = fx*fx + fy*fy - slip.R*slip.R
@@ -70,8 +70,8 @@ def generate_slices_on_arc(
     """
     地表 y_g(x) と円弧の上下解 y_u(x), y_l(x) を比較。
     - まず「地表より下側（<= y_g）」の解だけを候補にする
-    - 両方下なら、地表により近い側（y が大きい方）を選ぶ
-    これで“地表より上の弧”を誤採用しない。
+    - 両方下なら、地表により近い側（=値が大きい方）を選ぶ
+    - 分断された場合は“最長の連続区間”だけ採用
     """
     X = np.linspace(x_min, x_max, 1201)
     theta = circle_theta_from_x(slip, X)
@@ -79,32 +79,26 @@ def generate_slices_on_arc(
     yl = slip.yc - slip.R*np.sin(theta)
     yg = ground_y_at(X)
 
-    # 下側候補の決定
     under_u = yu <= yg
     under_l = yl <= yg
-    # どちらも下：地表に近い（=値が大きい）方、どちらか一方のみ下：その一方、両方上：NaN
     yc = np.where(
         under_u & under_l, np.maximum(yu, yl),
         np.where(under_u, yu, np.where(under_l, yl, np.nan))
     )
 
     valid = np.isfinite(yc)
-    if not np.any(valid):
-        return []
+    if not np.any(valid): return []
 
-    # 連続区間のうち最長を採用（分断されるケースの安定化）
     idx = np.where(valid)[0]
     # 連続ブロック抽出
     breaks = np.where(np.diff(idx) > 1)[0]
     starts = np.r_[0, breaks+1]
     ends   = np.r_[breaks, len(idx)-1]
-    # 最長ブロックを選ぶ
     lengths = idx[ends] - idx[starts]
     k = int(np.argmax(lengths))
     i0, i1 = idx[starts[k]], idx[ends[k]]
     xL, xR = X[i0], X[i1]
-    if xR - xL <= 1e-6:
-        return []
+    if xR - xL <= 1e-6: return []
 
     xs = np.linspace(xL, xR, n_slices+1)
     slices = []
@@ -128,7 +122,7 @@ def generate_slices_on_arc(
         under_l_g = yl_g <= yg_seg
         yc_seg = np.where(
             under_u_g & under_l_g, np.maximum(yu_g, yl_g),
-            np.where(under_u_g, yu_g, np.where(under_l_g, yl_g, yg_seg))  # 上側は高さ0として扱う
+            np.where(under_u_g, yu_g, np.where(under_l_g, yl_g, yg_seg))
         )
         heights = np.maximum(yg_seg - yc_seg, 0.0)
         area = np.trapz(heights, grid)  # m^2
@@ -148,16 +142,16 @@ def bishop_fs_unreinforced(slices: List[dict], soil: Soil, max_iter: int = 80, t
             m = 1.0 + (math.tan(phi) * math.sin(alpha)) / max(Fs, 1e-6)
             Np = (W * math.cos(alpha)) / m
             shear_res = c * b + (Np * math.tan(phi))
-            num += shear_res
-            den += W * math.sin(alpha)
+            num += shear_res; den += W * math.sin(alpha)
         Fs_new = num / max(den, 1e-9)
-        if abs(Fs_new - Fs) < tol:
-            return max(Fs_new, 1e-6)
+        if abs(Fs_new - Fs) < tol: return max(Fs_new, 1e-6)
         Fs = Fs_new
     return max(Fs, 1e-6)
 
-def bishop_fs_with_nails(slices: List[dict], soil: Soil, slip: CircleSlip, nails: List[Nail],
-                         max_iter: int = 80, tol: float = 1e-5) -> float:
+def bishop_fs_with_nails(
+    slices: List[dict], soil: Soil, slip: CircleSlip, nails: List[Nail],
+    max_iter: int = 80, tol: float = 1e-5
+) -> float:
     Fs = bishop_fs_unreinforced(slices, soil, max_iter=30, tol=1e-4)
     phi = math.radians(soil.phi); c = soil.c; R = slip.R
 
@@ -195,7 +189,6 @@ def bishop_fs_with_nails(slices: List[dict], soil: Soil, slip: CircleSlip, nails
             M_reinf += T_tan * R
 
         Fs_new = (num * R + M_reinf) / max(den * R, 1e-9)
-        if abs(Fs_new - Fs) < tol:
-            return max(Fs_new, 1e-6)
+        if abs(Fs_new - Fs) < tol: return max(Fs_new, 1e-6)
         Fs = Fs_new
     return max(Fs, 1e-6)
