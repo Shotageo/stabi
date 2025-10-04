@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 from dataclasses import dataclass
 import math
-from typing import List, Tuple, Callable, Optional
+from typing import List, Tuple, Callable
 import numpy as np
 
 # =========================
@@ -26,10 +26,10 @@ class Nail:
     y1: float
     x2: float
     y2: float
-    spacing: float            # m（1m幅換算用）
+    spacing: float            # m（1m幅換算用：kN/本→kN/m）
     T_yield: float            # kN/本
-    bond_strength: float      # kN/m
-    embed_length_each_side: float = 0.5  # m
+    bond_strength: float      # kN/m（付着）
+    embed_length_each_side: float = 0.5  # m（交点から両側の有効定着長：簡易）
 
 # =========================
 # 幾何ユーティリティ
@@ -79,8 +79,8 @@ def generate_slices_on_arc(
     soil_gamma: float
 ) -> List[dict]:
     """
-    地表 y_g(x) と円弧 y_c(x) を比較し、y_g >= y_c の領域（地表で覆土のある側）で
-    弧の有効区間 [xL, xR] を抽出し、そこでスライス化して重量Wと底面角alphaを与える。
+    地表 y_g(x) と円弧 y_c(x) を比較し、y_g >= y_c の領域（覆土がある側）で
+    弧の有効区間 [xL, xR] を抽出し、その区間でスライス化して重量Wと底面角alphaを与える。
     """
     X = np.linspace(x_min, x_max, 1201)
     theta = circle_theta_from_x(slip, X)
@@ -88,9 +88,7 @@ def generate_slices_on_arc(
     y_lower = slip.yc - slip.R*np.sin(theta)
     yg = ground_y_at(X)
 
-    # 地表に近い側の弧（見かけの交差側）を採用
     yc = np.where(np.abs(yg - y_upper) < np.abs(yg - y_lower), y_upper, y_lower)
-
     mask = (yg >= yc)
     if not np.any(mask):
         return []
@@ -106,12 +104,12 @@ def generate_slices_on_arc(
         x_a, x_b = xs[i], xs[i+1]
         xm = 0.5*(x_a + x_b)
 
-        # 接線角：弧のパラメトリックから（θでの接線は (-sinθ, +cosθ)）
+        # 接線角（底面勾配角）
         th_m = float(circle_theta_from_x(slip, np.array([xm]))[0])
         tx, ty = -math.sin(th_m), math.cos(th_m)
-        alpha = math.atan2(ty, tx)  # 底面勾配角
+        alpha = math.atan2(ty, tx)
 
-        # 面積（台形近似）
+        # 面積（台形積分）
         Nx = 8
         grid = np.linspace(x_a, x_b, Nx+1)
         thg = circle_theta_from_x(slip, grid)
@@ -129,7 +127,6 @@ def generate_slices_on_arc(
             'W': W,
             'area': area,
         })
-
     return slices
 
 # =========================
@@ -164,7 +161,7 @@ def bishop_fs_with_nails(
     Fs = bishop_fs_unreinforced(slices, soil, max_iter=30, tol=1e-4)
     phi = math.radians(soil.phi); c = soil.c; R = slip.R
 
-    def circle_tangent_at_xy(xp, yp) -> Tuple[float,float]:
+    def circle_tangent_at_xy(xp, yp):
         rx, ry = xp - slip.xc, yp - slip.yc
         tx, ty = -ry, rx
         n = math.hypot(tx, ty)
