@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from time import time
 
+# ---- Stabi LEM core ----
 from stabi_lem import (
     Soil, CircleSlip,
     generate_slices_on_arc,
@@ -13,25 +14,26 @@ from stabi_lem import (
     circle_xy_from_theta
 )
 
-# =============== Plot style（Theme/Tight layout/Legend切替：既定） ===============
+# ================= Plot style（Theme/Tight layout/Legend切替：既定） =================
 st.set_page_config(page_title="Stabi｜安定板２", layout="wide")
 st.sidebar.header("Plot style")
 theme = st.sidebar.selectbox("Theme", ["default", "dark_background"])
 tight = st.sidebar.checkbox("Tight layout", value=True)
 show_legend = st.sidebar.checkbox("Show legend", value=True)
 plt.style.use("dark_background" if theme == "dark_background" else "default")
-# ================================================================================
+# ==============================================================================
 
-st.title("Stabi｜安定板２：無補強の円弧探索（選択円弧を後段ページに渡します）")
+st.title("Stabi｜安定板２：無補強の円弧探索（“選択円弧”を次ページに引き渡し）")
 
-# ====== 探索設定（安定板２風） ======
+# ================= 探索設定（安定板２風） =================
 st.sidebar.header("探索設定")
 quality = st.sidebar.selectbox("Quality", ["Fast", "Normal", "High"], index=1)
 budget_coarse = st.sidebar.number_input("Budget Coarse [s]", value=0.8, step=0.1, min_value=0.1)
 budget_quick  = st.sidebar.number_input("Budget Quick  [s]", value=1.2, step=0.1, min_value=0.1)
-audit = st.sidebar.checkbox("Audit（センター可視化）", value=False)
+audit = st.sidebar.checkbox("Audit（センター可視化）", value=False,
+                            help="“安定板２”既定はOFF。必要時のみON。")
 
-# ====== 地形・材料 ======
+# ================= 地形・材料 =================
 st.subheader("地形・材料")
 cA, cB, cC = st.columns(3)
 with cA:
@@ -51,10 +53,11 @@ tanb = math.tan(beta_rad)
 def ground_y_at(X: np.ndarray) -> np.ndarray:
     return H - tanb * X
 
-# 表示範囲をセッションにも保存（他ページで再利用）
-x_top = H / max(tanb, 1e-6)
-x_left, x_right = -0.1*x_top, 1.1*x_top
-y_min, y_max = -1.2*H, 1.2*H
+# 表示範囲（他ページで再利用）
+x_top  = H / max(tanb, 1e-6)
+x_left, x_right = -0.1 * x_top, 1.1 * x_top
+y_min, y_max = -1.2 * H, 1.2 * H
+
 st.session_state["H"] = H
 st.session_state["beta_deg"] = beta
 st.session_state["gamma"] = gamma
@@ -65,8 +68,9 @@ st.session_state["x_right"] = x_right
 st.session_state["y_min"] = y_min
 st.session_state["y_max"] = y_max
 
-# ====== 円弧探索（Coarse→Quick→Refine：簡易グリッド） ======
+# ================= 円弧探索（Coarse→Quick→Refine：簡易グリッド） =================
 def search_best_circle():
+    # 解像度設定
     if quality == "Fast":
         coarse_n = (18, 10); quick_n = (12, 8); refine_nR = 12
     elif quality == "High":
@@ -74,9 +78,10 @@ def search_best_circle():
     else:
         coarse_n = (30, 14); quick_n = (20, 10); refine_nR = 18
 
-    xc_min, xc_max = -0.2*x_top, 1.2*x_top
-    yc_min, yc_max = -2.0*H, 0.2*H
-    R_min, R_max = 0.6*H, 2.2*H
+    # 探索窓
+    xc_min, xc_max = -0.2 * x_top, 1.2 * x_top
+    yc_min, yc_max = -2.0 * H, 0.2 * H
+    R_min, R_max   = 0.6 * H, 2.2 * H
 
     best = None  # (Fs, slip, slices)
     centers_record = []
@@ -91,8 +96,10 @@ def search_best_circle():
                 centers_record.append((xc, yc))
                 for R in Rs:
                     slip = CircleSlip(xc=xc, yc=yc, R=R)
-                    slices = generate_slices_on_arc(ground_y_at, slip, n_slices=nslices,
-                                                    x_min=x_left, x_max=x_right, soil_gamma=soil.gamma)
+                    slices = generate_slices_on_arc(
+                        ground_y_at, slip, n_slices=nslices,
+                        x_min=x_left, x_max=x_right, soil_gamma=soil.gamma
+                    )
                     if not slices:
                         continue
                     Fs_un = bishop_fs_unreinforced(slices, soil)
@@ -102,41 +109,49 @@ def search_best_circle():
                         best = (Fs_un, slip, slices)
 
     # Coarse
-    eval_grid(coarse_n[0], coarse_n[1], max(10, int((R_max-R_min)/H*8)),
+    eval_grid(coarse_n[0], coarse_n[1],
+              max(10, int((R_max - R_min) / H * 8)),
               xc_min, xc_max, yc_min, yc_max, R_min, R_max, nslices=36)
-    # Quick
+
+    # Quick（best周辺をズーム）
     if best is not None:
         _, s0, _ = best
-        dx = 0.25*x_top; dy = 0.35*H; dR = 0.35*H
-        eval_grid(quick_n[0], quick_n[1], max(12, int((R_max-R_min)/H*10)),
-                  s0.xc-dx, s0.xc+dx, s0.yc-dy, s0.yc+dy,
-                  max(R_min, s0.R-dR), min(R_max, s0.R+dR), nslices=40)
-    # Refine
+        dx = 0.25 * x_top; dy = 0.35 * H; dR = 0.35 * H
+        eval_grid(quick_n[0], quick_n[1],
+                  max(12, int((R_max - R_min) / H * 10)),
+                  s0.xc - dx, s0.xc + dx,
+                  s0.yc - dy, s0.yc + dy,
+                  max(R_min, s0.R - dR), min(R_max, s0.R + dR),
+                  nslices=40)
+
+    # Refine（さらに絞る）
     if best is not None:
         _, s0, _ = best
-        dx = 0.12*x_top; dy = 0.20*H; dR = 0.22*H
-        eval_grid(quick_n[0]+4, quick_n[1]+4, refine_nR,
-                  s0.xc-dx, s0.xc+dx, s0.yc-dy, s0.yc+dy,
-                  max(R_min, s0.R-dR), min(R_max, s0.R+dR), nslices=44)
+        dx = 0.12 * x_top; dy = 0.20 * H; dR = 0.22 * H
+        eval_grid(quick_n[0] + 4, quick_n[1] + 4, refine_nR,
+                  s0.xc - dx, s0.xc + dx,
+                  s0.yc - dy, s0.yc + dy,
+                  max(R_min, s0.R - dR), min(R_max, s0.R + dR),
+                  nslices=44)
 
     return best, centers_record
 
 best, centers_seen = search_best_circle()
 
-# ====== 結果・選択円弧の保存 ======
+# ================= 結果・選択円弧の保存 =================
 if best is None:
     Fs_un = float("nan")
     slip_best = None
     slices_best = []
 else:
     Fs_un, slip_best, slices_best = best
-    # ここが重要：後段ページが読む “選択円弧” を保存
+    # ★ 重要：後段ページ（ソイルネイル補強）が読む “選択円弧” を保存
     st.session_state["selected_slip"] = slip_best
 
 st.subheader("結果（無補強）")
 st.metric("最小 Fs", f"{Fs_un:.3f}" if best else "—")
 
-# ====== 可視化：地表＋選択円弧（全周） ======
+# ================= 可視化：地表＋選択円弧（全周） =================
 fig, ax = plt.subplots(figsize=(9, 6))
 
 # 地表
@@ -144,13 +159,13 @@ Xg = np.linspace(x_left, x_right, 400)
 Yg = ground_y_at(Xg)
 ax.plot(Xg, Yg, label="Ground", linewidth=2)
 
-# 最小円弧
+# 最小円弧（既存の見せ方に合わせて全周を点線表示）
 if slip_best is not None:
-    th = np.linspace(0, 2*math.pi, 400)
+    th = np.linspace(0, 2 * math.pi, 400)
     Xc, Yc = circle_xy_from_theta(slip_best, th)
     ax.plot(Xc, Yc, linestyle="--", label="Selected slip circle")
 
-# Audit：センター可視化
+# Audit：センター可視化（既定OFF）
 if audit and centers_seen:
     xs = [p[0] for p in centers_seen]; ys = [p[1] for p in centers_seen]
     ax.scatter(xs, ys, s=8, alpha=0.25, label="Coarse centers")
@@ -167,4 +182,4 @@ if tight:
     plt.tight_layout()
 st.pyplot(fig)
 
-st.caption("※ このページで確定した“選択円弧（selected_slip）”は、［ソイルネイル補強］ページで利用されます。")
+st.caption("※ このページで確定した“選択円弧（selected_slip）”は、pages/40_ソイルネイル補強.py で利用されます。")
