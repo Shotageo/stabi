@@ -1,117 +1,24 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-import math
-import numpy as np
-import matplotlib.pyplot as plt
 import streamlit as st
 
-from stabi_lem import (
-    Soil, CircleSlip,
-    generate_slices_on_arc,
-    bishop_fs_unreinforced,
-    circle_xy_from_theta
-)
+st.set_page_config(page_title="Stabi｜安定板２（ハブ）", layout="wide")
 
-st.set_page_config(page_title="Stabi｜安定板２：無補強", layout="wide")
-st.sidebar.header("Plot style")
-theme = st.sidebar.selectbox("Theme", ["default", "dark_background"])
-tight = st.sidebar.checkbox("Tight layout", True)
-show_legend = st.sidebar.checkbox("Show legend", True)
-plt.style.use("dark_background" if theme=="dark_background" else "default")
+st.title("Stabi｜安定板２（ハブ）")
+st.markdown("""
+段階ごとに進めます。左のサイドバーの **Pages** にも同じ順番で並びます。
 
-st.title("Stabi｜安定板２：無補強の円弧探索")
+1. **地形・材料**（基本条件の保存）  
+2. **地層**（必要なら；今は一括土質として保存）  
+3. **円弧探索（無補強）**：最小Fs円弧を決定して保存  
+4. **ソイルネイル補強**：③の“同じ円弧・同じスライス分割”で補強後Fs
+""")
 
-# 入力
-cA, cB, cC = st.columns(3)
-with cA:
-    H  = st.number_input("法高さ H [m]", 1.0, 100.0, float(st.session_state.get("H", 12.0)), 0.5)
-    beta = st.number_input("法勾配角 β [deg]", 5.0, 80.0, float(st.session_state.get("beta_deg", 35.0)), 0.5)
-with cB:
-    gamma = st.number_input("γ [kN/m³]", 10.0, 30.0, float(st.session_state.get("gamma", 18.0)), 0.5)
-    c = st.number_input("c [kPa]", 0.0, 300.0, float(st.session_state.get("c", st.session_state.get("c_kpa", 10.0))), 1.0)
-with cC:
-    phi = st.number_input("φ [deg]", 0.0, 45.0, float(st.session_state.get("phi", st.session_state.get("phi_deg", 30.0))), 0.5)
-soil = Soil(gamma=gamma, c=c, phi=phi)
+st.subheader("クイックリンク")
+st.page_link("pages/10_terrain_material.py", label="→ 1) 地形・材料", icon="🪧")
+st.page_link("pages/20_layers.py",         label="→ 2) 地層",       icon="🧱")
+st.page_link("pages/30_slip_search.py",    label="→ 3) 円弧探索",   icon="🌀")
+st.page_link("pages/40_soil_nail.py",      label="→ 4) ソイルネイル補強", icon="🪛")
 
-beta_rad = math.radians(beta); tanb = math.tan(beta_rad)
-def ground_y_at(X: np.ndarray) -> np.ndarray: return H - tanb * X
-
-x_top  = H / max(tanb, 1e-6)
-x_left, x_right = -0.1*x_top, 1.1*x_top
-y_min, y_max = -1.2*H, 1.2*H
-# 保存（補強ページで同じ表示範囲を使う）
-st.session_state.update({
-    "H": H, "beta_deg": beta, "gamma": gamma, "c": c, "phi": phi,
-    "x_left": x_left, "x_right": x_right, "y_min": y_min, "y_max": y_max
-})
-
-# 探索（同一のまま）
-quality = st.sidebar.selectbox("Quality", ["Fast", "Normal", "High"], index=1)
-audit = st.sidebar.checkbox("Audit（センター可視化）", False)
-def search_best_circle():
-    if quality == "Fast":
-        coarse_n = (18,10); quick_n = (12,8); refine_nR = 12
-    elif quality == "High":
-        coarse_n = (42,20); quick_n = (28,14); refine_nR = 24
-    else:
-        coarse_n = (30,14); quick_n = (20,10); refine_nR = 18
-    xc_min, xc_max = -0.2*x_top, 1.2*x_top
-    yc_min, yc_max = -2.0*H, 0.2*H
-    R_min, R_max   = 0.6*H, 2.2*H
-    best = None; centers=[]
-    def eval_grid(nx, ny, nR, xl,xh, yl,yh, Rl,Rh, nslices):
-        nonlocal best, centers
-        xs = np.linspace(xl,xh,nx); ys = np.linspace(yl,yh,ny); Rs = np.linspace(Rl,Rh,nR)
-        for xc in xs:
-            for yc in ys:
-                centers.append((xc,yc))
-                for R in Rs:
-                    slip = CircleSlip(xc=xc,yc=yc,R=R)
-                    sls = generate_slices_on_arc(ground_y_at, slip, nslices, x_left, x_right, soil.gamma)
-                    if not sls: continue
-                    Fs = bishop_fs_unreinforced(sls, soil)
-                    if not (Fs>0 and np.isfinite(Fs)): continue
-                    if (best is None) or (Fs < best[0]): best = (Fs, slip, sls)
-    eval_grid(coarse_n[0],coarse_n[1], max(10,int((R_max-R_min)/H*8)), xc_min,xc_max,yc_min,yc_max,R_min,R_max,36)
-    if best is not None:
-        _, s0, _ = best
-        dx,dy,dR = 0.25*x_top, 0.35*H, 0.35*H
-        eval_grid(quick_n[0],quick_n[1], max(12,int((R_max-R_min)/H*10)),
-                  s0.xc-dx, s0.xc+dx, s0.yc-dy, s0.yc+dy,
-                  max(R_min,s0.R-dR), min(R_max,s0.R+dR), 40)
-    if best is not None:
-        _, s0, _ = best
-        dx,dy,dR = 0.12*x_top, 0.20*H, 0.22*H
-        eval_grid(quick_n[0]+4,quick_n[1]+4, refine_nR,
-                  s0.xc-dx, s0.xc+dx, s0.yc-dy, s0.yc+dy,
-                  max(R_min,s0.R-dR), min(R_max,s0.R+dR), 44)
-    return best, centers
-
-best, centers = search_best_circle()
-
-if best is None:
-    Fs_un=float("nan"); slip_best=None; sls_best=[]
-else:
-    Fs_un, slip_best, sls_best = best
-    st.session_state["selected_slip"] = {"xc": float(slip_best.xc), "yc": float(slip_best.yc), "R": float(slip_best.R)}
-    # ★ θ境界つきスライスを保存（補強で“同じ分割”を使う）
-    st.session_state["slices_best"] = sls_best
-
-st.subheader("結果（無補強）")
-st.metric("最小 Fs", f"{Fs_un:.3f}" if best else "—")
-
-fig, ax = plt.subplots(figsize=(9,6))
-Xg = np.linspace(x_left, x_right, 400); ax.plot(Xg, ground_y_at(Xg), label="Ground", lw=2)
-if slip_best is not None:
-    th = np.linspace(0,2*math.pi,400); Xc,Yc = circle_xy_from_theta(slip_best, th)
-    ax.plot(Xc, Yc, "--", label="Selected slip circle")
-if audit and centers:
-    xs=[p[0] for p in centers]; ys=[p[1] for p in centers]; ax.scatter(xs,ys,s=8,alpha=0.25,label="Coarse centers")
-ax.set_aspect('equal','box'); ax.set_xlim(x_left,x_right); ax.set_ylim(y_min,y_max)
-ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.grid(True,alpha=0.4)
-ax.set_title(f"Fs_un(min)={Fs_un:.3f}" if best else "円弧が成立しません")
-if show_legend: ax.legend(loc="best")
-if tight: plt.tight_layout()
-st.pyplot(fig)
-
-st.caption("次ページ［Soil Nail Reinforcement］で、この最小Fs円弧に補強を適用します。")
+with st.expander("セッションの状態（確認用）"):
+    st.write(dict(st.session_state))
