@@ -451,6 +451,110 @@ elif page.startswith("3"):
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend(loc="upper right")
     st.pyplot(fig); plt.close(fig)
 
+# ===================== Nail helpers（描画用の最小実装） =====================
+def _slope_dydx_at_x(ground: GroundPL, x: float) -> float:
+    """ground 折れ線の区間勾配（dy/dx）を返す"""
+    X, Y = ground.X, ground.Y
+    if x <= X[0]:  i = 0
+    elif x >= X[-1]: i = len(X)-2
+    else:
+        i = int(np.searchsorted(X, x) - 1)
+        i = max(0, min(i, len(X)-2))
+    dx = X[i+1]-X[i]
+    dy = Y[i+1]-Y[i]
+    return float(dy/max(dx, 1e-12))
+
+def _unit_normal_from_slope(dydx: float, delta_deg: float = 0.0) -> np.ndarray:
+    """
+    斜面法線（地表に直交、下向きを採用）の単位ベクトル。
+    delta_deg で法線から±回転（+は時計回り＝より下向き）を与える。
+    """
+    # 接線角（+x から反時計回り）
+    theta_t = math.atan2(dydx, 1.0)
+    # 法線は接線＋(-90°)。2つあるが「下向き（-y 成分が負）」を選ぶ
+    cand = [theta_t - math.pi/2.0, theta_t + math.pi/2.0]
+    theta_n = min(cand, key=lambda th: math.sin(th))  # sin<0 を優先（より下向き）
+    theta_n = theta_n + (delta_deg * math.pi/180.0)   # 微調整
+    return np.array([math.cos(theta_n), math.sin(theta_n)], dtype=float)
+
+def _unit_vec_horizontal_down(beta_deg: float) -> np.ndarray:
+    """水平から下向き β° の単位ベクトル（右向き正、下向きが正の角度）"""
+    th = -beta_deg * math.pi/180.0  # 下向きが負y
+    return np.array([math.cos(th), math.sin(th)], dtype=float)
+
+def _ray_circle_forward_intersection(P: np.ndarray, v: np.ndarray,
+                                     xc: float, yc: float, R: float,
+                                     x1_arc: float, x2_arc: float) -> tuple[bool, np.ndarray | None]:
+    """
+    直線 P + t v（t>=0）と円の交点のうち「前方で」「円弧区間 x∈[x1_arc,x2_arc] の下側枝」にある最近点を返す。
+    戻り値: (hit, Q or None)
+    """
+    px, py = P; vx, vy = v
+    # (P + t v - C)^2 = R^2 → a t^2 + b t + c = 0
+    a = vx*vx + vy*vy
+    b = 2*((px - xc)*vx + (py - yc)*vy)
+    c = (px - xc)**2 + (py - yc)**2 - R*R
+    disc = b*b - 4*a*c
+    if disc < 0: return False, None
+    s = math.sqrt(max(0.0, disc))
+    ts = [t for t in ((-b - s)/(2*a), (-b + s)/(2*a)) if t >= 0.0]
+    if not ts: return False, None
+    ts.sort()
+    for t in ts:
+        qx = px + t*vx; qy = py + t*vy
+        # 円の下側枝（滑り円弧と同じ枝）かつ、x が弧の範囲内
+        if x1_arc - 1e-6 <= qx <= x2_arc + 1e-6:
+            # 下側枝チェック
+            inside = R*R - (qx - xc)**2
+            if inside >= -1e-6:
+                y_expected = yc - math.sqrt(max(0.0, inside))
+                if abs(qy - y_expected) <= 1e-3:
+                    return True, np.array([qx, qy], dtype=float)
+    return False, None
+
+def build_nails_geometry(ground: GroundPL,
+                         nail_heads: list[tuple[float,float]],
+                         arc: dict | None,
+                         angle_mode: str, beta_deg: float, delta_beta: float,
+                         L_mode: str, L_nail: float, d_embed: float):
+    """
+    各ネイルの head, tip,（あれば）slip 交点を返す。
+    戻り値: list of dict(head=(x,y), tip=(x,y), xing=(x,y) or None, hit_arc:bool)
+    """
+    out = []
+    if not nail_heads: return out
+    xc = yc = R = x1 = x2 = None
+    if arc:
+        xc, yc, R = arc["xc"], arc["yc"], arc["R"]
+        x1, x2    = arc["x1"], arc["x2"]
+    for (xh, yh) in nail_heads:
+        # 方向ベクトル（単位化）
+        if angle_mode.startswith("Slope-Normal"):
+            dydx = _slope_dydx_at_x(ground, float(xh))
+            v = _unit_normal_from_slope(dydx, delta_beta)
+        else:
+            v = _unit_vec_horizontal_down(beta_deg)
+        # 交点
+        hit_arc = False; Q = None
+        if arc is not None:
+            hit_arc, Q = _ray_circle_forward_intersection(
+                np.array([xh, yh], dtype=float), v, xc, yc, R, x1, x2
+            )
+        # tail（tip）を決定
+        if L_mode.startswith("パターン1"):  # 固定長
+            tip = np.array([xh, yh]) + v * float(L_nail)
+        elif L_mode.startswith("パターン2") and hit_arc:
+            tip = Q + v * float(max(0.0, d_embed))  # 交点から +Δm
+        else:
+            # 交点なし or 未対応 → 固定長でフォールバック
+            tip = np.array([xh, yh]) + v * float(L_nail)
+        out.append(dict(head=(float(xh), float(yh)),
+                        tip=(float(tip[0]), float(tip[1])),
+                        xing=(None if Q is None else (float(Q[0]), float(Q[1]))),
+                        hit_arc=bool(hit_arc)))
+    return out
+
+    
     # soils & allow_cross
     mats = cfg_get("layers.mat")
     soils=[Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
@@ -707,11 +811,9 @@ elif page.startswith("5"):
         st.info("必要情報: " + "、".join(missing))
     elif btn:
         with st.spinner("（将来）ネイル効果を連成計算中…"):
-            # いまは数値合成は未実装（Phase-2予定）。メタ情報だけ保存。
             cfg_set("results.reinforced", {
                 "n_nails": len(NH),
                 "arc_Fs_unreinforced": arc["Fs"],
-                # 実装後：ここに Fs_after などを追加していく
                 "note": "Phase-2で Tpullout/Tstrip(μ)/Ttens → Tt/Tn投影 → FS更新を実装予定。",
             })
 
@@ -724,7 +826,7 @@ elif page.startswith("5"):
         with col2: st.metric("未補強Fs（参照）", f"{r['arc_Fs_unreinforced']:.3f}")
         st.caption(r["note"])
 
-    # ── 下段：横断図（地形＋水位＋最小円弧＋ネイル頭） ───────────
+    # ── 下段：横断図（地形＋水位＋最小円弧＋ネイル） ───────────
     fig, ax = plt.subplots(figsize=(10.0, 7.0))
     Xd, Yg  = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd, Yg)
@@ -736,13 +838,39 @@ elif page.startswith("5"):
         ax.plot(xs, ys, lw=2.5, color="tab:red",
                 label=f"Slip arc（未補強Fs={arc['Fs']:.3f}）")
 
-    if NH:
-        ax.scatter([p[0] for p in NH], [p[1] for p in NH],
-                   s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+    # ▼ ここからネイル描画 ▼
+    nails_cfg = cfg_get("nails")
+    angle_mode = nails_cfg["angle_mode"]
+    beta_deg   = float(nails_cfg["beta_deg"])
+    delta_beta = float(nails_cfg["delta_beta"])
+    L_mode     = nails_cfg["L_mode"]
+    L_nail     = float(nails_cfg["L_nail"])
+    d_embed    = float(nails_cfg["d_embed"])
 
-    # タイトル（補強後Fsは未実装なので参照値のみ表示）
+    geom = build_nails_geometry(
+        ground,
+        NH,
+        arc,
+        angle_mode=angle_mode, beta_deg=beta_deg, delta_beta=delta_beta,
+        L_mode=L_mode, L_nail=L_nail, d_embed=d_embed
+    )
+
+    # 線（head→tip）と交点（×）を描く
+    for g in geom:
+        hx, hy = g["head"]
+        tx, ty = g["tip"]
+        ax.plot([hx, tx], [hy, ty],
+                lw=1.6, color=("tab:blue" if g["hit_arc"] else "0.6"),
+                alpha=(1.0 if g["hit_arc"] else 0.7))
+        if g["xing"] is not None:
+            qx, qy = g["xing"]
+            ax.plot(qx, qy, "x", ms=6, mew=1.5, color="tab:orange")
+
+    # ▲ ネイル描画ここまで ▲
+
+    # タイトル
     if arc:
-        ax.set_title(f"横断図｜未補強 Fs = {arc['Fs']:.3f}（補強効果の数値合成は次段で実装）")
+        ax.set_title(f"横断図｜未補強 Fs = {arc['Fs']:.3f}（交点×：ネイルとすべり円弧の交差）")
 
     set_axes(ax, H, L, ground)
     ax.grid(True); ax.legend()
