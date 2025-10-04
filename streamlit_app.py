@@ -652,7 +652,7 @@ def build_nails_geometry(ground: GroundPL,
         cfg_set("results.chosen_arc", dict(xc=xc,yc=yc,R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"]))
         st.success("未補強結果を保存しました（cfg.results）。")
 
-       res = cfg_get("results.unreinforced")
+          res = cfg_get("results.unreinforced")
     if res:
         xc, yc = res["center"]
         refined = res["refined"]
@@ -664,7 +664,7 @@ def build_nails_geometry(ground: GroundPL,
 
         for d in refined[:30]:
             xs = np.linspace(d["x1"], d["x2"], 200)
-            ys = yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
+            ys = yc - np.sqrt(np.maximum(0.0, d["R"] ** 2 - (xs - xc) ** 2))
             clipped = clip_yfloor(xs, ys, 0.0)
             if clipped is None:
                 continue
@@ -673,14 +673,14 @@ def build_nails_geometry(ground: GroundPL,
 
         d = refined[idx_minFs]
         xs = np.linspace(d["x1"], d["x2"], 400)
-        ys = yc - np.sqrt(np.maximum(0.0, d["R"]**2 - (xs - xc)**2))
+        ys = yc - np.sqrt(np.maximum(0.0, d["R"] ** 2 - (xs - xc) ** 2))
         clipped = clip_yfloor(xs, ys, 0.0)
         if clipped is not None:
             xs_c, ys_c = clipped
             ax.plot(xs_c, ys_c, lw=3.0, color=(0.9, 0, 0), label=f"Min Fs = {d['Fs']:.3f}")
             y1 = float(ground.y_at(xs_c[0]))
             y2 = float(ground.y_at(xs_c[-1]))
-            ax.plot([xc, xs_c[0]],  [yc, y1], lw=1.1, color=(0.9, 0, 0), alpha=0.9)
+            ax.plot([xc, xs_c[0]], [yc, y1], lw=1.1, color=(0.9, 0, 0), alpha=0.9)
             ax.plot([xc, xs_c[-1]], [yc, y2], lw=1.1, color=(0.9, 0, 0), alpha=0.9)
 
         set_axes(ax, H, L, ground)
@@ -692,9 +692,6 @@ def build_nails_geometry(ground: GroundPL,
         )
         st.pyplot(fig)
         plt.close(fig)
-
-# ===================== Page4: ネイル配置 =====================
-
 
 # ===================== Page4: ネイル配置 =====================
 elif page.startswith("4"):
