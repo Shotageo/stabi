@@ -502,6 +502,7 @@ elif page.startswith("2"):
     st.pyplot(fig); plt.close(fig)
 
 # ===================== Page3: 円弧探索（未補強） =====================
+# ===================== Page3: 円弧探索（未補強） =====================
 elif page.startswith("3"):
     H,L,ground = make_ground_from_cfg()
     n_layers = int(cfg_get("layers.n"))
@@ -509,10 +510,12 @@ elif page.startswith("3"):
     if n_layers>=2: interfaces.append(make_interface1_example(H,L))
     if n_layers>=3: interfaces.append(make_interface2_example(H,L))
 
+    # 初期枠（未設定なら H/L から種）
     if cfg_get("grid.x_min") is None:
         cfg_set("grid.x_min", 0.25*L); cfg_set("grid.x_max", 1.15*L)
         cfg_set("grid.y_min", 1.60*H); cfg_set("grid.y_max", 2.20*H)
 
+    # UI seed
     ui_seed("p3_x_min", cfg_get("grid.x_min"))
     ui_seed("p3_x_max", cfg_get("grid.x_max"))
     ui_seed("p3_y_min", cfg_get("grid.y_min"))
@@ -535,7 +538,7 @@ elif page.startswith("3"):
             st.number_input("Center-grid ピッチ (m)", min_value=0.1, step=0.1, format="%.2f", key="p3_pitch", value=float(st.session_state["p3_pitch"]))
         with colB:
             st.selectbox("Method", ["Bishop (simplified)","Fellenius"], key="p3_method", index=["Bishop (simplified)","Fellenius"].index(st.session_state["p3_method"]))
-            st.select_slider("Quality", options=["Coarse","Normal","Fine","Very-fine"], key="p3_quality", value=st.session_state["p3_quality"])
+            st.select_slider("Quality（表示のみ）", options=["Coarse","Normal","Fine","Very-fine"], key="p3_quality", value=st.session_state["p3_quality"])
             st.number_input("Target FS", min_value=1.00, max_value=2.00, step=0.05, format="%.2f", key="p3_Fs_t", value=float(st.session_state["p3_Fs_t"]))
         if n_layers>=2: st.checkbox("Allow into Layer 2", key="p3_allow2", value=bool(st.session_state["p3_allow2"]))
         if n_layers>=3: st.checkbox("Allow into Layer 3", key="p3_allow3", value=bool(st.session_state["p3_allow3"]))
@@ -559,10 +562,10 @@ elif page.startswith("3"):
         sync_grid_ui_to_cfg()
         st.success("cfgに保存しました。")
 
+    # グリッドの可視化
     x_min=cfg_get("grid.x_min"); x_max=cfg_get("grid.x_max")
     y_min=cfg_get("grid.y_min"); y_max=cfg_get("grid.y_max")
     pitch=cfg_get("grid.pitch")
-
     fig,ax = plt.subplots(figsize=(10.0,6.8))
     Xd,Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd, Yg)
@@ -575,19 +578,31 @@ elif page.startswith("3"):
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend(loc="upper right")
     st.pyplot(fig); plt.close(fig)
 
-    # -- ダミー計算（ここでは簡略）：中心を一つ仮に選び、Refined一件を保存 --
-    # 実線化時は、あなたの既存“安定板２の探索ロジック”を戻せばOK
-    xc = 0.5*(x_min+x_max); yc = 0.5*(y_min+y_max)
-    R  = max(5.0, 0.25*(x_max-x_min+y_max-y_min))
-    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
-    if s is not None:
-        x1,x2,*_ = s
-        Fs = fs_given_R_multi(ground, interfaces, [Soil(cfg_get("layers.mat.1")["gamma"], cfg_get("layers.mat.1")["c"], cfg_get("layers.mat.1")["phi"])], [], cfg_get("grid.method"), xc, yc, R, n_slices=40)
-        if Fs is None: Fs = 1.00
-        res = dict(center=(xc,yc), refined=[dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=0.0)], idx_minFs=0)
-        cfg_set("results.unreinforced", res)
-        cfg_set("results.chosen_arc", dict(xc=xc,yc=yc,R=float(R), x1=float(x1), x2=float(x2), Fs=float(Fs)))
+    # ▶ 計算開始（未補強）ボタン — ここで初めて保存＆描画
+    if st.button("▶ 計算開始（未補強）"):
+        sync_grid_ui_to_cfg()
+        # いったん簡易：中心1点から円弧サンプル→Fs算定→保存
+        method = cfg_get("grid.method")
+        xc = 0.5*(x_min+x_max); yc = 0.5*(y_min+y_max)
+        R  = max(5.0, 0.25*((x_max-x_min)+(y_max-y_min)))
+        s = arc_sample_poly_best_pair(ground, xc, yc, R, n=251, y_floor=0.0)
+        if s is None:
+            st.error("この中心・半径では有効な円弧が得られません。範囲やピッチを見直してください。")
+        else:
+            x1,x2,*_ = s
+            # 代表として Layer1 でFs算定（多層化は今後の拡張でOK）
+            mats = cfg_get("layers.mat")
+            soil1 = Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])
+            Fs = fs_given_R_multi(ground, interfaces, [soil1], [], method, xc, yc, R, n_slices=40)
+            if Fs is None: Fs = 1.00
+            res = dict(center=(xc,yc),
+                       refined=[dict(Fs=float(Fs), R=float(R), x1=float(x1), x2=float(x2), T_req=0.0)],
+                       idx_minFs=0)
+            cfg_set("results.unreinforced", res)
+            cfg_set("results.chosen_arc", dict(xc=xc,yc=yc,R=float(R), x1=float(x1), x2=float(x2), Fs=float(Fs)))
+            st.success(f"未補強の結果を保存しました（Fs={Fs:.3f}）。")
 
+    # 保存済みを描画
     res = cfg_get("results.unreinforced")
     if res:
         xc,yc = res["center"]; refined=res["refined"]; idx_minFs=res["idx_minFs"]
@@ -612,6 +627,8 @@ elif page.startswith("3"):
         set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
         ax.set_title(f"Center=({xc:.2f},{yc:.2f}) • MinFs={refined[idx_minFs]['Fs']:.3f}")
         st.pyplot(fig); plt.close(fig)
+# ===================== Page4: ネイル配置 =====================
+
 
 # ===================== Page4: ネイル配置 =====================
 elif page.startswith("4"):
