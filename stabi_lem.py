@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-import streamlit as st
-import numpy as np, heapq, time
+# 標準/外部ライブラリ
+import math
+import heapq
+import time
+import numpy as np
 import matplotlib.pyplot as plt
+import streamlit as st
 
-# ---- stabiパッケージ（__init__.py作成済）から正規インポート ----
+# stabiパッケージ（__init__.py作成済）から正規インポート
 from stabi.stabi_lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
