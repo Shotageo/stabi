@@ -2,3 +2,4 @@ streamlit
 numpy
 pandas
 matplotlib
+pytest==8.2.1
