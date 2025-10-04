@@ -558,7 +558,6 @@ elif page.startswith("3"):
         st.pyplot(fig); plt.close(fig)
 
 # ===================== Page4: ネイル配置 =====================
-# ===================== Page4: ネイル配置 =====================
 elif page.startswith("4"):
     H,L,ground = make_ground_from_cfg()
 
