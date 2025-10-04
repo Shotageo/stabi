@@ -560,6 +560,23 @@ elif page.startswith("3"):
 # ===================== Page4: ネイル配置 =====================
 elif page.startswith("4"):
     H,L,ground = make_ground_from_cfg()
+
+# ===================== Page4: ネイル配置 =====================
+elif page.startswith("4"):
+    H,L,ground = make_ground_from_cfg()
+
+    # ★ これを追加（不足していた定義）
+    n_layers = int(cfg_get("layers.n"))
+    interfaces = []
+    if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
+    if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
+
+    st.subheader("ソイルネイル配置（試作：頭位置のみ）")
+    arc = cfg_get("results.chosen_arc")
+    if not arc:
+        st.info("Page3でMin Fs円弧を確定してから来てね。"); st.stop()
+
+    
     st.subheader("ソイルネイル配置（試作：頭位置のみ）")
     arc = cfg_get("results.chosen_arc")
     if not arc:
