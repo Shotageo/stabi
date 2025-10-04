@@ -5,9 +5,7 @@ import math
 from typing import List, Tuple, Callable
 import numpy as np
 
-# =========================
-# 基本データ構造
-# =========================
+# ===== 基本データ構造 =====
 @dataclass
 class Soil:
     gamma: float   # kN/m3
@@ -22,31 +20,26 @@ class CircleSlip:
 
 @dataclass
 class Nail:
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    spacing: float            # m（1m幅換算用：kN/本→kN/m）
+    x1: float; y1: float
+    x2: float; y2: float
+    spacing: float            # m（1m幅換算）
     T_yield: float            # kN/本
-    bond_strength: float      # kN/m（付着）
-    embed_length_each_side: float = 0.5  # m（交点から両側の有効定着長：簡易）
+    bond_strength: float      # kN/m
+    embed_length_each_side: float = 0.5  # m
 
-# =========================
-# 幾何ユーティリティ
-# =========================
+# ===== 幾何ユーティリティ =====
 def _dot(ax, ay, bx, by): return ax * bx + ay * by
 def _norm(ax, ay): return math.hypot(ax, ay)
-
-def _angle_between(ax, ay, bx, by) -> float:
+def _angle_between(ax, ay, bx, by):
     na = _norm(ax, ay); nb = _norm(bx, by)
     if na == 0 or nb == 0: return 0.0
     cosv = max(-1.0, min(1.0, _dot(ax, ay, bx, by) / (na * nb)))
     return math.acos(cosv)
 
-def circle_xy_from_theta(slip: CircleSlip, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def circle_xy_from_theta(slip: CircleSlip, theta: np.ndarray):
     return slip.xc + slip.R*np.cos(theta), slip.yc + slip.R*np.sin(theta)
 
-def circle_theta_from_x(slip: CircleSlip, x: np.ndarray) -> np.ndarray:
+def circle_theta_from_x(slip: CircleSlip, x: np.ndarray):
     v = np.clip((x - slip.xc) / max(slip.R, 1e-9), -1.0, 1.0)
     return np.arccos(v)
 
@@ -57,19 +50,15 @@ def line_circle_intersections_segment(x1, y1, x2, y2, slip: CircleSlip) -> List[
     B = 2*(fx*dx + fy*dy)
     C = fx*fx + fy*fy - slip.R*slip.R
     disc = B*B - 4*A*C
-    if A == 0 or disc < 0:
-        return []
-    rt = math.sqrt(disc)
-    pts = []
+    if A == 0 or disc < 0: return []
+    rt = math.sqrt(disc); pts = []
     for s in (-1.0, 1.0):
         t = (-B + s*rt) / (2*A)
         if 0.0 <= t <= 1.0:
             pts.append((x1 + t*dx, y1 + t*dy))
     return pts
 
-# =========================
-# スライス生成（地表と円弧から）
-# =========================
+# ===== スライス生成（ロバスト化） =====
 def generate_slices_on_arc(
     ground_y_at: Callable[[np.ndarray], np.ndarray],
     slip: CircleSlip,
@@ -79,22 +68,41 @@ def generate_slices_on_arc(
     soil_gamma: float
 ) -> List[dict]:
     """
-    地表 y_g(x) と円弧 y_c(x) を比較し、y_g >= y_c の領域（覆土がある側）で
-    弧の有効区間 [xL, xR] を抽出し、その区間でスライス化して重量Wと底面角alphaを与える。
+    地表 y_g(x) と円弧の上下解 y_u(x), y_l(x) を比較。
+    - まず「地表より下側（<= y_g）」の解だけを候補にする
+    - 両方下なら、地表により近い側（y が大きい方）を選ぶ
+    これで“地表より上の弧”を誤採用しない。
     """
     X = np.linspace(x_min, x_max, 1201)
     theta = circle_theta_from_x(slip, X)
-    y_upper = slip.yc + slip.R*np.sin(theta)
-    y_lower = slip.yc - slip.R*np.sin(theta)
+    yu = slip.yc + slip.R*np.sin(theta)
+    yl = slip.yc - slip.R*np.sin(theta)
     yg = ground_y_at(X)
 
-    yc = np.where(np.abs(yg - y_upper) < np.abs(yg - y_lower), y_upper, y_lower)
-    mask = (yg >= yc)
-    if not np.any(mask):
+    # 下側候補の決定
+    under_u = yu <= yg
+    under_l = yl <= yg
+    # どちらも下：地表に近い（=値が大きい）方、どちらか一方のみ下：その一方、両方上：NaN
+    yc = np.where(
+        under_u & under_l, np.maximum(yu, yl),
+        np.where(under_u, yu, np.where(under_l, yl, np.nan))
+    )
+
+    valid = np.isfinite(yc)
+    if not np.any(valid):
         return []
 
-    idx = np.where(mask)[0]
-    xL, xR = X[idx[0]], X[idx[-1]]
+    # 連続区間のうち最長を採用（分断されるケースの安定化）
+    idx = np.where(valid)[0]
+    # 連続ブロック抽出
+    breaks = np.where(np.diff(idx) > 1)[0]
+    starts = np.r_[0, breaks+1]
+    ends   = np.r_[breaks, len(idx)-1]
+    # 最長ブロックを選ぶ
+    lengths = idx[ends] - idx[starts]
+    k = int(np.argmax(lengths))
+    i0, i1 = idx[starts[k]], idx[ends[k]]
+    xL, xR = X[i0], X[i1]
     if xR - xL <= 1e-6:
         return []
 
@@ -104,7 +112,7 @@ def generate_slices_on_arc(
         x_a, x_b = xs[i], xs[i+1]
         xm = 0.5*(x_a + x_b)
 
-        # 接線角（底面勾配角）
+        # 接線角
         th_m = float(circle_theta_from_x(slip, np.array([xm]))[0])
         tx, ty = -math.sin(th_m), math.cos(th_m)
         alpha = math.atan2(ty, tx)
@@ -113,25 +121,23 @@ def generate_slices_on_arc(
         Nx = 8
         grid = np.linspace(x_a, x_b, Nx+1)
         thg = circle_theta_from_x(slip, grid)
-        yu = slip.yc + slip.R*np.sin(thg)
-        yl = slip.yc - slip.R*np.sin(thg)
+        yu_g = slip.yc + slip.R*np.sin(thg)
+        yl_g = slip.yc - slip.R*np.sin(thg)
         yg_seg = ground_y_at(grid)
-        yc_seg = np.where(np.abs(yg_seg - yu) < np.abs(yg_seg - yl), yu, yl)
+        under_u_g = yu_g <= yg_seg
+        under_l_g = yl_g <= yg_seg
+        yc_seg = np.where(
+            under_u_g & under_l_g, np.maximum(yu_g, yl_g),
+            np.where(under_u_g, yu_g, np.where(under_l_g, yl_g, yg_seg))  # 上側は高さ0として扱う
+        )
         heights = np.maximum(yg_seg - yc_seg, 0.0)
-        area = np.trapz(heights, grid)  # m^2（奥行1m）
-        W = soil_gamma * area          # kN
+        area = np.trapz(heights, grid)  # m^2
+        W = soil_gamma * area           # kN（奥行1m）
 
-        slices.append({
-            'alpha': alpha,
-            'width': (x_b - x_a),
-            'W': W,
-            'area': area,
-        })
+        slices.append({'alpha': alpha, 'width': (x_b-x_a), 'W': W, 'area': area})
     return slices
 
-# =========================
-# Bishop（未補強 / 補強）核
-# =========================
+# ===== Bishop（未補強 / 補強） =====
 def bishop_fs_unreinforced(slices: List[dict], soil: Soil, max_iter: int = 80, tol: float = 1e-5) -> float:
     phi = math.radians(soil.phi); c = soil.c
     Fs = 1.2
@@ -150,41 +156,32 @@ def bishop_fs_unreinforced(slices: List[dict], soil: Soil, max_iter: int = 80, t
         Fs = Fs_new
     return max(Fs, 1e-6)
 
-def bishop_fs_with_nails(
-    slices: List[dict],
-    soil: Soil,
-    slip: CircleSlip,
-    nails: List[Nail],
-    max_iter: int = 80,
-    tol: float = 1e-5
-) -> float:
+def bishop_fs_with_nails(slices: List[dict], soil: Soil, slip: CircleSlip, nails: List[Nail],
+                         max_iter: int = 80, tol: float = 1e-5) -> float:
     Fs = bishop_fs_unreinforced(slices, soil, max_iter=30, tol=1e-4)
     phi = math.radians(soil.phi); c = soil.c; R = slip.R
 
-    def circle_tangent_at_xy(xp, yp):
+    def _tangent_at(xp, yp):
         rx, ry = xp - slip.xc, yp - slip.yc
         tx, ty = -ry, rx
         n = math.hypot(tx, ty)
         return (1.0, 0.0) if n == 0 else (tx/n, ty/n)
 
     for _ in range(max_iter):
-        num = den = 0.0
-        M_reinf = 0.0
-
+        num = den = 0.0; M_reinf = 0.0
         for s in slices:
             alpha = s['alpha']; W = s['W']; b = s['width']
             m = 1.0 + (math.tan(phi) * math.sin(alpha)) / max(Fs, 1e-6)
             Np = (W * math.cos(alpha)) / m
             shear_res = c * b + (Np * math.tan(phi))
-            num += shear_res
-            den += W * math.sin(alpha)
+            num += shear_res; den += W * math.sin(alpha)
 
         for nl in nails:
             pts = line_circle_intersections_segment(nl.x1, nl.y1, nl.x2, nl.y2, slip)
             if not pts: 
                 continue
             xp, yp = sorted(pts, key=lambda p:(p[0]-slip.xc)**2 + (p[1]-slip.yc)**2)[0]
-            tx, ty = circle_tangent_at_xy(xp, yp)
+            tx, ty = _tangent_at(xp, yp)
             nx, ny = (nl.x2-nl.x1), (nl.y2-nl.y1)
             nlen = math.hypot(nx, ny)
             if nlen == 0: 
