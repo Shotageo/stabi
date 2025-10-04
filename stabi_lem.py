@@ -90,7 +90,6 @@ def generate_slices_on_arc(
     if not np.any(valid): return []
 
     idx = np.where(valid)[0]
-    # 連続ブロック抽出
     breaks = np.where(np.diff(idx) > 1)[0]
     starts = np.r_[0, breaks+1]
     ends   = np.r_[breaks, len(idx)-1]
@@ -105,13 +104,10 @@ def generate_slices_on_arc(
     for i in range(n_slices):
         x_a, x_b = xs[i], xs[i+1]
         xm = 0.5*(x_a + x_b)
-
-        # 接線角
         th_m = float(circle_theta_from_x(slip, np.array([xm]))[0])
         tx, ty = -math.sin(th_m), math.cos(th_m)
         alpha = math.atan2(ty, tx)
 
-        # 面積（台形積分）
         Nx = 8
         grid = np.linspace(x_a, x_b, Nx+1)
         thg = circle_theta_from_x(slip, grid)
@@ -125,9 +121,8 @@ def generate_slices_on_arc(
             np.where(under_u_g, yu_g, np.where(under_l_g, yl_g, yg_seg))
         )
         heights = np.maximum(yg_seg - yc_seg, 0.0)
-        area = np.trapz(heights, grid)  # m^2
-        W = soil_gamma * area           # kN（奥行1m）
-
+        area = np.trapz(heights, grid)
+        W = soil_gamma * area  # kN（奥行1m）
         slices.append({'alpha': alpha, 'width': (x_b-x_a), 'W': W, 'area': area})
     return slices
 
@@ -172,14 +167,12 @@ def bishop_fs_with_nails(
 
         for nl in nails:
             pts = line_circle_intersections_segment(nl.x1, nl.y1, nl.x2, nl.y2, slip)
-            if not pts: 
-                continue
+            if not pts: continue
             xp, yp = sorted(pts, key=lambda p:(p[0]-slip.xc)**2 + (p[1]-slip.yc)**2)[0]
             tx, ty = _tangent_at(xp, yp)
             nx, ny = (nl.x2-nl.x1), (nl.y2-nl.y1)
             nlen = math.hypot(nx, ny)
-            if nlen == 0: 
-                continue
+            if nlen == 0: continue
             nx /= nlen; ny /= nlen
             delta = _angle_between(nx, ny, tx, ty)
             L_embed = 2.0 * nl.embed_length_each_side
