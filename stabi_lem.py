@@ -1,303 +1,154 @@
-# stabi_lem.py — 安定版ベース＋軽微拡張（Soilにτ[kPa]を追加）
-from __future__ import annotations
+# stabi_lem.py
+# -*- coding: utf-8 -*-
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Iterable
-import numpy as np, math
+import math
+from typing import List, Tuple
 
-DEG = math.pi/180.0
-EPS = 1e-12
-
-# ----------------- 基本データ構造 -----------------
+# ---- 型定義 ----
 @dataclass
 class Soil:
-    gamma: float  # kN/m3
-    c: float      # kPa
-    phi: float    # deg
-    tau_kPa: float = 0.0  # ← 追加：ネイル周面せん断（層ごと・直接入力, kPa）
+    gamma: float   # kN/m3
+    c: float       # kPa (kN/m2)
+    phi: float     # deg
 
 @dataclass
-class GroundPL:
-    X: np.ndarray
-    Y: np.ndarray
-    def y_at(self, x):
-        x = np.asarray(x, dtype=float)
-        y = np.empty_like(x)
-        for i, xv in np.ndenumerate(x):
-            if xv <= self.X[0]:
-                y[i] = self.Y[0]; continue
-            if xv >= self.X[-1]:
-                y[i] = self.Y[-1]; continue
-            k = np.searchsorted(self.X, xv) - 1
-            x0, x1 = self.X[k], self.X[k+1]
-            y0, y1 = self.Y[k], self.Y[k+1]
-            t = (xv - x0) / max(x1 - x0, 1e-12)
-            y[i] = (1-t)*y0 + t*y1
-        return y if y.shape != () else float(y)
+class CircleSlip:
+    xc: float
+    yc: float
+    R: float
 
-# ----------------- 円×折れ線 交点 -----------------
-def circle_segment_intersections(xc, yc, R, x0, y0, x1, y1):
-    dx, dy = x1 - x0, y1 - y0
-    a = dx*dx + dy*dy
-    b = 2*((x0 - xc)*dx + (y0 - yc)*dy)
-    c = (x0 - xc)**2 + (y0 - yc)**2 - R*R
-    disc = b*b - 4*a*c
-    if disc < 0: return []
-    s = math.sqrt(max(0.0, disc))
-    out = []
-    for t in ((-b - s)/(2*a), (-b + s)/(2*a)):
-        if -1e-10 <= t <= 1 + 1e-10:
-            out.append((float(x0 + t*dx), float(y0 + t*dy)))
-    # ほぼ同一点の重複除去
-    uniq = []
-    for p in out:
-        if not any(abs(p[0]-q[0])<1e-9 and abs(p[1]-q[1])<1e-9 for q in uniq):
-            uniq.append(p)
-    return uniq
+@dataclass
+class Nail:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    spacing: float            # m（奥行方向の配置間隔：kN/本→kN/m換算用）
+    T_yield: float            # kN（1本）
+    bond_strength: float      # kN/m（付着耐力：定着長1mあたり）
+    embed_length_each_side: float = 0.5  # m（交点から両側の有効定着長：簡易）
 
-def circle_polyline_intersections(xc, yc, R, pl: GroundPL) -> List[Tuple[float,float]]:
+# ---- ユーティリティ ----
+def _dot(ax, ay, bx, by):
+    return ax * bx + ay * by
+
+def _norm(ax, ay):
+    return math.hypot(ax, ay)
+
+def _angle_between(ax, ay, bx, by) -> float:
+    na = _norm(ax, ay); nb = _norm(bx, by)
+    if na == 0 or nb == 0: return 0.0
+    cosv = max(-1.0, min(1.0, _dot(ax, ay, bx, by) / (na * nb)))
+    return math.acos(cosv)
+
+def _line_circle_intersections(x1, y1, x2, y2, xc, yc, R) -> List[Tuple[float, float]]:
+    dx, dy = (x2 - x1), (y2 - y1)
+    fx, fy = (x1 - xc), (y1 - yc)
+    A = dx*dx + dy*dy
+    B = 2*(fx*dx + fy*dy)
+    C = fx*fx + fy*fy - R*R
+    disc = B*B - 4*A*C
     pts = []
-    for i in range(len(pl.X)-1):
-        pts.extend(circle_segment_intersections(xc, yc, R, pl.X[i], pl.Y[i], pl.X[i+1], pl.Y[i+1]))
-    pts = sorted(pts, key=lambda p: p[0])
-    out = []
-    for p in pts:
-        if not out or abs(p[0]-out[-1][0])>1e-8 or abs(p[1]-out[-1][1])>1e-8:
-            out.append(p)
-    return out
+    if disc < 0 or A == 0:
+        return pts
+    sqrt_disc = math.sqrt(disc)
+    for s in (-1.0, 1.0):
+        t = (-B + s*sqrt_disc) / (2*A)
+        if 0.0 <= t <= 1.0:
+            px = x1 + t*dx
+            py = y1 + t*dy
+            pts.append((px, py))
+    return pts
 
-# ----------------- 円弧サンプリング（最良の地表区間） -----------------
-def arc_sample_poly_best_pair(pl: GroundPL, xc, yc, R, n=241, y_floor: float = 0.0):
+def _circle_tangent_at_point(xp, yp, xc, yc):
+    rx, ry = xp - xc, yp - yc
+    tx, ty = -ry, rx
+    n = _norm(tx, ty)
+    if n == 0: return (1.0, 0.0)
+    return (tx/n, ty/n)
+
+# ---- Bishop簡略法（未補強） ----
+def bishop_fs_unreinforced(slices: List[dict], soil: Soil, slip: CircleSlip, water_gamma_red: float = 0.0,
+                           max_iter: int = 80, tol: float = 1e-5) -> float:
     """
-    地表折れ線と円の交点列から、最良の区間 [x1,x2] を選びサンプルする。
-    y_floor で下限（既定: 0.0）を設定。弧が y_floor 未満に潜る区間は不採用。
+    slices: {'width':m, 'alpha':rad, 'W':kN, 'area':m2, 'u':kPa(任意)} のリスト想定（奥行1m）
     """
-    pts = circle_polyline_intersections(xc, yc, R, pl)
-    if len(pts) < 2: return None
-    best = None
-    for i in range(len(pts)-1):
-        (x1,y1),(x2,y2) = pts[i], pts[i+1]
-        if x2 - x1 <= 1e-10:
-            continue
-        xs = np.linspace(x1, x2, n)
-        inside = R*R - (xs - xc)**2
-        if np.any(inside <= 0):
-            continue
-        ys = yc - np.sqrt(inside)
-        # 下限チェック
-        if np.any(ys < y_floor - 1e-9):
-            continue
-        h  = pl.y_at(xs) - ys
-        if np.any(h <= 0) or np.any(~np.isfinite(h)):
-            continue
-        dmax = float(np.max(h))
-        if (best is None) or (dmax > best[-1]):
-            best = (x1, x2, xs, ys, h, dmax)
-    if best is None: return None
-    x1, x2, xs, ys, h, _ = best
-    return x1, x2, xs, ys, h
-
-def _alpha_cos(xc, yc, R, xs):
-    inside = R*R - (xs - xc)**2
-    y_arc = yc - np.sqrt(inside)
-    denom = y_arc - yc
-    denom = np.where(np.abs(denom) < 1e-12, np.sign(denom)*1e-12, denom)
-    dydx  = -(xs - xc) / denom
-    alpha = -np.arctan(dydx)
-    return alpha, np.cos(alpha), y_arc
-
-# ----------------- 複層処理（地層境界：上から順にクリップ） -----------------
-def clip_interfaces_to_ground(ground: GroundPL, interfaces: List[GroundPL], x) -> List[np.ndarray]:
-    Yg = ground.y_at(x)
-    ys_list = []
-    y_top = Yg
-    for pl_if in interfaces:
-        yi = np.minimum(pl_if.y_at(x), y_top)
-        ys_list.append(yi)
-        y_top = yi
-    return ys_list
-
-def barrier_y_from_flags(Yifs: List[np.ndarray], allow_cross: List[bool]) -> np.ndarray:
-    if not Yifs or not allow_cross:
-        return np.full_like(Yifs[0] if Yifs else np.array([0.0]), -1e9, dtype=float)
-    # allow_cross[j]==False の境界より下へは降りない
-    blocked = [Yifs[j] for j in range(len(Yifs)) if not allow_cross[j]]
-    if not blocked:
-        return np.full_like(Yifs[0], -1e9, dtype=float)
-    B = blocked[0].copy()
-    for arr in blocked[1:]:
-        B = np.maximum(B, arr)
-    return B
-
-def base_soil_vectors_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil],
-                            xmid: np.ndarray, y_arc: np.ndarray):
-    nL = len(soils)
-    Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, nL-1)], xmid)
-    if nL == 1:
-        gamma = np.full_like(xmid, soils[0].gamma, dtype=float)
-        c     = np.full_like(xmid, soils[0].c,     dtype=float)
-        phi   = np.full_like(xmid, soils[0].phi,   dtype=float)
-        return gamma, c, phi
-    if nL == 2:
-        Y1 = Yifs[0]
-        mask1 = (y_arc >= Y1)
-        gamma = np.where(mask1, soils[0].gamma, soils[1].gamma)
-        c     = np.where(mask1, soils[0].c,     soils[1].c)
-        phi   = np.where(mask1, soils[0].phi,   soils[1].phi)
-        return gamma.astype(float), c.astype(float), phi.astype(float)
-    Y1, Y2 = Yifs[0], Yifs[1]
-    mask1 = (y_arc >= Y1)
-    mask3 = (y_arc <  Y2)
-    mask2 = ~(mask1 | mask3)
-    gamma = np.where(mask1, soils[0].gamma, np.where(mask2, soils[1].gamma, soils[2].gamma))
-    c     = np.where(mask1, soils[0].c,     np.where(mask2, soils[1].c,     soils[2].c))
-    phi   = np.where(mask1, soils[0].phi,   np.where(mask2, soils[1].phi,   soils[2].phi))
-    return gamma.astype(float), c.astype(float), phi.astype(float)
-
-# ----------------- Fs 計算 -----------------
-def fs_fellenius_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
-                            xc, yc, R, n_slices=40) -> Optional[float]:
-    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201), y_floor=0.0)
-    if s is None: return None
-    x1, x2, xs, ys, h = s
-    xs_e  = np.linspace(x1, x2, n_slices+1)
-    xmid  = 0.5*(xs_e[:-1] + xs_e[1:])
-    dx    = (x2 - x1)/n_slices
-    alpha, cos_a, y_arc = _alpha_cos(xc, yc, R, xmid)
-    if np.any(np.isclose(cos_a,0,atol=1e-10)): return None
-    hmid  = ground.y_at(xmid) - y_arc
-    if np.any(hmid<=0): return None
-    Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, len(soils)-1)], xmid)
-    B    = barrier_y_from_flags(Yifs, allow_cross[:max(0, len(soils)-1)])
-    if np.any(y_arc < B - 1e-9): return None
-    gamma, c, phi = base_soil_vectors_multi(ground, interfaces, soils, xmid, y_arc)
-    b     = dx / cos_a
-    W     = gamma * hmid * dx
-    tanp  = np.tan(phi*DEG)
-    num   = float(np.sum(c*b + W*np.cos(alpha)*tanp))
-    den   = float(np.sum(W*np.sin(alpha)))
-    if den <= 0: return None
-    Fs    = num/den
-    return Fs if (np.isfinite(Fs) and Fs>0) else None
-
-def fs_bishop_poly_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
-                         xc, yc, R, n_slices=40) -> Optional[float]:
-    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201), y_floor=0.0)
-    if s is None: return None
-    x1, x2, xs, ys, h = s
-    xs_e  = np.linspace(x1, x2, n_slices+1)
-    xmid  = 0.5*(xs_e[:-1] + xs_e[1:])
-    dx    = (x2 - x1)/n_slices
-    alpha, cos_a, y_arc = _alpha_cos(xc, yc, R, xmid)
-    if np.any(np.isclose(cos_a,0,atol=1e-10)): return None
-    hmid  = ground.y_at(xmid) - y_arc
-    if np.any(hmid<=0): return None
-    Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, len(soils)-1)], xmid)
-    B    = barrier_y_from_flags(Yifs, allow_cross[:max(0, len(soils)-1)])
-    if np.any(y_arc < B - 1e-9): return None
-    gamma, c, phi = base_soil_vectors_multi(ground, interfaces, soils, xmid, y_arc)
-    b     = dx / cos_a
-    W     = gamma * hmid * dx
-    tanp  = np.tan(phi*DEG)
-    Fs    = 1.3
-    for _ in range(120):
-        denom_a = 1.0 + (tanp*np.tan(alpha))/max(Fs,1e-12)
-        num = float(np.sum((c*b + W*tanp*np.cos(alpha))/denom_a))
-        den = float(np.sum(W*np.sin(alpha)))
-        if den <= 0: return None
-        Fs_new = num/den
-        if not (np.isfinite(Fs_new) and Fs_new>0): return None
-        if abs(Fs_new-Fs) < 1e-6: return float(Fs_new)
+    phi = math.radians(soil.phi)
+    c = soil.c
+    Fs = 1.2
+    for _ in range(max_iter):
+        num = 0.0
+        den = 0.0
+        for s in slices:
+            alpha = s['alpha']
+            W = max(0.0, s['W'] - water_gamma_red * s.get('area', 0.0))
+            b = s['width']
+            m = 1.0 + (math.tan(phi) * math.sin(alpha)) / max(Fs, 1e-6)
+            Np = (W * math.cos(alpha)) / m
+            shear_res = c * b + (Np * math.tan(phi))
+            num += shear_res
+            den += W * math.sin(alpha)
+        Fs_new = num / max(den, 1e-9)
+        if abs(Fs_new - Fs) < tol:
+            return max(Fs_new, 1e-6)
         Fs = Fs_new
-    return float(Fs)
+    return max(Fs, 1e-6)
 
-def fs_given_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
-                     method: str, xc: float, yc: float, R: float, n_slices: int) -> Optional[float]:
-    if method.lower().startswith("b"):
-        return fs_bishop_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices)
-    else:
-        return fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices)
+# ---- ネイル寄与付き：補強後Fs ----
+def bishop_fs_with_nails(slices: List[dict], soil: Soil, slip: CircleSlip, nails: List[Nail],
+                         water_gamma_red: float = 0.0, max_iter: int = 80, tol: float = 1e-5) -> float:
+    """
+    ネイル寄与＝円弧接線方向の抵抗力T_tanをモーメント化し加算：M_reinf = Σ(T_tan * R)
+    T_tan = T_axial * |cos(δ)|、T_axial = min(T_yield, bond_strength*L_embed)/spacing
+    """
+    Fs = bishop_fs_unreinforced(slices, soil, slip, water_gamma_red, max_iter=30, tol=1e-4)
 
-# 追加：必要抑止力計算で使う駆動項 D = Σ(W sinα)
-def driving_sum_for_R_multi(ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
-                            xc, yc, R, n_slices=40) -> Optional[Tuple[float,float,float]]:
-    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201), y_floor=0.0)
-    if s is None: return None
-    x1, x2, xs, ys, h = s
-    xs_e  = np.linspace(x1, x2, n_slices+1)
-    xmid  = 0.5*(xs_e[:-1] + xs_e[1:])
-    dx    = (x2 - x1)/n_slices
-    alpha, cos_a, y_arc = _alpha_cos(xc, yc, R, xmid)
-    if np.any(np.isclose(cos_a,0,atol=1e-10)): return None
-    hmid  = ground.y_at(xmid) - y_arc
-    if np.any(hmid<=0): return None
-    Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, len(soils)-1)], xmid)
-    B    = barrier_y_from_flags(Yifs, allow_cross[:max(0, len(soils)-1)])
-    if np.any(y_arc < B - 1e-9): return None
-    gamma, c, phi = base_soil_vectors_multi(ground, interfaces, soils, xmid, y_arc)
-    W     = gamma * hmid * dx
-    D_sum = float(np.sum(W*np.sin(alpha)))
-    if D_sum <= 0 or not np.isfinite(D_sum): return None
-    return D_sum, float(x1), float(x2)
+    phi = math.radians(soil.phi)
+    c = soil.c
+    R = slip.R
 
-# ----------------- 円弧候補の生成（中心→{x,depth}格子からRを作る） -----------------
-def _R_from_x_and_depth(ground: GroundPL, xc: float, yc: float, x: float, h: float) -> float:
-    yg = float(ground.y_at(x))
-    return math.sqrt(max(0.0, (yg - h - yc)**2 + (x - xc)**2))
+    for _ in range(max_iter):
+        num = 0.0
+        den = 0.0
+        M_reinf = 0.0
 
-def arcs_from_center_by_entries_multi(
-    ground: GroundPL, soils: List[Soil], xc: float, yc: float,
-    n_entries: int, method: str,
-    depth_min: float, depth_max: float,
-    interfaces: List[GroundPL], allow_cross: List[bool],
-    quick_mode: bool, n_slices_quick: int,
-    limit_arcs_per_center: int, probe_n_min: int,
-) -> Iterable[Tuple[float,float,float,float]]:
-    if n_entries < 2 or depth_max <= 0 or depth_max < depth_min:
-        return
-    x0, x1 = float(ground.X[0]), float(ground.X[-1])
-    xs = np.linspace(x0+1e-6, x1-1e-6, n_entries)
-    n_depth = max(5, int(round((depth_max - depth_min)/max(0.5, (depth_max - depth_min)/10))) + 1)
-    hs = np.linspace(max(0.01, depth_min), depth_max, n_depth)
-    count = 0
-    for xi in xs:
-        for h in hs:
-            R = _R_from_x_and_depth(ground, xc, yc, float(xi), float(h))
-            if not (np.isfinite(R) and R > 0.5):
+        for s in slices:
+            alpha = s['alpha']
+            W = max(0.0, s['W'] - water_gamma_red * s.get('area', 0.0))
+            b = s['width']
+            m = 1.0 + (math.tan(phi) * math.sin(alpha)) / max(Fs, 1e-6)
+            Np = (W * math.cos(alpha)) / m
+            shear_res = c * b + (Np * math.tan(phi))
+            num += shear_res
+            den += W * math.sin(alpha)
+
+        for nail in nails:
+            pts = _line_circle_intersections(nail.x1, nail.y1, nail.x2, nail.y2, slip.xc, slip.yc, R)
+            if not pts:
                 continue
-            n_probe = max(probe_n_min, 201) if not quick_mode else max(101, probe_n_min)
-            s = arc_sample_poly_best_pair(ground, xc, yc, R, n=n_probe, y_floor=0.0)
-            if s is None:
+            pts_sorted = sorted(pts, key=lambda p: (p[0]-slip.xc)**2 + (p[1]-slip.yc)**2)
+            xp, yp = pts_sorted[0]
+
+            tx, ty = _circle_tangent_at_point(xp, yp, slip.xc, slip.yc)
+            nx, ny = (nail.x2 - nail.x1), (nail.y2 - nail.y1)
+            nlen = _norm(nx, ny)
+            if nlen == 0: 
                 continue
-            a_x1, a_x2, _xs, _ys, _h = s
-            Fs_q = fs_fellenius_poly_multi(ground, interfaces, soils, allow_cross, xc, yc, R, n_slices=n_slices_quick)
-            if Fs_q is None:
-                continue
-            yield float(a_x1), float(a_x2), float(R), float(Fs_q)
-            count += 1
-            if count >= limit_arcs_per_center:
-                return
+            nx_u, ny_u = nx / nlen, ny / nlen
 
-# ----------------- サンプル地形（UI用） -----------------
-def make_ground_example(H: float, L: float) -> GroundPL:
-    X = np.array([0.0, 0.30*L, 0.63*L, L], dtype=float)
-    Y = np.array([H,   0.88*H, 0.46*H, 0.0], dtype=float)
-    return GroundPL(X=X, Y=Y)
+            delta = _angle_between(nx_u, ny_u, tx, ty)
 
-def make_interface1_example(H: float, L: float) -> GroundPL:
-    X = np.array([0.0, 0.35*L, 0.70*L, L], dtype=float)
-    Y = np.array([0.70*H, 0.60*H, 0.38*H, 0.20*H], dtype=float)
-    return GroundPL(X=X, Y=Y)
+            L_embed = nail.embed_length_each_side * 2.0
+            T_pullout = nail.bond_strength * L_embed           # kN/本
+            T_axial_1 = min(nail.T_yield, T_pullout)           # kN/本
+            T_axial   = T_axial_1 / max(nail.spacing, 1e-6)    # kN/m（1m幅）
 
-def make_interface2_example(H: float, L: float) -> GroundPL:
-    X = np.array([0.0, 0.40*L, 0.75*L, L], dtype=float)
-    Y = np.array([0.45*H, 0.38*H, 0.22*H, 0.10*H], dtype=float)
-    return GroundPL(X=X, Y=Y)
+            T_tan = T_axial * abs(math.cos(delta))
+            M_reinf += T_tan * R
 
-__all__ = [
-    "Soil","GroundPL",
-    "make_ground_example","make_interface1_example","make_interface2_example",
-    "arc_sample_poly_best_pair","circle_polyline_intersections",
-    "clip_interfaces_to_ground","barrier_y_from_flags","base_soil_vectors_multi",
-    "fs_fellenius_poly_multi","fs_bishop_poly_multi","fs_given_R_multi",
-    "arcs_from_center_by_entries_multi","driving_sum_for_R_multi",
-]
+        Fs_new = (num * R + M_reinf) / max(den * R, 1e-9)
+        if abs(Fs_new - Fs) < tol:
+            return max(Fs_new, 1e-6)
+        Fs = Fs_new
+
+    return max(Fs, 1e-6)
