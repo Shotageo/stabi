@@ -560,12 +560,30 @@ elif page.startswith("3"):
 # ===================== Page4: ネイル配置 =====================
 elif page.startswith("4"):
     H,L,ground = make_ground_from_cfg()
+
+    # ★ レイヤー定義（不足していたので追加）
+    n_layers = int(cfg_get("layers.n"))
+    interfaces = []
+    if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
+    if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
+
     st.subheader("ソイルネイル配置（試作：頭位置のみ）")
+
+    # --- まず chosen_arc を堅牢化：無ければ unreinforced から復元して保存
     arc = cfg_get("results.chosen_arc")
     if not arc:
-        st.info("Page3でMin Fs円弧を確定してから来てね。"); st.stop()
+        res_un = cfg_get("results.unreinforced")
+        if res_un and "center" in res_un and "refined" in res_un and res_un["refined"]:
+            xc,yc = res_un["center"]
+            idx = res_un.get("idx_minFs", int(np.argmin([d["Fs"] for d in res_un["refined"]])))
+            d = res_un["refined"][idx]
+            arc = dict(xc=xc, yc=yc, R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"])
+            cfg_set("results.chosen_arc", arc)  # ← 保存
+        else:
+            st.info("未補強の Min Fs 円弧が未確定です。Page3 で「▶ 計算開始（未補強）」を実行してから来てください。")
+            st.stop()
 
-    # UI seed（現状は頭位置だけ）
+    # --- UI seed（現状は頭位置だけ）
     nails = cfg_get("nails")
     ui_seed("s_start", nails["s_start"]); ui_seed("s_end", nails["s_end"])
     ui_seed("S_surf", nails["S_surf"]);   ui_seed("S_row", nails["S_row"])
@@ -574,34 +592,44 @@ elif page.startswith("4"):
     ui_seed("beta_deg", nails["beta_deg"]); ui_seed("delta_beta", nails["delta_beta"])
     ui_seed("L_mode", nails["L_mode"]); ui_seed("L_nail", nails["L_nail"]); ui_seed("d_embed", nails["d_embed"])
 
+    # --- 斜面の測地長（s）をつくる
     Xd = np.linspace(ground.X[0], ground.X[-1], 1200)
     Yg = np.array([float(ground.y_at(x)) for x in Xd])
     seg = np.sqrt(np.diff(Xd)**2 + np.diff(Yg)**2)
     s_cum = np.concatenate([[0.0], np.cumsum(seg)])
     s_total = float(s_cum[-1])
 
+    # --- 入力 UI
     st.slider("s_start (m)", 0.0, s_total, step=0.5, key="s_start", value=float(st.session_state["s_start"]))
     st.slider("s_end (m)", st.session_state["s_start"], s_total, step=0.5, key="s_end", value=float(st.session_state["s_end"]))
     st.slider("斜面ピッチ S_surf (m)", 0.5, 5.0, step=0.1, key="S_surf", value=float(st.session_state["S_surf"]))
     st.slider("段間隔 S_row (法線方向 m) [未実装]", 0.5, 5.0, step=0.5, key="S_row", value=float(st.session_state["S_row"]))
     st.number_input("段数（表示のみ）", 1, 5, step=1, key="tiers", value=int(st.session_state["tiers"]))
-    st.radio("角度モード", ["Slope-Normal (⊥斜面)", "Horizontal-Down (β°)"], key="angle_mode", index=["Slope-Normal (⊥斜面)","Horizontal-Down (β°)"].index(st.session_state["angle_mode"]))
+
+    st.radio("角度モード", ["Slope-Normal (⊥斜面)", "Horizontal-Down (β°)"],
+             key="angle_mode",
+             index=["Slope-Normal (⊥斜面)","Horizontal-Down (β°)"].index(st.session_state["angle_mode"]))
     if st.session_state["angle_mode"].endswith("β°"):
         st.slider("β（水平から下向き °）", 0.0, 45.0, step=1.0, key="beta_deg", value=float(st.session_state["beta_deg"]))
     else:
         st.slider("法線からの微調整 ±Δβ（°）", -10.0, 10.0, step=1.0, key="delta_beta", value=float(st.session_state["delta_beta"]))
-    st.radio("長さモード", ["パターン1：固定長", "パターン2：すべり面より +Δm", "パターン3：FS目標で自動"], key="L_mode", index=["パターン1：固定長","パターン2：すべり面より +Δm","パターン3：FS目標で自動"].index(st.session_state["L_mode"]))
+
+    st.radio("長さモード", ["パターン1：固定長", "パターン2：すべり面より +Δm", "パターン3：FS目標で自動"],
+             key="L_mode",
+             index=["パターン1：固定長","パターン2：すべり面より +Δm","パターン3：FS目標で自動"].index(st.session_state["L_mode"]))
     if st.session_state["L_mode"]=="パターン1：固定長":
         st.slider("ネイル長 L (m)", 1.0, 15.0, step=0.5, key="L_nail", value=float(st.session_state["L_nail"]))
     elif st.session_state["L_mode"]=="パターン2：すべり面より +Δm":
         st.slider("すべり面より +Δm (m)", 0.0, 5.0, step=0.5, key="d_embed", value=float(st.session_state["d_embed"]))
 
+    # --- s→(x,y)補間関数
     def x_at_s(sv):
         idx = np.searchsorted(s_cum, sv, side="right")-1
         idx = max(0, min(idx, len(Xd)-2))
         t = (sv - s_cum[idx]) / (seg[idx] if seg[idx]>1e-12 else 1e-12)
         return float((1-t)*Xd[idx] + t*Xd[idx+1])
 
+    # --- 自動配置（頭位置）
     s_vals = list(np.arange(st.session_state["s_start"], st.session_state["s_end"]+1e-9, st.session_state["S_surf"]))
     nail_heads = [(x_at_s(sv), float(ground.y_at(x_at_s(sv)))) for sv in s_vals]
     cfg_set("results.nail_heads", nail_heads)
@@ -620,19 +648,23 @@ elif page.startswith("4"):
         cfg_set("nails.d_embed", float(st.session_state.get("d_embed", 1.0)))
         st.success("cfgに保存しました。")
 
-    # 表示
+    # --- 図化
     fig,ax = plt.subplots(figsize=(10.0,7.0))
     Xd2,Yg2 = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd2, Yg2)
+
     xc,yc,R = arc["xc"],arc["yc"],arc["R"]
     xs=np.linspace(arc["x1"], arc["x2"], 400)
     ys=yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
     ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Chosen slip arc (Fs={arc['Fs']:.3f})")
+
     NH = cfg_get("results.nail_heads", [])
     if NH:
         ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
+
 
 # ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
