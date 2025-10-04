@@ -85,15 +85,8 @@ layers = cfg["layers"]
 with st.expander("層を追加", expanded=False):
     c1, c2, c3 = st.columns(3)
     with c1:
-        z_top = st.number_input("層上端 z_top [m]", -100, 100, 8.0)
-        z_bot = st.number_input("層下端 z_bot [m]", -100, 100, 4.0)
-    with c2:
-        color = st.color_picker("色", "#e7d7a8")
-        name = st.text_input("層名", "Layer")
-    with c3:
-        if st.button("＋追加"):
-            layers.append({"name": name, "z_top": z_top, "z_bot": z_bot, "color": color})
-            st.success("層を追加しました。")
+        z_top = st.number_input("層上端 z_top [m]", -100.0, 100.0, 8.0)
+        z_bot = st.number_input("層下端 z_bot [m]", -100.0, 100.0, 4.0)
 
 if layers:
     st.write(f"登録済み層数: {len(layers)}")
