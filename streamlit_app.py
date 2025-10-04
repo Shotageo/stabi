@@ -1,6 +1,12 @@
 # streamlit_app.py — ソイルネイル統合・最小円弧オート保存版（フル）
 
 from __future__ import annotations
+import os, sys
+# パッケージ（stabi）を親ディレクトリから解決できるようにする
+_PKG_DIR = os.path.dirname(__file__)          # .../stabi
+_PARENT  = os.path.dirname(_PKG_DIR)          # .../
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
 
 # ===== 標準/外部ライブラリ =====
 import math, time, heapq
