@@ -7,6 +7,26 @@ import streamlit as st
 
 from stabi_lem import Soil, CircleSlip, generate_slices_on_arc, bishop_fs_unreinforced, circle_xy_from_theta
 
+# --- 横断図プレビュー（読み取り専用） ---
+H    = float(st.session_state.get("H", 12.0))
+beta = float(st.session_state.get("beta_deg", 35.0))
+x_left  = float(st.session_state.get("x_left", -1.0))
+x_right = float(st.session_state.get("x_right",  1.0))
+y_min   = float(st.session_state.get("y_min",  -10.0))
+y_max   = float(st.session_state.get("y_max",   10.0))
+tanb = math.tan(math.radians(beta))
+def ground_y_at(X): return H - tanb * X
+
+with st.expander("横断図プレビュー（確認用）", expanded=False):
+    Xv = np.linspace(x_left, x_right, 400)
+    Yv = ground_y_at(Xv)
+    figv, axv = plt.subplots(figsize=(9, 3))
+    axv.plot(Xv, Yv, lw=2)
+    axv.set_aspect('equal', 'box')
+    axv.set_xlim(x_left, x_right); axv.set_ylim(y_min, y_max)
+    axv.grid(True, alpha=0.3); axv.set_xlabel("x [m]"); axv.set_ylabel("y [m]")
+    st.pyplot(figv)
+
 st.set_page_config(page_title="安定板２｜3) 円弧探索（無補強）", layout="wide")
 st.sidebar.header("Plot style")
 theme = st.sidebar.selectbox("Theme", ["default", "dark_background"])
