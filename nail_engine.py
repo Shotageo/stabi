@@ -25,7 +25,7 @@ def reinforce_nails(arc: dict, ground, soils, nails_cfg: dict, slices: dict):
     # materials
     d_g = float(nails_cfg.get("d_g", 0.125))      # m
     d_s = float(nails_cfg.get("d_s", 0.022))      # m
-    fy  = float(nails_cfg.get("fy", 1000.0))      # MPa = N/mm^2
+    fy  = float(nails_cfg.get("fy", 1000.0))      # MPa
     gamma_m = float(nails_cfg.get("gamma_m", 1.2))
     tau_cap = float(nails_cfg.get("tau_grout_cap_kPa", 150.0))  # kPa = kN/m^2
 
@@ -34,18 +34,18 @@ def reinforce_nails(arc: dict, ground, soils, nails_cfg: dict, slices: dict):
     delta = float(nails_cfg.get("delta_beta", 0.0)) * DEG
     L_mode  = str(nails_cfg.get("L_mode", "パターン1：固定長"))
     L_nail  = float(nails_cfg.get("L_nail", 5.0))
-    d_embed = float(nails_cfg.get("d_embed", 1.0))
+    d_embed = float(nails_cfg.get("d_embed", 1.0))  # パターン2：すべり面より +Δm
 
     for (xh, yh) in heads:
-        # 方向角
+        # --- 方向角：斜面法線は “地山側” へ（+π/2）
         if angle_mode.startswith("Slope-Normal"):
             tau = _slope_tangent_angle(ground, float(xh))
-            theta = tau - math.pi/2 + delta
+            theta = tau + math.pi/2 + delta
         else:
-            theta = -beta
+            theta = -beta  # 水平から下向きβ°
         ct, st = math.cos(theta), math.sin(theta)
 
-        # 交点（光線） p(t)=(xh,yh)+t*(ct,st), t>0 の最小解を採用
+        # --- 円との交点（光線：t>0 最小根）
         B = 2*((xh - xc)*ct + (yh - yc)*st)
         C = (xh - xc)**2 + (yh - yc)**2 - R**2
         disc = B*B - 4*C
@@ -56,26 +56,26 @@ def reinforce_nails(arc: dict, ground, soils, nails_cfg: dict, slices: dict):
         t_pos = [t for t in t_candidates if t > EPS]
         if not t_pos:
             hits.append(dict(reason="intersection_behind", xq=None, yq=None, idx=None, Tt=0.0)); continue
-        t = min(t_pos)  # ← 最初の貫入点
+        t = min(t_pos)
         xq, yq = float(xh + t*ct), float(yh + t*st)
 
-        # ボンド長
-        if L_mode.startswith("パターン2"):
-            L_bond = max(0.0, L_nail - t + d_embed)
-        else:
+        # --- ボンド長
+        if L_mode.startswith("パターン2"):            # すべり面より +Δm
+            L_bond = max(0.0, d_embed)               # ← Δm をそのままボンド長に採用
+        else:                                        # 固定長
             L_bond = max(0.0, L_nail - t)
         if L_bond < 0.20:
             hits.append(dict(reason="short_bond", xq=xq, yq=yq, idx=None, Tt=0.0)); continue
 
-        # 能力（単位訂正）
-        # τ[kPa]=kN/m^2 × (π d_g L)[m^2] → kN/m（2D幅=1m）
-        T_bond  = tau_cap * (math.pi * d_g * L_bond)                 # ← 1e-3 は不要
-        # fy[MPa]=N/mm^2 → A_s[m^2]*fy*1e6[N] /1000 = A_s*fy*1e3[kN]
+        # --- 能力（単位整合）
+        # τ[kPa]=kN/m^2 × (π d_g L)[m^2] → kN/m
+        T_bond  = tau_cap * (math.pi * d_g * L_bond)
+        # fy[MPa]→kN: A[m^2] * fy[MPa]*1e3[kN/m^2]
         A_s     = math.pi * (d_s**2) / 4.0
-        T_steel = (A_s * fy * 1e3) / gamma_m                         # ← *1e3 を付与
+        T_steel = (A_s * fy * 1e3) / gamma_m
         T_cap   = min(T_bond, T_steel)
 
-        # 所属スライスと投影
+        # --- スライス所属 & 投影（負は寄与なし）
         idx = int(np.searchsorted(xmid, xq) - 1)
         idx = max(0, min(idx, N-1))
         proj = math.cos(theta - float(alpha[idx]))
