@@ -1,4 +1,4 @@
-# stabi_lem.py — full module (centers→R生成/検査/FS評価まで一気通貫)
+# stabi_lem.py — LEM core (centers→R生成/検査/FS評価まで一気通貫)
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Iterable
@@ -309,41 +309,6 @@ def make_interface2_example(H: float, L: float) -> GroundPL:
     Y = np.array([0.45*H, 0.38*H, 0.22*H, 0.10*H], dtype=float)
     return GroundPL(X=X, Y=Y)
 
-# ===================== Slices 抽出（連成用の共通前処理） =====================
-# ===================== Slices 抽出（連成前処理） =====================
-def compute_slices_poly_multi(
-    ground: GroundPL, interfaces: List[GroundPL], soils: List[Soil], allow_cross: List[bool],
-    xc: float, yc: float, R: float, n_slices: int = 40
-):
-    s = arc_sample_poly_best_pair(ground, xc, yc, R, n=max(2*n_slices+1,201), y_floor=0.0)
-    if s is None: return None
-    x1, x2, xs, ys, h = s
-    xs_e  = np.linspace(x1, x2, n_slices+1)
-    xmid  = 0.5*(xs_e[:-1] + xs_e[1:])
-    dx    = (x2 - x1)/n_slices
-    alpha, cos_a, y_arc = _alpha_cos(xc, yc, R, xmid)
-    if np.any(np.isclose(cos_a,0,atol=1e-10)): return None
-    hmid  = ground.y_at(xmid) - y_arc
-    if np.any(hmid<=0): return None
-    Yifs = clip_interfaces_to_ground(ground, interfaces[:max(0, len(soils)-1)], xmid)
-    B    = barrier_y_from_flags(Yifs, allow_cross[:max(0, len(soils)-1)])
-    if np.any(y_arc < B - 1e-9): return None
-    gamma, c, phi = base_soil_vectors_multi(ground, interfaces, soils, xmid, y_arc)
-    b     = dx / cos_a
-    W     = gamma * hmid * dx
-    if np.any(W<=0) or not np.isfinite(dx): return None
-    return {
-        "x_mid": xmid.astype(float),
-        "alpha": alpha.astype(float),
-        "b":     b.astype(float),
-        "h":     hmid.astype(float),
-        "W":     W.astype(float),
-        "y_arc": y_arc.astype(float),
-        "dx":    float(dx),
-    }
-
-
-
 __all__ = [
     "Soil","GroundPL",
     "make_ground_example","make_interface1_example","make_interface2_example",
@@ -351,5 +316,4 @@ __all__ = [
     "clip_interfaces_to_ground","barrier_y_from_flags","base_soil_vectors_multi",
     "fs_fellenius_poly_multi","fs_bishop_poly_multi","fs_given_R_multi",
     "arcs_from_center_by_entries_multi","driving_sum_for_R_multi",
-    "compute_slices_poly_multi",          # ← これを追加
 ]
