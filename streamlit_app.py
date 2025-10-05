@@ -1,91 +1,17 @@
-# streamlit_app.py — Stabi LEM + Soil Nail（安定・一括貼替版）
+# streamlit_app.py — Stabi LEM 多段UI + SoilNail簡易合成（安定版・フル）
 from __future__ import annotations
 
-# ====== Imports ======
-import os, sys, math, time, heapq
+# ===== 基本import =====
+import math, time, heapq
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
-ST = st  # ← 保険：どこかで st を数値で上書きしても ST を残す
 
-# ---- stabi_lem の import（パッケージ/単体の両対応）----
-try:
-    import stabi.stabi_lem as lem
-except ModuleNotFoundError:
-    import stabi_lem as lem
-
-# ★ “lem”経由で必要シンボルを束ねる（from lem import ... は使わない）
-Soil = lem.Soil
-GroundPL = lem.GroundPL
-make_ground_example = lem.make_ground_example
-make_interface1_example = lem.make_interface1_example
-make_interface2_example = lem.make_interface2_example
-clip_interfaces_to_ground = lem.clip_interfaces_to_ground
-arcs_from_center_by_entries_multi = lem.arcs_from_center_by_entries_multi
-fs_given_R_multi = lem.fs_given_R_multi
-arc_sample_poly_best_pair = lem.arc_sample_poly_best_pair
-driving_sum_for_R_multi = lem.driving_sum_for_R_multi
-
-# ---- nail_engine / coupler が無い場合のフォールバック ----
-try:
-    from nail_engine import reinforce_nails
-except Exception:
-    def reinforce_nails(arc, ground, soils, nails_cfg, slices):
-        N = len(slices.get("x_mid", []))
-        return np.zeros(N, dtype=float), {"hits": [], "notes": "nail_engine not found"}
-
-try:
-    from coupler import bishop_with_reinforcement
-except Exception:
-    def bishop_with_reinforcement(slices, soil, Tt):
-        D = float(np.sum(slices["W"] * np.sin(slices["alpha"])))
-        if D <= 0: return slices.get("Fs0", np.nan)
-        return slices.get("Fs0", 1.0) + float(np.sum(Tt)) / D
+# ===== LEMコア（同階層 stabi_lem.py） =====
+import stabi_lem as lem
 
 st.set_page_config(page_title="Stabi LEM｜cfg一元・安定版", layout="wide")
 st.title("Stabi LEM｜多段UI（cfg一元・安定版）")
-
-DEG = math.pi / 180.0
-
-# ========= 共通ヘルパ =========
-def inward_normal_angle(g: GroundPL, x: float, delta_beta_deg: float) -> float:
-    """
-    斜面接線角 tau から ±90° の法線2候補を作り，
-    **常に地山側（下向き: sinθ < 0）** を選んで返す。
-    """
-    x2 = x + 1e-4
-    y1 = float(g.y_at(x)); y2 = float(g.y_at(x2))
-    tau = math.atan2((y2 - y1), (x2 - x))
-    db = float(delta_beta_deg) * DEG
-    cand1 = tau - math.pi/2 + db
-    cand2 = tau + math.pi/2 + db
-    th = cand1 if math.sin(cand1) < 0 else cand2
-    if math.sin(th) >= 0:  # 念のため保険
-        th -= math.pi
-    return th
-
-def nail_ray_hit_circle(xh, yh, theta, xc, yc, R):
-    """ネイル頭(xh,yh)から方向thetaの光線と円の交点距離 t（t>0 の最小）"""
-    ct, snt = math.cos(theta), math.sin(theta)
-    B = 2 * ((xh - xc) * ct + (yh - yc) * snt)
-    C = (xh - xc)**2 + (yh - yc)**2 - R**2
-    disc = B*B - 4*C
-    if disc <= 0:
-        return None
-    rt = math.sqrt(max(0.0, disc))
-    cand = [(-B - rt) / 2.0, (-B + rt) / 2.0]
-    tpos = [t for t in cand if t > 1e-9]
-    return (min(tpos) if tpos else None)
-
-def grout_pullout_capacity_kNm_per_m(d_g, Lb, tau_kPa):
-    """τ[kPa]=kN/m^2, 周長 π d_g, 長さ Lb → kN/m（2D 1m幅）"""
-    return math.pi * float(d_g) * float(max(0.0, Lb)) * float(max(0.0, tau_kPa))
-
-def steel_tension_capacity_kN_per_m(d_s, fy_MPa, gamma_m):
-    """As=π d^2/4, fy[MPa]×1000=kN/m^2 → kN/m"""
-    As = math.pi * (float(d_s)**2) / 4.0
-    fy_kNm2 = float(fy_MPa) * 1000.0
-    return As * fy_kNm2 / max(1.0, float(gamma_m))
 
 # ===================== cfg（正本） =====================
 def default_cfg():
@@ -99,10 +25,12 @@ def default_cfg():
                 2: {"gamma": 19.0, "c": 8.0,  "phi": 28.0, "tau": 180.0},
                 3: {"gamma": 20.0, "c": 12.0, "phi": 25.0, "tau": 200.0},
             },
-            "tau_grout_cap_kPa": 150.0,
-            "d_g": 0.125,  # m
-            "d_s": 0.022,  # m
-            "fy": 1000.0, "gamma_m": 1.20, "mu": 0.0,
+            "tau_grout_cap_kPa": 150.0,   # グラウト-地山付着上限
+            "d_g": 0.125,                 # グラウト径 [m]
+            "d_s": 0.022,                 # 鋼材径 [m]
+            "fy": 1000.0,                 # MPa
+            "gamma_m": 1.20,
+            "mu": 0.3,                    # 逓減係数
         },
         "grid": {
             "x_min": None, "x_max": None, "y_min": None, "y_max": None,
@@ -117,21 +45,24 @@ def default_cfg():
             "tiers": 1,
             "angle_mode": "Slope-Normal (⊥斜面)",
             "beta_deg": 15.0, "delta_beta": 0.0,
-            "L_mode": "パターン1：固定長", "L_nail": 5.0, "d_embed": 1.0,
+            "L_mode": "パターン2：すべり面より +Δm",
+            "L_nail": 5.0, "d_embed": 1.0,
         },
         "results": {
-            "unreinforced": None,
+            "unreinforced": None,   # {"center":(xc,yc),"refined":[...],"idx_minFs":int}
             "chosen_arc": None,
             "nail_heads": [],
             "reinforced": None,
         }
     }
 
-# --- 数値キー対応 cfg_get/cfg_set/ui_seed ---
+# --- 数値キーを安全に辿る cfg_get/cfg_set ---
 def _maybe_int_key(p):
     if isinstance(p, str) and p.isdigit():
-        try: return int(p)
-        except: return p
+        try:
+            return int(p)
+        except Exception:
+            return p
     return p
 
 def cfg_get(path, default=None):
@@ -142,11 +73,13 @@ def cfg_get(path, default=None):
             if p in node: node = node[p]
             elif p_try in node: node = node[p_try]
             else: return default
-        else: return default
+        else:
+            return default
     return node
 
 def cfg_set(path, value):
-    node = st.session_state["cfg"]; parts = path.split(".")
+    node = st.session_state["cfg"]
+    parts = path.split(".")
     for p in parts[:-1]:
         p_try = _maybe_int_key(p)
         if isinstance(node, dict):
@@ -157,8 +90,10 @@ def cfg_set(path, value):
         else:
             raise KeyError(f"cfg_set: '{p}' below is not a dict")
     last = _maybe_int_key(parts[-1])
-    if isinstance(node, dict): node[last] = value
-    else: raise KeyError(f"cfg_set: cannot set at '{parts[-1]}'")
+    if isinstance(node, dict):
+        node[last] = value
+    else:
+        raise KeyError(f"cfg_set: cannot set at '{parts[-1]}'")
 
 def ui_seed(key, value):
     if key not in st.session_state:
@@ -168,23 +103,29 @@ def ui_seed(key, value):
 if "cfg" not in st.session_state:
     st.session_state["cfg"] = default_cfg()
 
-# ===== サイドバー（ページ選択／初期化）=====
-with st.sidebar:
-    st.header("Pages")
-    page = st.radio(
-        "",
-        ["1) 地形・水位", "2) 地層・材料", "3) 円弧探索（未補強）", "4) ネイル配置", "5) 補強後解析"],
-        key="__page__"
-    )
-    st.caption("cfgが正本。保存しない限り自動上書きしません。")
-    if st.button("⚠ すべて初期化（cfgを再作成）"):
-        st.session_state["cfg"] = default_cfg()
-        st.success("初期化しました。")
+# ===================== 共通小物 =====================
+QUALITY = {
+    "Coarse": dict(quick_slices=10, final_slices=30, n_entries_final=900,  probe_n_min_quick=81,
+                   limit_arcs_quick=80,  show_k=60,  coarse_subsample="every 3rd",
+                   coarse_entries=160, coarse_limit_arcs=50, coarse_probe_min=61,
+                   budget_coarse_s=0.6, budget_quick_s=0.9),
+    "Normal": dict(quick_slices=12, final_slices=40, n_entries_final=1300, probe_n_min_quick=101,
+                   limit_arcs_quick=120, show_k=120, coarse_subsample="every 2nd",
+                   coarse_entries=220, coarse_limit_arcs=70, coarse_probe_min=81,
+                   budget_coarse_s=0.8, budget_quick_s=1.2),
+    "Fine": dict(quick_slices=16, final_slices=50, n_entries_final=1700, probe_n_min_quick=121,
+                 limit_arcs_quick=160, show_k=180, coarse_subsample="full",
+                 coarse_entries=320, coarse_limit_arcs=100, coarse_probe_min=101,
+                 budget_coarse_s=1.2, budget_quick_s=1.8),
+    "Very-fine": dict(quick_slices=20, final_slices=60, n_entries_final=2200, probe_n_min_quick=141,
+                      limit_arcs_quick=220, show_k=240, coarse_subsample="full",
+                      coarse_entries=420, coarse_limit_arcs=140, coarse_probe_min=121,
+                      budget_coarse_s=1.8, budget_quick_s=2.6),
+}
 
-# ========= 描画小物 =========
 def make_ground_from_cfg():
     H = float(cfg_get("geom.H")); L = float(cfg_get("geom.L"))
-    return H, L, make_ground_example(H,L)
+    return H, L, lem.make_ground_example(H, L)
 
 def set_axes(ax, H, L, ground):
     x_upper = max(1.18*L, float(ground.X[-1])+0.05*L, 100.0)
@@ -193,17 +134,28 @@ def set_axes(ax, H, L, ground):
     ax.set_ylim(0.0, y_upper)
     ax.set_aspect("equal", adjustable="box")
 
+def fs_to_color(fs):
+    if fs < 1.0: return (0.85,0,0)
+    if fs < 1.2:
+        t=(fs-1.0)/0.2; return (1.0,0.50+0.50*t,0.0)
+    return (0.0,0.55,0.0)
+
+def clip_yfloor(xs, ys, y_floor=0.0):
+    m = ys >= (y_floor - 1e-12)
+    if np.count_nonzero(m) < 2: return None
+    return xs[m], ys[m]
+
 def draw_layers_and_ground(ax, ground, n_layers, interfaces):
     Xd = np.linspace(ground.X[0], ground.X[-1], 600)
     Yg = np.array([float(ground.y_at(x)) for x in Xd])
     if n_layers==1:
         ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
     elif n_layers==2:
-        Y1 = clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
+        Y1 = lem.clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
         ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
         ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
     else:
-        Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
+        Y1,Y2 = lem.clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
         ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
         ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
         ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
@@ -225,24 +177,14 @@ def draw_water(ax, ground, Xd, Yg):
         Yw = np.clip(Yg + off, 0.0, Yg)
         ax.plot(Xd, Yw, "-.", color="tab:blue", label="WT (offset preview)")
 
-def fs_to_color(fs):
-    if fs < 1.0: return (0.85,0,0)
-    if fs < 1.2:
-        t=(fs-1.0)/0.2; return (1.0,0.50+0.50*t,0.0)
-    return (0.0,0.55,0.0)
-
-def clip_yfloor(xs, ys, y_floor=0.0):
-    m = ys >= (y_floor - 1e-12)
-    if np.count_nonzero(m) < 2: return None
-    return xs[m], ys[m]
-
-# ========= QUALITY プリセット =========
-QUALITY = {
-    "Normal": dict(quick_slices=12, final_slices=40, n_entries_final=1300, probe_n_min_quick=101,
-                   limit_arcs_quick=120, show_k=120, coarse_subsample="every 2nd",
-                   coarse_entries=220, coarse_limit_arcs=70, coarse_probe_min=81,
-                   budget_coarse_s=0.8, budget_quick_s=1.2),
-}
+# ===================== サイドバー =====================
+with st.sidebar:
+    st.header("Pages")
+    page = st.radio("", ["1) 地形・水位", "2) 地層・材料", "3) 円弧探索（未補強）", "4) ネイル配置", "5) 補強後解析"], key="__page__")
+    st.caption("cfgが正本。保存しない限り自動上書きしません。")
+    if st.button("⚠ すべて初期化（cfgを再作成）"):
+        st.session_state["cfg"] = default_cfg()
+        st.success("初期化しました。")
 
 # ===================== Page1: 地形・水位 =====================
 if page.startswith("1"):
@@ -270,6 +212,7 @@ if page.startswith("1"):
             cfg_set("water.mode", st.session_state["water_mode"])
             cfg_set("water.ru", float(st.session_state["ru"]))
             cfg_set("water.offset", float(st.session_state["wt_offset"]))
+            # grid 初期枠（未設定時のみH,Lから種）
             if cfg_get("grid.x_min") is None:
                 L = cfg_get("geom.L"); H = cfg_get("geom.H")
                 cfg_set("grid.x_min", 0.25*L); cfg_set("grid.x_max", 1.15*L)
@@ -278,7 +221,7 @@ if page.startswith("1"):
     with c2:
         if st.button("💾 WT水位線を offset から生成/更新（cfg.water.wl_points）"):
             H_ui = float(st.session_state["H"]); L_ui = float(st.session_state["L"])
-            ground_ui = make_ground_example(H_ui, L_ui)
+            ground_ui = lem.make_ground_example(H_ui, L_ui)
             Xd = np.linspace(ground_ui.X[0], ground_ui.X[-1], 400)
             Yg = np.array([float(ground_ui.y_at(x)) for x in Xd])
             off = float(st.session_state["wt_offset"])
@@ -290,12 +233,12 @@ if page.startswith("1"):
     # プレビュー
     H_ui = float(st.session_state["H"])
     L_ui = float(st.session_state["L"])
-    ground_ui = make_ground_example(H_ui, L_ui)
+    ground_ui = lem.make_ground_example(H_ui, L_ui)
 
     n_layers_cfg = int(cfg_get("layers.n"))
     interfaces_ui = []
-    if n_layers_cfg >= 2: interfaces_ui.append(make_interface1_example(H_ui, L_ui))
-    if n_layers_cfg >= 3: interfaces_ui.append(make_interface2_example(H_ui, L_ui))
+    if n_layers_cfg >= 2: interfaces_ui.append(lem.make_interface1_example(H_ui, L_ui))
+    if n_layers_cfg >= 3: interfaces_ui.append(lem.make_interface2_example(H_ui, L_ui))
 
     fig, ax = plt.subplots(figsize=(9.6, 5.8))
     Xd = np.linspace(ground_ui.X[0], ground_ui.X[-1], 600)
@@ -304,11 +247,11 @@ if page.startswith("1"):
     if n_layers_cfg == 1:
         ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
     elif n_layers_cfg == 2:
-        Y1 = clip_interfaces_to_ground(ground_ui, [interfaces_ui[0]], Xd)[0]
+        Y1 = lem.clip_interfaces_to_ground(ground_ui, [interfaces_ui[0]], Xd)[0]
         ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
         ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
     else:
-        Y1, Y2 = clip_interfaces_to_ground(ground_ui, [interfaces_ui[0], interfaces_ui[1]], Xd)
+        Y1, Y2 = lem.clip_interfaces_to_ground(ground_ui, [interfaces_ui[0], interfaces_ui[1]], Xd)
         ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
         ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
         ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
@@ -316,6 +259,7 @@ if page.startswith("1"):
     ax.plot(ground_ui.X, ground_ui.Y, linewidth=2.0, label="Ground")
     draw_water(ax, ground_ui, Xd, Yg)
     set_axes(ax, H_ui, L_ui, ground_ui); ax.grid(True); ax.legend()
+    ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     st.pyplot(fig); plt.close(fig)
 
 # ===================== Page2: 地層・材料 =====================
@@ -381,10 +325,13 @@ elif page.startswith("2"):
         cfg_set("layers.mu", float(st.session_state["mu"]))
         st.success("cfgに保存しました。")
 
+    # プレビュー（cfg正本）
     fig,ax = plt.subplots(figsize=(9.5,5.8))
-    Xd,Yg = draw_layers_and_ground(ax, ground, int(cfg_get("layers.n")),
-                                   ([make_interface1_example(H,L)] if int(cfg_get("layers.n"))>=2 else []) +
-                                   ([make_interface2_example(H,L)] if int(cfg_get("layers.n"))>=3 else []))
+    n_layers = int(cfg_get("layers.n"))
+    interfaces=[]
+    if n_layers>=2: interfaces.append(lem.make_interface1_example(H,L))
+    if n_layers>=3: interfaces.append(lem.make_interface2_example(H,L))
+    Xd,Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd, Yg)
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
@@ -394,9 +341,10 @@ elif page.startswith("3"):
     H,L,ground = make_ground_from_cfg()
     n_layers = int(cfg_get("layers.n"))
     interfaces=[]
-    if n_layers>=2: interfaces.append(make_interface1_example(H,L))
-    if n_layers>=3: interfaces.append(make_interface2_example(H,L))
+    if n_layers>=2: interfaces.append(lem.make_interface1_example(H,L))
+    if n_layers>=3: interfaces.append(lem.make_interface2_example(H,L))
 
+    # 初期枠（未設定なら H/L から種）
     if cfg_get("grid.x_min") is None:
         cfg_set("grid.x_min", 0.25*L); cfg_set("grid.x_max", 1.15*L)
         cfg_set("grid.y_min", 1.60*H); cfg_set("grid.y_max", 2.20*H)
@@ -448,15 +396,25 @@ elif page.startswith("3"):
         sync_grid_ui_to_cfg()
         st.success("cfgに保存しました。")
 
-    # 可視化（grid）
+    # 可視化（cfg正本）— RangeError対策の正規化
     x_min=cfg_get("grid.x_min"); x_max=cfg_get("grid.x_max")
     y_min=cfg_get("grid.y_min"); y_max=cfg_get("grid.y_max")
     pitch=cfg_get("grid.pitch")
+    try:
+        x_min,x_max,y_min,y_max,pitch = float(x_min),float(x_max),float(y_min),float(y_max),float(pitch)
+    except Exception:
+        x_min,x_max,y_min,y_max,pitch = 10.0,70.0,30.0,80.0,5.0
+    if not np.isfinite(pitch) or pitch<=0: pitch=5.0
+    if x_max<=x_min: x_max=x_min+max(1.0,pitch)
+    if y_max<=y_min: y_max=y_min+max(1.0,pitch)
+
     method=cfg_get("grid.method"); quality=cfg_get("grid.quality"); Fs_t=float(cfg_get("grid.Fs_target"))
+
     fig,ax = plt.subplots(figsize=(10.0,6.8))
     Xd,Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd, Yg)
-    gx = np.arange(x_min, x_max+1e-9, pitch); gy = np.arange(y_min, y_max+1e-9, pitch)
+    gx = np.arange(x_min, x_max+1e-9, max(pitch,1e-6))
+    gy = np.arange(y_min, y_max+1e-9, max(pitch,1e-6))
     if gx.size<1: gx=np.array([x_min])
     if gy.size<1: gy=np.array([y_min])
     xs=[float(x) for x in gx for _ in gy]; ys=[float(y) for y in gy for _ in gx]
@@ -467,27 +425,29 @@ elif page.startswith("3"):
 
     # soils & allow_cross
     mats = cfg_get("layers.mat")
-    soils=[Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
+    soils=[lem.Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
     allow_cross=[]
     if n_layers>=2:
-        soils.append(Soil(mats[2]["gamma"], mats[2]["c"], mats[2]["phi"]))
+        soils.append(lem.Soil(mats[2]["gamma"], mats[2]["c"], mats[2]["phi"]))
         allow_cross.append(bool(cfg_get("grid.allow_cross2")))
     if n_layers>=3:
-        soils.append(Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
+        soils.append(lem.Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
         allow_cross.append(bool(cfg_get("grid.allow_cross3")))
-    P = QUALITY["Normal"].copy()
+    P = QUALITY[quality].copy()
 
     def compute_once():
         Hc,Lc,groundL = make_ground_from_cfg()
         ifaces=[]
-        if n_layers>=2: ifaces.append(make_interface1_example(Hc,Lc))
-        if n_layers>=3: ifaces.append(make_interface2_example(Hc,Lc))
+        if n_layers>=2: ifaces.append(lem.make_interface1_example(Hc,Lc))
+        if n_layers>=3: ifaces.append(lem.make_interface2_example(Hc,Lc))
 
         def subsampled():
             xs = np.arange(x_min, x_max+1e-9, pitch)
             ys = np.arange(y_min, y_max+1e-9, pitch)
-            tag = "every 2nd"
-            if tag=="every 2nd":
+            tag = P["coarse_subsample"]
+            if tag=="every 3rd":
+                xs = xs[::3] if xs.size>2 else xs; ys = ys[::3] if ys.size>2 else ys
+            elif tag=="every 2nd":
                 xs = xs[::2] if xs.size>1 else xs; ys = ys[::2] if ys.size>1 else ys
             return [(float(xc),float(yc)) for yc in ys for xc in xs]
 
@@ -495,14 +455,14 @@ elif page.startswith("3"):
             deadline = time.time()+budget_s; best=None
             for (xc,yc) in subsampled():
                 cnt=0; Fs_min=None
-                for _x1,_x2,_R,Fs in arcs_from_center_by_entries_multi(
+                for _x1,_x2,_R,Fs in lem.arcs_from_center_by_entries_multi(
                     groundL, soils, xc, yc,
-                    n_entries=220, method="Fellenius",
+                    n_entries=P["coarse_entries"], method="Fellenius",
                     depth_min=0.5, depth_max=4.0,
                     interfaces=ifaces, allow_cross=allow_cross,
                     quick_mode=True, n_slices_quick=max(8,P["quick_slices"]//2),
-                    limit_arcs_per_center=70,
-                    probe_n_min=81,
+                    limit_arcs_per_center=P["coarse_limit_arcs"],
+                    probe_n_min=P["coarse_probe_min"],
                 ):
                     cnt+=1
                     if (Fs_min is None) or (Fs < Fs_min): Fs_min = Fs
@@ -512,35 +472,35 @@ elif page.startswith("3"):
                 if time.time()>deadline: break
             return (best[1] if best else None)
 
-        center = pick_center(0.8)
+        center = pick_center(P["budget_coarse_s"])
         if center is None: return dict(error="Coarseで候補なし。範囲/ピッチ/深さを見直してください。")
         xc,yc = center
 
-        heap_R=[]; deadline=time.time()+1.2
-        for _x1,_x2,R,Fs in arcs_from_center_by_entries_multi(
+        heap_R=[]; deadline=time.time()+P["budget_quick_s"]
+        for _x1,_x2,R,Fs in lem.arcs_from_center_by_entries_multi(
             groundL, soils, xc, yc,
-            n_entries=1300, method="Fellenius",
+            n_entries=P["n_entries_final"], method="Fellenius",
             depth_min=0.5, depth_max=4.0,
             interfaces=ifaces, allow_cross=allow_cross,
             quick_mode=True, n_slices_quick=P["quick_slices"],
-            limit_arcs_per_center=120,
+            limit_arcs_per_center=P["limit_arcs_quick"],
             probe_n_min=P["probe_n_min_quick"],
         ):
             heapq.heappush(heap_R, (-Fs,R))
-            if len(heap_R) > 120: heapq.heappop(heap_R)
+            if len(heap_R) > max(P["show_k"],20): heapq.heappop(heap_R)
             if time.time()>deadline: break
         R_candidates = [r for _fsneg,r in sorted([(-fsneg,R) for fsneg,R in heap_R], key=lambda t:t[0])]
         if not R_candidates:
             return dict(error="Quickで円弧候補なし。進入可/Quality/ピッチを調整してください。")
 
         refined=[]
-        for R in R_candidates[:120]:
-            Fs = fs_given_R_multi(groundL, ifaces, soils, allow_cross, method, xc, yc, R, n_slices=40)
+        for R in R_candidates[:P["show_k"]]:
+            Fs = lem.fs_given_R_multi(groundL, ifaces, soils, allow_cross, method, xc, yc, R, n_slices=P["final_slices"])
             if Fs is None: continue
-            s = arc_sample_poly_best_pair(groundL, xc, yc, R, n=251, y_floor=0.0)
+            s = lem.arc_sample_poly_best_pair(groundL, xc, yc, R, n=251, y_floor=0.0)
             if s is None: continue
             x1,x2,*_ = s
-            packD = driving_sum_for_R_multi(groundL, ifaces, soils, allow_cross, xc, yc, R, n_slices=40)
+            packD = lem.driving_sum_for_R_multi(groundL, ifaces, soils, allow_cross, xc, yc, R, n_slices=P["final_slices"])
             if packD is None: continue
             D_sum,_,_ = packD
             T_req = max(0.0, (Fs_t - Fs)*D_sum)
@@ -586,33 +546,30 @@ elif page.startswith("3"):
 
 # ===================== Page4: ネイル配置 =====================
 elif page.startswith("4"):
-    st = ST  # 念のため毎回復旧
+    H,L,ground = make_ground_from_cfg()
 
-    H, L, ground = make_ground_from_cfg()
-
-    # レイヤー定義
     n_layers = int(cfg_get("layers.n"))
     interfaces = []
-    if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
-    if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
+    if n_layers >= 2: interfaces.append(lem.make_interface1_example(H, L))
+    if n_layers >= 3: interfaces.append(lem.make_interface2_example(H, L))
 
-    st.subheader("ソイルネイル配置（頭位置＋軸＋ボンド可視化）")
+    st.subheader("ソイルネイル配置")
 
-    # chosen_arc を確定
+    # chosen_arc が無ければ復元
     arc = cfg_get("results.chosen_arc")
     if not arc:
         res_un = cfg_get("results.unreinforced")
         if res_un and "center" in res_un and "refined" in res_un and res_un["refined"]:
-            xc0, yc0 = res_un["center"]
-            idx0 = res_un.get("idx_minFs", int(np.argmin([d["Fs"] for d in res_un["refined"]])))
-            d0 = res_un["refined"][idx0]
-            arc = dict(xc=xc0, yc=yc0, R=d0["R"], x1=d0["x1"], x2=d0["x2"], Fs=d0["Fs"])
+            xc,yc = res_un["center"]
+            idx = res_un.get("idx_minFs", int(np.argmin([d["Fs"] for d in res_un["refined"]])))
+            d = res_un["refined"][idx]
+            arc = dict(xc=xc, yc=yc, R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"])
             cfg_set("results.chosen_arc", arc)
         else:
-            st.info("未補強MinFs円弧が未確定です。Page3で実行してください。")
+            st.info("未補強の Min Fs 円弧が未確定です。Page3 で実行してから来てください。")
             st.stop()
 
-    # --- UI seed
+    # UI seed
     nails = cfg_get("nails")
     ui_seed("s_start", nails["s_start"]); ui_seed("s_end", nails["s_end"])
     ui_seed("S_surf", nails["S_surf"]);   ui_seed("S_row", nails["S_row"])
@@ -621,14 +578,14 @@ elif page.startswith("4"):
     ui_seed("beta_deg", nails["beta_deg"]); ui_seed("delta_beta", nails["delta_beta"])
     ui_seed("L_mode", nails["L_mode"]); ui_seed("L_nail", nails["L_nail"]); ui_seed("d_embed", nails["d_embed"])
 
-    # 測地長 s
+    # 斜面の測地長（s）
     Xd = np.linspace(ground.X[0], ground.X[-1], 1200)
     Yg = np.array([float(ground.y_at(x)) for x in Xd])
     seg = np.sqrt(np.diff(Xd)**2 + np.diff(Yg)**2)
     s_cum = np.concatenate([[0.0], np.cumsum(seg)])
     s_total = float(s_cum[-1])
 
-    # 入力UI
+    # 入力 UI
     st.slider("s_start (m)", 0.0, s_total, step=0.5, key="s_start", value=float(st.session_state["s_start"]))
     st.slider("s_end (m)", st.session_state["s_start"], s_total, step=0.5, key="s_end", value=float(st.session_state["s_end"]))
     st.slider("斜面ピッチ S_surf (m)", 0.5, 5.0, step=0.1, key="S_surf", value=float(st.session_state["S_surf"]))
@@ -651,15 +608,14 @@ elif page.startswith("4"):
     elif st.session_state["L_mode"]=="パターン2：すべり面より +Δm":
         st.slider("すべり面より +Δm (m)", 0.0, 5.0, step=0.5, key="d_embed", value=float(st.session_state["d_embed"]))
 
-    # s→x 補間
+    # s→(x,y)
     def x_at_s(sv):
-        idx = np.searchsorted(s_cum, sv, side="right") - 1
-        idx = max(0, min(idx, len(Xd) - 2))
-        t = (sv - s_cum[idx]) / (seg[idx] if seg[idx] > 1e-12 else 1e-12)
-        return float((1 - t) * Xd[idx] + t * Xd[idx + 1])
+        idx = np.searchsorted(s_cum, sv, side="right")-1
+        idx = max(0, min(idx, len(Xd)-2))
+        t = (sv - s_cum[idx]) / (seg[idx] if seg[idx]>1e-12 else 1e-12)
+        return float((1-t)*Xd[idx] + t*Xd[idx+1])
 
-    # 自動配置（頭）
-    s_vals = list(np.arange(st.session_state["s_start"], st.session_state["s_end"] + 1e-9, st.session_state["S_surf"]))
+    s_vals = list(np.arange(st.session_state["s_start"], st.session_state["s_end"]+1e-9, st.session_state["S_surf"]))
     nail_heads = [(x_at_s(sv), float(ground.y_at(x_at_s(sv)))) for sv in s_vals]
     cfg_set("results.nail_heads", nail_heads)
 
@@ -677,109 +633,45 @@ elif page.startswith("4"):
         cfg_set("nails.d_embed", float(st.session_state.get("d_embed", 1.0)))
         st.success("cfgに保存しました。")
 
-    # 図化
-    fig, ax = plt.subplots(figsize=(10.0, 7.0))
+    # --- 可視化（ネイル軸 & ボンド） ---
+    def slope_tangent_angle(ground, x):
+        x2 = x + 1e-4
+        y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
+        return math.atan2((y2 - y1), (x2 - x))
+
+    def choose_inward_dir(xh, yh, tau):
+        # 斜面法線の2方向
+        cand = [tau + math.pi/2, tau - math.pi/2]
+        for th in cand:
+            ct, stn = math.cos(th), math.sin(th)
+            # 円との交点（t>0の最小）
+            B = 2*((xh - arc["xc"])*ct + (yh - arc["yc"])*stn)
+            C = (xh - arc["xc"])**2 + (yh - arc["yc"])**2 - arc["R"]**2
+            disc = B*B - 4*C
+            if disc <= 0: continue
+            t = min([t for t in [(-B - math.sqrt(disc))/2.0, (-B + math.sqrt(disc))/2.0] if t>1e-9], default=None)
+            if t is None: continue
+            xq, yq = xh + ct*t, yh + stn*t
+            # 地山側判定：交点が地表より下
+            if yq <= float(ground.y_at(xq)) - 1e-6:
+                return th, t, (xq,yq)
+        # どちらもダメなら最初で返す
+        th = cand[0]
+        ct, stn = math.cos(th), math.sin(th)
+        return th, 0.0, (xh, yh)
+
+    fig,ax = plt.subplots(figsize=(10.0,7.0))
     Xd2,Yg2 = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd2, Yg2)
 
-    xc, yc, R = arc["xc"], arc["yc"], arc["R"]
-    xs = np.linspace(arc["x1"], arc["x2"], 400)
-    ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
+    xs=np.linspace(arc["x1"], arc["x2"], 400)
+    ys=arc["yc"] - np.sqrt(np.maximum(0.0, arc["R"]**2 - (xs - arc["xc"])**2))
     ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Chosen slip arc (Fs={arc['Fs']:.3f})")
 
     NH = cfg_get("results.nail_heads", [])
     if NH:
-        ax.scatter([p[0] for p in NH], [p[1] for p in NH],
-                   s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+        ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
-    # 軸＆ボンド（常に地山側へ）
-    try:
-        angle_mode = cfg_get("nails.angle_mode")
-        beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
-        delta_beta = float(cfg_get("nails.delta_beta", 0.0))
-        L_mode     = cfg_get("nails.L_mode")
-        L_nail     = float(cfg_get("nails.L_nail", 5.0))
-        d_embed    = float(cfg_get("nails.d_embed", 1.0))
-
-        for (xh, yh) in NH:
-            if str(angle_mode).startswith("Slope-Normal"):
-                theta = inward_normal_angle(ground, xh, delta_beta)
-            else:
-                theta = -beta_deg * DEG
-
-            t = nail_ray_hit_circle(xh, yh, theta, xc, yc, R)
-            ct, snt = math.cos(theta), math.sin(theta)
-
-            if t is None:
-                ax.plot([xh, xh + ct * L_nail], [yh, yh + snt * L_nail],
-                        color="tab:blue", lw=1.5, alpha=0.4)
-                continue
-
-            xq, yq = xh + ct * t, yh + snt * t
-            ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
-
-            Lb = (max(0.0, d_embed) if str(L_mode).startswith("パターン2")
-                  else max(0.0, L_nail - t))
-            if Lb > 1e-3:
-                xb2, yb2 = xq + ct * Lb, yq + snt * Lb
-                ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
-    except Exception as e:
-        ST.warning(f"nail drawing skipped: {e}")
-
-    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
-    st.pyplot(fig); plt.close(fig)
-
-# ===================== Page5: 補強後解析 =====================
-elif page.startswith("5"):
-    st = ST
-    H, L, ground = make_ground_from_cfg()
-    st.subheader("補強後解析（簡易合成）")
-    arc = cfg_get("results.chosen_arc")
-    NH = cfg_get("results.nail_heads", [])
-
-    if not (arc and NH):
-        missing=[]
-        if not arc: missing.append("Page3のMin Fs円弧")
-        if not NH:  missing.append("Page4のネイル頭配置")
-        st.info("必要情報: " + "、".join(missing))
-        st.stop()
-
-    Fs0 = float(arc["Fs"])
-    # D_sum 取得（未補強分母）
-    packD = driving_sum_for_R_multi(
-        *make_ground_from_cfg()[2:],  # ground は不要なので捨て値防止
-        # 上の * は使いにくいので、下で改めて呼び出し
-    )
-    # ↑ うまくいかないので素直に再作成
-    H_, L_, ground_ = make_ground_from_cfg()
-    n_layers = int(cfg_get("layers.n"))
-    ifaces=[]
-    if n_layers>=2: ifaces.append(make_interface1_example(H_,L_))
-    if n_layers>=3: ifaces.append(make_interface2_example(H_,L_))
-    mats = cfg_get("layers.mat")
-    soils=[Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
-    allow_cross=[]
-    if n_layers>=2:
-        soils.append(Soil(mats[2]["gamma"], mats[2]["c"], mats[2]["phi"]))
-        allow_cross.append(bool(cfg_get("grid.allow_cross2")))
-    if n_layers>=3:
-        soils.append(Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
-        allow_cross.append(bool(cfg_get("grid.allow_cross3")))
-    packD = driving_sum_for_R_multi(ground_, ifaces, soils, allow_cross, arc["xc"], arc["yc"], arc["R"], n_slices=40)
-    if packD is None:
-        st.error("D_sum が取得できませんでした。")
-        st.stop()
-    D_sum, _, _ = packD
-    N0 = Fs0 * D_sum
-
-    # 材料パラメータ
-    tau_cap = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))
-    d_g     = float(cfg_get("layers.d_g", 0.125))
-    d_s     = float(cfg_get("layers.d_s", 0.022))
-    fy      = float(cfg_get("layers.fy", 1000.0))
-    gamma_m = float(cfg_get("layers.gamma_m", 1.20))
-
-    # ネイル効果
     angle_mode = cfg_get("nails.angle_mode")
     beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
     delta_beta = float(cfg_get("nails.delta_beta", 0.0))
@@ -787,67 +679,172 @@ elif page.startswith("5"):
     L_nail     = float(cfg_get("nails.L_nail", 5.0))
     d_embed    = float(cfg_get("nails.d_embed", 1.0))
 
-    T_total = 0.0
     for (xh, yh) in NH:
-        theta = (inward_normal_angle(ground_, xh, delta_beta)
-                 if str(angle_mode).startswith("Slope-Normal")
-                 else -beta_deg * DEG)
-        t = nail_ray_hit_circle(xh, yh, theta, arc["xc"], arc["yc"], arc["R"])
-        if t is None:
-            continue
-        Lb = (max(0.0, d_embed) if str(L_mode).startswith("パターン2")
-              else max(0.0, L_nail - t))
-        if Lb <= 1e-6:
-            continue
-        T_pull = grout_pullout_capacity_kNm_per_m(d_g, Lb, tau_cap)
-        T_steel= steel_tension_capacity_kN_per_m(d_s, fy, gamma_m)
-        T_total += min(T_pull, T_steel)
+        if str(angle_mode).startswith("Slope-Normal"):
+            tau = slope_tangent_angle(ground, float(xh))
+            th0 = tau + (delta_beta*math.pi/180.0)
+            th, t_hit, (xq,yq) = choose_inward_dir(xh, yh, th0)
+        else:
+            th = -beta_deg*math.pi/180.0
+            ct, stn = math.cos(th), math.sin(th)
+            B = 2*((xh - arc["xc"])*ct + (yh - arc["yc"])*stn)
+            C = (xh - arc["xc"])**2 + (yh - arc["yc"])**2 - arc["R"]**2
+            disc = B*B - 4*C
+            t_hit = min([t for t in [(-B - math.sqrt(disc))/2.0, (-B + math.sqrt(disc))/2.0] if t>1e-9], default=0.0)
+            xq, yq = (xh + ct*t_hit, yh + stn*t_hit) if t_hit>0 else (xh, yh)
 
-    Fs_after = (N0 + T_total) / D_sum if D_sum > 0 else np.nan
-
-    cfg_set("results.reinforced", {
-        "n_nails": len(NH),
-        "arc_Fs_unreinforced": Fs0,
-        "Fs_after": float(Fs_after),
-        "T_total": float(T_total),
-    })
-
-    # 可視化
-    fig, ax = plt.subplots(figsize=(10.0, 7.0))
-    Xd,Yg = draw_layers_and_ground(ax, ground_, n_layers, ifaces)
-    draw_water(ax, ground_, Xd, Yg)
-    xs = np.linspace(arc["x1"], arc["x2"], 400)
-    ys = arc["yc"] - np.sqrt(np.maximum(0.0, arc["R"]**2 - (xs - arc["xc"])**2))
-    ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={Fs0:.3f} → {Fs_after:.3f})")
-
-    # ネイル描画（命中は緑のボンド表示）
-    if NH:
-        ax.scatter([p[0] for p in NH], [p[1] for p in NH],
-                   s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
-
-    for (xh, yh) in NH:
-        theta = (inward_normal_angle(ground_, xh, delta_beta)
-                 if str(angle_mode).startswith("Slope-Normal")
-                 else -beta_deg * DEG)
-        ct, snt = math.cos(theta), math.sin(theta)
-        t = nail_ray_hit_circle(xh, yh, theta, arc["xc"], arc["yc"], arc["R"])
-        if t is None:
-            ax.plot([xh, xh + ct * L_nail], [yh, yh + snt * L_nail],
-                    color="tab:blue", lw=1.5, alpha=0.4)
-            continue
-        xq, yq = xh + ct * t, yh + snt * t
+        ct, stn = math.cos(th), math.sin(th)
+        # 頭→すべり面
         ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
-        Lb = (max(0.0, d_embed) if str(L_mode).startswith("パターン2")
-              else max(0.0, L_nail - t))
-        if Lb > 1e-3:
-            xb2, yb2 = xq + ct * Lb, yq + snt * Lb
+
+        # ボンド区間
+        if str(L_mode).startswith("パターン2"):
+            Lb = max(0.0, d_embed)
+        else:
+            Lb = max(0.0, L_nail - t_hit)
+        if Lb > 1e-3 and t_hit>0:
+            xb2, yb2 = xq + ct*Lb, yq + stn*Lb
             ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
 
-    set_axes(ax, H_, L_, ground_); ax.grid(True); ax.legend()
-
-    col1, col2, col3 = st.columns(3)
-    with col1: st.metric("ネイル本数", f"{len(NH)}")
-    with col2: st.metric("未補強Fs", f"{Fs0:.3f}")
-    with col3: st.metric("補強後Fs", f"{Fs_after:.3f}")
-
+    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
+
+# ===================== Page5: 補強後解析 =====================
+elif page.startswith("5"):
+    H,L,ground = make_ground_from_cfg()
+    st.subheader("補強後解析（簡易合成）")
+    arc = cfg_get("results.chosen_arc")
+    NH = cfg_get("results.nail_heads", [])
+    btn = st.button("▶ 補強後の計算を実行", disabled=not (arc and NH))
+    if not (arc and NH):
+        missing=[]
+        if not arc: missing.append("Page3のMin Fs円弧")
+        if not NH: missing.append("Page4のネイル頭配置")
+        st.info("必要情報: " + "、".join(missing))
+    elif btn:
+        # ---- D_sum（未補強の分母）----
+        n_layers = int(cfg_get("layers.n"))
+        ifaces=[]
+        if n_layers>=2: ifaces.append(lem.make_interface1_example(H,L))
+        if n_layers>=3: ifaces.append(lem.make_interface2_example(H,L))
+
+        mats = cfg_get("layers.mat")
+        soils=[lem.Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
+        allow_cross=[]
+        if n_layers>=2:
+            soils.append(lem.Soil(mats[2]["gamma"], mats[2]["c"], mats[2]["phi"]))
+            allow_cross.append(bool(cfg_get("grid.allow_cross2")))
+        if n_layers>=3:
+            soils.append(lem.Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
+            allow_cross.append(bool(cfg_get("grid.allow_cross3")))
+
+        packD = lem.driving_sum_for_R_multi(ground, ifaces, soils, allow_cross,
+                                            arc["xc"], arc["yc"], arc["R"], n_slices=40)
+        if packD is None:
+            st.error("D_sum が取得できませんでした。円弧・範囲・層設定を確認してください。")
+            st.stop()
+        D_sum, _, _ = packD
+        Fs0 = float(arc["Fs"])
+        N0  = Fs0 * D_sum
+
+        # ---- ネイル合力（非常に簡易な合成）----
+        tau_cap = float(cfg_get("layers.tau_grout_cap_kPa"))   # kPa = kN/m^2
+        d_g     = float(cfg_get("layers.d_g"))
+        d_s     = float(cfg_get("layers.d_s"))
+        fy      = float(cfg_get("layers.fy"))                  # MPa
+        gamma_m = float(cfg_get("layers.gamma_m"))
+        mu      = float(cfg_get("layers.mu"))
+
+        # 補助：地表接線角
+        def slope_tangent_angle(ground, x):
+            x2 = x + 1e-4
+            y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
+            return math.atan2((y2 - y1), (x2 - x))
+        # 円の接線角（x位置）
+        def circle_tangent_angle(x):
+            denom = ( (arc["yc"] - (arc["yc"] - math.sqrt(max(1e-12, arc["R"]**2 - (x-arc["xc"])**2)))) - arc["yc"] )
+            # 上の式は y_arc - yc, 数値安定のため 1e-12 ガード
+            denom = -math.sqrt(max(1e-12, arc["R"]**2 - (x-arc["xc"])**2))
+            dydx  = -(x - arc["xc"]) / max(denom, 1e-12)
+            return math.atan2(dydx, 1.0)  # tan方向角
+
+        Tt_sum = 0.0
+        for (xh,yh) in NH:
+            # 方向決定
+            if str(cfg_get("nails.angle_mode")).startswith("Slope-Normal"):
+                tau = slope_tangent_angle(ground, float(xh))
+                cand = [tau + math.pi/2 + cfg_get("nails.delta_beta")*math.pi/180.0,
+                        tau - math.pi/2 + cfg_get("nails.delta_beta")*math.pi/180.0]
+            else:
+                cand = [-cfg_get("nails.beta_deg")*math.pi/180.0]
+
+            hit = None
+            for th in cand:
+                ct, stn = math.cos(th), math.sin(th)
+                B = 2*((xh - arc["xc"])*ct + (yh - arc["yc"])*stn)
+                C = (xh - arc["xc"])**2 + (yh - arc["yc"])**2 - arc["R"]**2
+                disc = B*B - 4*C
+                if disc <= 0: continue
+                roots = [(-B - math.sqrt(disc))/2.0, (-B + math.sqrt(disc))/2.0]
+                roots = [t for t in roots if t>1e-9]
+                if not roots: continue
+                t = min(roots)
+                xq, yq = xh + ct*t, yh + stn*t
+                if yq <= float(ground.y_at(xq)) - 1e-6:
+                    hit = (th, t, xq, yq); break
+            if hit is None: continue
+            th, t_hit, xq, yq = hit
+
+            # Lb
+            if str(cfg_get("nails.L_mode")).startswith("パターン2"):
+                Lb = max(0.0, float(cfg_get("nails.d_embed")))
+            else:
+                Lb = max(0.0, float(cfg_get("nails.L_nail")) - t_hit)
+            if Lb <= 1e-6: continue
+
+            # Pullout / Steel tension
+            perimeter = math.pi * d_g
+            T_pullout = tau_cap * perimeter * Lb          # kN
+            A_s = math.pi*(d_s/2.0)**2
+            T_tens = (A_s * fy * 1000.0) / max(gamma_m,1e-6)  # MPa→kN/m^2*area
+            Tn = mu * min(T_pullout, T_tens)              # 有効引張
+
+            # 接線へ投影
+            tan_th = circle_tangent_angle(xq)
+            dot = math.cos(th - tan_th)
+            if dot > 0:
+                Tt_sum += Tn * dot
+
+        Fs1 = N0 / max(D_sum - 1e-12, 1e-12) + Tt_sum / max(D_sum, 1e-12)
+        cfg_set("results.reinforced", {
+            "n_nails": len(NH),
+            "arc_Fs_unreinforced": Fs0,
+            "arc_Fs_reinforced": float(Fs1),
+        })
+
+    r = cfg_get("results.reinforced")
+    if r:
+        col1,col2,col3 = st.columns(3)
+        with col1: st.metric("ネイル本数", f"{r['n_nails']}")
+        with col2: st.metric("未補強Fs（参照）", f"{r['arc_Fs_unreinforced']:.3f}")
+        with col3: st.metric("補強後Fs（簡易）", f"{r.get('arc_Fs_reinforced',r['arc_Fs_unreinforced']):.3f}")
+
+        # 図：Fs0→Fs1 を弧に表示
+        fig,ax = plt.subplots(figsize=(10.0,7.0))
+        n_layers = int(cfg_get("layers.n"))
+        interfaces=[]
+        if n_layers>=2: interfaces.append(lem.make_interface1_example(H,L))
+        if n_layers>=3: interfaces.append(lem.make_interface2_example(H,L))
+        Xd2,Yg2 = draw_layers_and_ground(ax, ground, n_layers, interfaces)
+        draw_water(ax, ground, Xd2, Yg2)
+
+        xs=np.linspace(arc["x1"], arc["x2"], 400)
+        ys=arc["yc"] - np.sqrt(np.maximum(0.0, arc["R"]**2 - (xs - arc["xc"])**2))
+        Fs0 = float(arc["Fs"]); Fs1 = float(r.get("arc_Fs_reinforced", Fs0))
+        ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={Fs0:.3f} → {Fs1:.3f})")
+
+        NH = cfg_get("results.nail_heads", [])
+        if NH:
+            ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+        set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
+        st.pyplot(fig); plt.close(fig)
