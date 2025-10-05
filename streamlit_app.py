@@ -736,16 +736,38 @@ elif page.startswith("5"):
     ys = arc["yc"] - np.sqrt(np.maximum(0.0, arc["R"]**2 - (xs - arc["xc"])**2))
     ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={arc['Fs']:.3f} → {Fs_after:.3f})")
 
-    # ネイル頭
-    ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+        # ネイル頭
+    ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=16, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
-    # 交点 & 有効ボンド方向を少し長めに表示
-    for h in (diag.get("hits") or []):
-        if h.get("xq") is None: continue
-        ax.plot(h["xq"], h["yq"], marker="o", markersize=4, color="k")
-        # ボンド方向の短い線（見やすく）
-        # 方向は斜面法線/βと同じなので省略可。簡易的に小さな縦棒でマーク
-        ax.vlines(h["xq"], h["yq"], h["yq"]+0.5, colors="k", linewidth=0.8, alpha=0.6)
+    # ネイル軸（頭 → すべり面）と、すべり面以深のボンド長（+Δm）を描画
+    #   - 頭→すべり面：青実線
+    #   - すべり面以深のボンド：緑実線
+    #   - 交点：黒点
+    for (xh, yh), h in zip(NH, (diag.get("hits") or [])):
+        xq = h.get("xq"); yq = h.get("yq")
+        if xq is None:
+            continue
+        # 交点マーク
+        ax.plot(xq, yq, marker="o", markersize=3.5, color="k")
+
+        # 頭→すべり面（光線長 t_head_to_slip があればそれを使用）
+        t = float(h.get("t_head_to_slip", 0.0))
+        th = float(h.get("theta", 0.0))
+        ct, st = math.cos(th), math.sin(th)
+
+        # 安全側：もし t が無ければ頭と交点の距離から算出
+        if t <= 0:
+            t = math.hypot(xq - xh, yq - yh)
+
+        # 軸（頭→交点）
+        ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
+
+        # ボンド長（すべり面以深）
+        Lb = float(h.get("L_bond", 0.0))
+        if Lb > 1e-3:
+            xb2 = xq + ct*Lb
+            yb2 = yq + st*Lb
+            ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
 
     # スライス別Tt（正規化して棒の長さに反映）
     tmax = float(np.max(Tt)) if np.any(Tt>0) else 0.0
