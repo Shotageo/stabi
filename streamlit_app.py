@@ -716,8 +716,6 @@ elif page.startswith("5"):
 
     arc = cfg_get("results.chosen_arc")
     NH  = cfg_get("results.nail_heads", [])
-
-    # 早期バリデーション
     if not arc:
         st.info("未補強の最小円弧が未確定です。Page3で未補強の計算を実行してください。")
         st.stop()
@@ -725,15 +723,15 @@ elif page.startswith("5"):
         st.info("ネイル頭が未配置です。Page4でネイルを配置してください。")
         st.stop()
 
-    # --- 材料パラメタ（kN単位系で扱う）
-    tau_cap_kPa = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))  # kPa
+    # 材料（kN 系）
+    tau_cap_kPa = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))  # kPa = kN/m^2
     d_g         = float(cfg_get("layers.d_g", 0.125))                # m
     d_s         = float(cfg_get("layers.d_s", 0.022))                # m
     fy_MPa      = float(cfg_get("layers.fy", 1000.0))                # MPa
     gamma_m     = float(cfg_get("layers.gamma_m", 1.2))
-    mu_decay    = float(cfg_get("layers.mu", 0.0))                   # 0..0.9 (任意)
+    mu_decay    = float(cfg_get("layers.mu", 0.0))
 
-    # ネイル方向/長さモード
+    # ネイル設定
     angle_mode = cfg_get("nails.angle_mode")
     beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
     delta_beta = float(cfg_get("nails.delta_beta", 0.0))
@@ -741,12 +739,13 @@ elif page.startswith("5"):
     L_nail     = float(cfg_get("nails.L_nail", 5.0))
     d_embed    = float(cfg_get("nails.d_embed", 1.0))
 
-    # --- 図の準備（地形・水位・未補強円弧）
+    # レイヤ作成（★ lem. で明示）
     n_layers = int(cfg_get("layers.n"))
     interfaces = []
-    if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
-    if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
+    if n_layers >= 2: interfaces.append(lem.make_interface1_example(H, L))
+    if n_layers >= 3: interfaces.append(lem.make_interface2_example(H, L))
 
+    # 図
     fig, ax = plt.subplots(figsize=(10.0, 7.0))
     Xd, Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd, Yg)
@@ -754,44 +753,38 @@ elif page.startswith("5"):
     xc, yc, R = float(arc["xc"]), float(arc["yc"]), float(arc["R"])
     xs = np.linspace(float(arc["x1"]), float(arc["x2"]), 400)
     ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
-    ax.plot(xs, ys, lw=2.5, color="tab:red",
-            label=f"Slip arc (Fs0={arc['Fs']:.3f})")
+    ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={arc['Fs']:.3f})")
 
-    # --- 便利関数：斜面接線角（水平から反時計＋）
+    # 斜面接線角
     def _slope_tangent_angle(x):
         x2 = x + 1e-4
         y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
         return math.atan2((y2 - y1), (x2 - x))
 
-    # --- ネイル交点＆ボンド長／図示＆合力計算
-    tau_cap = tau_cap_kPa * 1e-3  # kPa→MPa→(kN/m^2)：kPa = kN/m^2
-    As = math.pi * (d_s**2) / 4.0 # m^2（1m幅）
-    T_steel = (fy_MPa * As) / max(gamma_m, 1e-6)   # kN（MPa=MN/m^2= kN/mm^2×? →ここは一貫系：MPa= N/mm^2。m系では fy[MPa]*As[m^2] = MN/m = 10^3 kN/m。）
-    # 上の単位換算を厳密に気にするなら fy を kN/m^2 (=MPa*1e3) として扱う：
-    T_steel = (fy_MPa * 1e3) * As / max(gamma_m, 1e-6)  # ← kN
+    # 容量計算の前処理
+    tau_cap = tau_cap_kPa * 1e-3            # kN/m^2
+    As = math.pi * (d_s**2) / 4.0           # m^2
+    T_steel = (fy_MPa * 1e3) * As / max(gamma_m, 1e-6)  # kN
 
     T_sum = 0.0
-    heads_x = [float(p[0]) for p in NH]
-    heads_y = [float(p[1]) for p in NH]
-    ax.scatter(heads_x, heads_y, s=26, color="tab:blue", label=f"Nail heads ({len(NH)})")
+    ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=26, color="tab:blue",
+               label=f"Nail heads ({len(NH)})")
 
     for i, (xh, yh) in enumerate(NH):
         xh = float(xh); yh = float(yh)
-
-        # 方向ベクトル（地山側へ向くよう修正済）
+        # 地山側へ：接線−90°（＋Δβ）
         if str(angle_mode).startswith("Slope-Normal"):
             tau = _slope_tangent_angle(xh)
-            theta = tau - math.pi/2 + delta_beta * DEG   # ← 地山側へ（法線＝接線−90°）
+            theta = tau - math.pi/2 + delta_beta * DEG
         else:
-            theta = -abs(beta_deg) * DEG                  # 水平から下向き
+            theta = -abs(beta_deg) * DEG
         ct, st = math.cos(theta), math.sin(theta)
 
-        # すべり円との最初の交点（レイ方程式で t>0 最小）
+        # 円との交点（t>0 最小）
         B = 2.0 * ((xh - xc) * ct + (yh - yc) * st)
         C = (xh - xc)**2 + (yh - yc)**2 - R**2
         disc = B*B - 4.0*C
         if disc <= 0:
-            # 交わらなければ固定長を薄色表示のみ
             if L_nail > 1e-3:
                 ax.plot([xh, xh + ct*L_nail], [yh, yh + st*L_nail],
                         color="tab:blue", lw=1.2, alpha=0.5)
@@ -805,34 +798,24 @@ elif page.startswith("5"):
                         color="tab:blue", lw=1.2, alpha=0.5)
             continue
         t = min(t_pos)
-        xq, yq = xh + ct*t, yh + st*t  # すべり面交点
+        xq, yq = xh + ct*t, yh + st*t
 
-        # 地表→交点は青実線
+        # 地表→交点（青）
         ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.6, alpha=0.9)
 
-        # 埋込み長 Lb（モード別）
-        if str(L_mode).startswith("パターン2"):
-            Lb = max(0.0, d_embed)
-        else:
-            Lb = max(0.0, L_nail - t)
-
-        # ボンド区間を緑で
+        # 埋込み長
+        Lb = max(0.0, d_embed) if str(L_mode).startswith("パターン2") else max(0.0, L_nail - t)
         if Lb > 1e-3:
             xb2, yb2 = xq + ct*Lb, yq + st*Lb
             ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.95)
-
-            # 容量（グラウト付着 vs 鋼材）
-            T_grout = tau_cap * math.pi * d_g * Lb         # kN（1m幅）
+            T_grout = tau_cap * math.pi * d_g * Lb  # kN
             T_cap   = min(T_grout, T_steel)
-            # 逓減（任意）— 列番号で弱める単純モデル
             if mu_decay > 0 and len(NH) > 1:
                 w = 1.0 - mu_decay * (i / (len(NH)-1))
                 T_cap *= max(0.0, w)
-
             T_sum += T_cap
 
-    # --- 駆動項 D を未補強スライスから取得（Fs合成に使用）
-    # soils・allow_cross は Page3 と同様に構築
+    # D = Σ(W sinα)
     mats = cfg_get("layers.mat")
     soils = [Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
     allow_cross = []
@@ -843,18 +826,18 @@ elif page.startswith("5"):
         soils.append(Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
         allow_cross.append(bool(cfg_get("grid.allow_cross3")))
 
+    n_slices = QUALITY.get(cfg_get("grid.quality"), QUALITY["Normal"])["final_slices"] if "QUALITY" in globals() else 40
     packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross,
-                                    xc, yc, R, n_slices=QUALITY[cfg_get("grid.quality")]["final_slices"])
+                                    xc, yc, R, n_slices=n_slices)
     if packD is None:
-        st.error("D=Σ(W sinα) の評価に失敗しました。地形/層設定を見直してください。")
+        st.error("D=Σ(W sinα) の評価に失敗しました。")
         st.stop()
     D_sum, _, _ = packD
-    Fs0 = float(arc["Fs"])
-    Fs_after = Fs0 + (T_sum / max(D_sum, 1e-9))
 
-    # --- 図・メトリクス
-    set_axes(ax, H, L, ground)
-    ax.grid(True); ax.legend()
+    Fs0 = float(arc["Fs"])
+    Fs_after = Fs0 + T_sum / max(D_sum, 1e-9)
+
+    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
 
     c1, c2, c3 = st.columns(3)
