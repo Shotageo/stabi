@@ -723,29 +723,13 @@ elif page.startswith("5"):
         st.info("ネイル頭が未配置です。Page4でネイルを配置してください。")
         st.stop()
 
-    # 材料（kN 系）
-    tau_cap_kPa = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))  # kPa = kN/m^2
-    d_g         = float(cfg_get("layers.d_g", 0.125))                # m
-    d_s         = float(cfg_get("layers.d_s", 0.022))                # m
-    fy_MPa      = float(cfg_get("layers.fy", 1000.0))                # MPa
-    gamma_m     = float(cfg_get("layers.gamma_m", 1.2))
-    mu_decay    = float(cfg_get("layers.mu", 0.0))
-
-    # ネイル設定
-    angle_mode = cfg_get("nails.angle_mode")
-    beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
-    delta_beta = float(cfg_get("nails.delta_beta", 0.0))
-    L_mode     = cfg_get("nails.L_mode")
-    L_nail     = float(cfg_get("nails.L_nail", 5.0))
-    d_embed    = float(cfg_get("nails.d_embed", 1.0))
-
-    # レイヤ作成（★ lem. で明示）
+    # --- レイヤ（★必ず lem. 経由）
     n_layers = int(cfg_get("layers.n"))
     interfaces = []
     if n_layers >= 2: interfaces.append(lem.make_interface1_example(H, L))
     if n_layers >= 3: interfaces.append(lem.make_interface2_example(H, L))
 
-    # 図
+    # --- 図のベース
     fig, ax = plt.subplots(figsize=(10.0, 7.0))
     Xd, Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd, Yg)
@@ -755,32 +739,52 @@ elif page.startswith("5"):
     ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
     ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={arc['Fs']:.3f})")
 
-    # 斜面接線角
+    # --- 材料（kN 系）
+    tau_cap_kPa = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))  # kPa = kN/m^2
+    d_g         = float(cfg_get("layers.d_g", 0.125))                # m
+    d_s         = float(cfg_get("layers.d_s", 0.022))                # m
+    fy_MPa      = float(cfg_get("layers.fy", 1000.0))                # MPa
+    gamma_m     = float(cfg_get("layers.gamma_m", 1.2))
+    mu_decay    = float(cfg_get("layers.mu", 0.0))                   # 0..0.9
+
+    # --- ネイル設定
+    angle_mode = cfg_get("nails.angle_mode")
+    beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
+    delta_beta = float(cfg_get("nails.delta_beta", 0.0))
+    L_mode     = cfg_get("nails.L_mode")
+    L_nail     = float(cfg_get("nails.L_nail", 5.0))
+    d_embed    = float(cfg_get("nails.d_embed", 1.0))
+
+    # 斜面接線角（水平基準、反時計+）
     def _slope_tangent_angle(x):
         x2 = x + 1e-4
         y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
         return math.atan2((y2 - y1), (x2 - x))
 
-    # 容量計算の前処理
-    tau_cap = tau_cap_kPa * 1e-3            # kN/m^2
-    As = math.pi * (d_s**2) / 4.0           # m^2
+    # 容量前処理
+    tau_cap = tau_cap_kPa * 1e-3                # kN/m^2
+    As = math.pi * (d_s**2) / 4.0               # m^2（1m幅）
     T_steel = (fy_MPa * 1e3) * As / max(gamma_m, 1e-6)  # kN
 
-    T_sum = 0.0
+    # 頭プロット
     ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=26, color="tab:blue",
                label=f"Nail heads ({len(NH)})")
 
+    # ネイル→すべり面→ボンド、合力
+    T_sum = 0.0
     for i, (xh, yh) in enumerate(NH):
         xh = float(xh); yh = float(yh)
-        # 地山側へ：接線−90°（＋Δβ）
+
+        # 地山側へ向く角度：接線 − 90°（＋Δβ）
         if str(angle_mode).startswith("Slope-Normal"):
             tau = _slope_tangent_angle(xh)
-            theta = tau - math.pi/2 + delta_beta * DEG
+            theta = tau - math.pi/2 + math.radians(delta_beta)
         else:
-            theta = -abs(beta_deg) * DEG
+            theta = -abs(math.radians(beta_deg))   # 水平から下向き
+
         ct, st = math.cos(theta), math.sin(theta)
 
-        # 円との交点（t>0 最小）
+        # レイ×円（t>0 最小根）
         B = 2.0 * ((xh - xc) * ct + (yh - yc) * st)
         C = (xh - xc)**2 + (yh - yc)**2 - R**2
         disc = B*B - 4.0*C
@@ -789,6 +793,7 @@ elif page.startswith("5"):
                 ax.plot([xh, xh + ct*L_nail], [yh, yh + st*L_nail],
                         color="tab:blue", lw=1.2, alpha=0.5)
             continue
+
         sdisc = math.sqrt(max(0.0, disc))
         t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
         t_pos = [t for t in t_candidates if t > 1e-9]
@@ -797,6 +802,7 @@ elif page.startswith("5"):
                 ax.plot([xh, xh + ct*L_nail], [yh, yh + st*L_nail],
                         color="tab:blue", lw=1.2, alpha=0.5)
             continue
+
         t = min(t_pos)
         xq, yq = xh + ct*t, yh + st*t
 
@@ -808,14 +814,16 @@ elif page.startswith("5"):
         if Lb > 1e-3:
             xb2, yb2 = xq + ct*Lb, yq + st*Lb
             ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.95)
-            T_grout = tau_cap * math.pi * d_g * Lb  # kN
+
+            # 容量（グラウト vs 鋼材）
+            T_grout = tau_cap * math.pi * d_g * Lb   # kN
             T_cap   = min(T_grout, T_steel)
             if mu_decay > 0 and len(NH) > 1:
-                w = 1.0 - mu_decay * (i / (len(NH)-1))
+                w = 1.0 - mu_decay * (i / (len(NH) - 1))
                 T_cap *= max(0.0, w)
             T_sum += T_cap
 
-    # D = Σ(W sinα)
+    # D = Σ(W sinα) を未補強切片から取得
     mats = cfg_get("layers.mat")
     soils = [Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
     allow_cross = []
