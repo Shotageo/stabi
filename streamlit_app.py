@@ -715,31 +715,29 @@ elif page.startswith("5"):
     import numpy as np
     import matplotlib.pyplot as plt
 
-    # ---- cfg を必ず用意（直リンク/再起動で空でも復旧）----
+    # ---- cfg を必ず用意 ----
     if "cfg" not in st.session_state or not isinstance(st.session_state["cfg"], dict):
         st.session_state["cfg"] = default_cfg()
 
     st.subheader("補強後解析（簡易合成）")
 
-    # ========== 必須データ取得 ==========
+    # ========== 必須データ ==========
     arc = cfg_get("results.chosen_arc")
     NH  = cfg_get("results.nail_heads", [])
 
-    # ---- プリフライト（ここで全部正規化＆診断）----
-    # 1) arc 構造
+    # ---- プリフライト（壊れててもここで復旧）----
     need = {"xc","yc","R","x1","x2","Fs"}
     if not isinstance(arc, dict) or not need.issubset(arc.keys()):
-        st.error("未補強すべり面（results.chosen_arc）が未確定 / 破損しています。Page3を再実行してください。")
+        st.info("未補強すべり面が未確定です。Page3で未補強の計算を実行してください。")
         st.stop()
     try:
         for k in list(need):
             arc[k] = float(arc[k])
             if not np.isfinite(arc[k]): raise ValueError(k)
     except Exception:
-        st.error("results.chosen_arc に NaN/inf など不正値があります。Page3で再計算してください。")
+        st.error("results.chosen_arc に不正な数値があります。Page3で再計算してください。")
         st.stop()
 
-    # 2) nail heads
     try:
         NH = [(float(x), float(y)) for (x, y) in NH if np.isfinite(x) and np.isfinite(y)]
     except Exception:
@@ -748,33 +746,22 @@ elif page.startswith("5"):
         st.info("ネイル頭が未配置です。Page4でネイルを配置してください。")
         st.stop()
 
-    # 3) layers.mat を dict[int] に正規化
     mats_raw = cfg_get("layers.mat")
     if not isinstance(mats_raw, dict) or not mats_raw:
         mats_raw = default_cfg()["layers"]["mat"]
-
     def _to_int(k):
         try: return int(k)
         except: return k
-
-    mats_norm = {}
+    mats = {}
     for k, m in mats_raw.items():
         if not isinstance(m, dict): continue
-        try:
-            ki = int(_to_int(k))
-            mats_norm[ki] = {
-                "gamma": float(m["gamma"]),
-                "c":     float(m["c"]),
-                "phi":   float(m["phi"]),
-                "tau":   float(m.get("tau", 0.0)),
-            }
-        except Exception:
-            st.error("layers.mat の項目に数値化できない値があります。Page2で再保存してください。")
-            st.stop()
-    mats = dict(sorted(mats_norm.items(), key=lambda t: t[0]))
-    cfg_set("layers.mat", mats)  # 正規化して保存
+        mats[int(_to_int(k))] = {
+            "gamma": float(m["gamma"]), "c": float(m["c"]),
+            "phi": float(m["phi"]), "tau": float(m.get("tau", 0.0))
+        }
+    mats = dict(sorted(mats.items(), key=lambda t: t[0]))
+    cfg_set("layers.mat", mats)
 
-    # 4) QUALITY が無い環境でも動かす
     if "QUALITY" not in globals() or not isinstance(QUALITY, dict):
         QUALITY = {"Normal": {"final_slices": 40}}
 
@@ -785,7 +772,7 @@ elif page.startswith("5"):
     if n_layers >= 2: interfaces.append(lem.make_interface1_example(H, L))
     if n_layers >= 3: interfaces.append(lem.make_interface2_example(H, L))
 
-    # ========== 図ベース ==========
+    # ========== 図の土台（常に表示：プレビュー可） ==========
     fig, ax = plt.subplots(figsize=(10.0, 7.0))
     Xd, Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd, Yg)
@@ -795,14 +782,11 @@ elif page.startswith("5"):
     ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
     ax.plot(xs, ys, lw=2.4, color="tab:red", label=f"Slip arc (Fs0={arc['Fs']:.3f})")
 
-    # ========== 材料・ネイル設定 ==========
-    tau_cap_kPa = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))  # kPa
-    d_g   = float(cfg_get("layers.d_g", 0.125))                      # m
-    d_s   = float(cfg_get("layers.d_s", 0.022))                      # m
-    fy    = float(cfg_get("layers.fy", 1000.0))                      # MPa
-    gamma_m = float(cfg_get("layers.gamma_m", 1.2))
-    mu_decay= float(cfg_get("layers.mu", 0.0))
+    # ネイル頭は常に表示（プレビュー）
+    ax.scatter([p[0] for p in NH], [p[1] for p in NH],
+               s=26, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
+    # ---- ネイル描画用ヘルパ ----
     angle_mode = str(cfg_get("nails.angle_mode", "Slope-Normal (⊥斜面)"))
     beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
     delta_beta = float(cfg_get("nails.delta_beta", 0.0))
@@ -810,64 +794,92 @@ elif page.startswith("5"):
     L_nail     = float(cfg_get("nails.L_nail", 5.0))
     d_embed    = float(cfg_get("nails.d_embed", 1.0))
 
-    # 地表接線角（水平基準、反時計+）
     def slope_tangent_angle(x):
         x2 = x + 1e-4
         y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
         return math.atan2((y2 - y1), (x2 - x))
 
-    # 容量（kN系に統一）
-    tau_cap = tau_cap_kPa * 1e-3          # kN/m^2
-    As = math.pi * (d_s**2) / 4.0         # m^2（1m幅想定）
-    T_steel = fy * 1e3 * As / max(gamma_m, 1e-6)  # kN
-
-    # 頭の表示
-    ax.scatter([p[0] for p in NH], [p[1] for p in NH],
-               s=26, color="tab:blue", label=f"Nail heads ({len(NH)})")
-
-    # ========== ネイル：交点・ボンド・合力 ==========
-    T_sum = 0.0
-    for i, (xh, yh) in enumerate(NH):
-        xh = float(xh); yh = float(yh)
-
+    # すべり面との交点を探して、プレビュー線（青）だけは常に描く
+    for (xh, yh) in NH:
         if angle_mode.startswith("Slope-Normal"):
             tau = slope_tangent_angle(xh)
-            theta = tau - math.pi/2 + math.radians(delta_beta)  # 地山側に向ける
+            theta = tau - math.pi/2 + math.radians(delta_beta)  # 地山側
         else:
             theta = -abs(math.radians(beta_deg))                # 水平から下向き
-
         ct, st_sin = math.cos(theta), math.sin(theta)
+        B = 2.0 * ((xh - xc)*ct + (yh - yc)*st_sin)
+        C = (xh - xc)**2 + (yh - yc)**2 - R**2
+        disc = B*B - 4.0*C
+        if disc <= 0: 
+            # 交点なし：固定長のプレビュー
+            ax.plot([xh, xh + ct*L_nail], [yh, yh + st_sin*L_nail],
+                    color="tab:blue", lw=1.2, alpha=0.5)
+            continue
+        sdisc = math.sqrt(max(0.0, disc))
+        t_pos = [t for t in [(-B - sdisc)/2.0, (-B + sdisc)/2.0] if t > 1e-9]
+        if not t_pos:
+            ax.plot([xh, xh + ct*L_nail], [yh, yh + st_sin*L_nail],
+                    color="tab:blue", lw=1.2, alpha=0.5)
+            continue
+        t = min(t_pos)
+        xq, yq = xh + ct*t, yh + st_sin*t
+        ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.6, alpha=0.9)
+        # ボンド区間プレビュー（緑）
+        Lb_prev = (max(0.0, d_embed) if "パターン2" in L_mode else max(0.0, L_nail - t))
+        if Lb_prev > 1e-3:
+            xb2, yb2 = xq + ct*Lb_prev, yq + st_sin*Lb_prev
+            ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.0, alpha=0.9)
 
-        # レイ×円（t>0 の最小根）
-        B = 2.0 * ((xh - xc) * ct + (yh - yc) * st_sin)
+    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
+    st.pyplot(fig); plt.close(fig)
+
+    # ========== ここから「ボタンで実行」 ==========
+    btn = st.button("▶ 補強後の計算を実行")
+    if not btn:
+        st.caption("ボタンを押すと、ネイルの引抜/鋼材と D=Σ(W sinα) から Fs を合成します。")
+        st.stop()
+
+    # ---- 材料パラメータ（kN系）----
+    tau_cap_kPa = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))  # kPa
+    d_g   = float(cfg_get("layers.d_g", 0.125))                      # m
+    d_s   = float(cfg_get("layers.d_s", 0.022))                      # m
+    fy    = float(cfg_get("layers.fy", 1000.0))                      # MPa
+    gamma_m = float(cfg_get("layers.gamma_m", 1.2))
+    mu_decay= float(cfg_get("layers.mu", 0.0))
+
+    tau_cap = tau_cap_kPa * 1e-3             # kN/m^2
+    As = math.pi * (d_s**2) / 4.0            # m^2（1m幅）
+    T_steel = fy * 1e3 * As / max(gamma_m, 1e-6)  # kN
+
+    # ---- ネイル合力（ボタン押下時のみ計算）----
+    T_sum = 0.0
+    for i, (xh, yh) in enumerate(NH):
+        if angle_mode.startswith("Slope-Normal"):
+            tau = slope_tangent_angle(xh)
+            theta = tau - math.pi/2 + math.radians(delta_beta)
+        else:
+            theta = -abs(math.radians(beta_deg))
+        ct, st_sin = math.cos(theta), math.sin(theta)
+        B = 2.0 * ((xh - xc)*ct + (yh - yc)*st_sin)
         C = (xh - xc)**2 + (yh - yc)**2 - R**2
         disc = B*B - 4.0*C
         if disc <= 0: 
             continue
         sdisc = math.sqrt(max(0.0, disc))
-        t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
-        t_pos = [t for t in t_candidates if t > 1e-9]
-        if not t_pos:
+        t_pos = [t for t in [(-B - sdisc)/2.0, (-B + sdisc)/2.0] if t > 1e-9]
+        if not t_pos: 
             continue
         t = min(t_pos)
-
-        xq, yq = xh + ct*t, yh + st_sin*t
-        ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.6, alpha=0.9)
-
         Lb = (max(0.0, d_embed) if "パターン2" in L_mode else max(0.0, L_nail - t))
-        if Lb > 1e-3:
-            xb2, yb2 = xq + ct*Lb, yq + st_sin*Lb
-            ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.95)
+        if Lb <= 1e-3:
+            continue
+        T_grout = tau_cap * math.pi * d_g * Lb
+        T_cap   = min(T_grout, T_steel)
+        if mu_decay > 0 and len(NH) > 1:
+            T_cap *= max(0.0, 1.0 - mu_decay * (i / (len(NH) - 1)))
+        T_sum += T_cap
 
-            T_grout = tau_cap * math.pi * d_g * Lb  # kN
-            T_cap   = min(T_grout, T_steel)
-            if mu_decay > 0 and len(NH) > 1:
-                w = 1.0 - mu_decay * (i / (len(NH) - 1))
-                T_cap *= max(0.0, w)
-            T_sum += T_cap
-
-    # ========== D = Σ(W sinα) 取得 ==========
-    # Soil / driving は lem 経由（import 経路差異に強い）
+    # ---- D=Σ(W sinα) ----
     soils = [lem.Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
     allow_cross = []
     if n_layers >= 2:
@@ -879,7 +891,6 @@ elif page.startswith("5"):
 
     qname = str(cfg_get("grid.quality", "Normal"))
     n_slices = QUALITY.get(qname, QUALITY["Normal"])["final_slices"]
-
     packD = lem.driving_sum_for_R_multi(ground, interfaces, soils, allow_cross,
                                         xc, yc, R, n_slices=n_slices)
     if not packD:
@@ -887,15 +898,12 @@ elif page.startswith("5"):
         st.stop()
     D_sum, _, _ = packD
     if not (np.isfinite(D_sum) and D_sum > 0):
-        st.error("D が不正（≤0またはNaN）です。設定を見直してください。")
+        st.error("D が不正（≤0 or NaN）です。設定を見直してください。")
         st.stop()
 
-    # ========== Fs（簡易合成） ==========
+    # ---- Fs（簡易合成）----
     Fs0 = float(arc["Fs"])
     Fs_after = Fs0 + T_sum / max(D_sum, 1e-9)
-
-    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
-    st.pyplot(fig); plt.close(fig)
 
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("ネイル本数", f"{len(NH)}")
