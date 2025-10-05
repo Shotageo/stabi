@@ -667,6 +667,7 @@ elif page.startswith("4"):
 
 
 # ===================== Page5: 補強後解析 =====================
+# ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
     import stabi_lem as lem
     from nail_engine import reinforce_nails
@@ -684,7 +685,11 @@ elif page.startswith("5"):
         st.info("必要情報: " + "、".join(missing))
         st.stop()
 
-    # nails_cfg を構成
+    run = st.button("▶ 補強後の計算を実行")
+    if not run:
+        st.stop()
+
+    # nails_cfg
     nails_cfg = {
         "heads": NH,
         "angle_mode": cfg_get("nails.angle_mode"),
@@ -700,24 +705,18 @@ elif page.startswith("5"):
         "tau_grout_cap_kPa": cfg_get("layers.tau_grout_cap_kPa"),
     }
 
-    # soils（単層相当でOK。多層でも最上層を使う）
     mats = cfg_get("layers.mat")
     soils=[Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
     interfaces=[]; allow_cross=[]
 
-    # スライス抽出
     S = lem.compute_slices_poly_multi(ground, interfaces, soils, allow_cross,
                                       arc["xc"], arc["yc"], arc["R"], n_slices=40)
     if S is None:
         st.error("円弧が成立しません（Page3の再計算を確認）"); st.stop()
 
-    # ネイル→Tt
     Tt, diag = reinforce_nails(arc, ground, soils, nails_cfg, S)
-
-    # CouplerでFs更新
     Fs_after = bishop_with_reinforcement(S, soils[0], Tt)
 
-    # 保存
     cfg_set("results.reinforced", {
         "n_nails": len(NH),
         "arc_Fs_unreinforced": arc["Fs"],
@@ -726,34 +725,39 @@ elif page.startswith("5"):
         "diag": diag,
     })
 
-    # 図化
+    # === 図化 ===
     fig, ax = plt.subplots(figsize=(10.0,7.0))
-    # 地層は簡略（単層塗り）
     Xd = np.linspace(ground.X[0], ground.X[-1], 600)
     Yg = np.array([float(ground.y_at(x)) for x in Xd])
     ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
     ax.plot(ground.X, ground.Y, lw=2.0, label="Ground")
 
-    # すべり円弧
     xs = np.linspace(arc["x1"], arc["x2"], 400)
     ys = arc["yc"] - np.sqrt(np.maximum(0.0, arc["R"]**2 - (xs - arc["xc"])**2))
     ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={arc['Fs']:.3f} → {Fs_after:.3f})")
 
-    # ネイル頭と交点・ボンド向き
+    # ネイル頭
     ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+
+    # 交点 & 有効ボンド方向を少し長めに表示
     for h in (diag.get("hits") or []):
         if h.get("xq") is None: continue
-        ax.plot([h["xq"], h["xq"]], [h["yq"], h["yq"]+0.01], color="k", lw=0.8)  # 小マーク
-    # スライス別Tt（棒）
+        ax.plot(h["xq"], h["yq"], marker="o", markersize=4, color="k")
+        # ボンド方向の短い線（見やすく）
+        # 方向は斜面法線/βと同じなので省略可。簡易的に小さな縦棒でマーク
+        ax.vlines(h["xq"], h["yq"], h["yq"]+0.5, colors="k", linewidth=0.8, alpha=0.6)
+
+    # スライス別Tt（正規化して棒の長さに反映）
+    tmax = float(np.max(Tt)) if np.any(Tt>0) else 0.0
     for xi,ti in zip(S["x_mid"], Tt):
-        if ti <= 0: continue
+        if ti <= 0 or tmax <= 0: continue
         y_top = float(ground.y_at(xi))
-        ax.plot([xi, xi], [y_top, y_top + 0.10*ti/max(1.0, np.max(Tt)) * (0.08*L)], color="tab:green", lw=2.0, alpha=0.8)
+        Lbar = 0.12*L * (ti/tmax)  # 画面スケールで見える長さに
+        ax.plot([xi, xi], [y_top, y_top + Lbar], color="tab:green", lw=2.0, alpha=0.9)
 
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
 
-    # メトリクス
     col1,col2,col3 = st.columns(3)
     with col1: st.metric("ネイル本数", f"{len(NH)}")
     with col2: st.metric("未補強Fs", f"{arc['Fs']:.3f}")
