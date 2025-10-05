@@ -568,7 +568,7 @@ elif page.startswith("4"):
     if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
     if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
 
-    st.subheader("ソイルネイル配置（試作：頭位置のみ）")
+    st.subheader("ソイルネイル配置（試作：頭位置＋可視化）")
 
     # --- まず chosen_arc を堅牢化：無ければ unreinforced から復元して保存
     arc = cfg_get("results.chosen_arc")
@@ -579,7 +579,7 @@ elif page.startswith("4"):
             idx = res_un.get("idx_minFs", int(np.argmin([d["Fs"] for d in res_un["refined"]])))
             d = res_un["refined"][idx]
             arc = dict(xc=xc, yc=yc, R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"])
-            cfg_set("results.chosen_arc", arc)  # ← 保存
+            cfg_set("results.chosen_arc", arc)
         else:
             st.info("未補強の Min Fs 円弧が未確定です。Page3 で「▶ 計算開始（未補強）」を実行してから来てください。")
             st.stop()
@@ -649,19 +649,75 @@ elif page.startswith("4"):
         cfg_set("nails.d_embed", float(st.session_state.get("d_embed", 1.0)))
         st.success("cfgに保存しました。")
 
-    # --- 図化
-    fig,ax = plt.subplots(figsize=(10.0,7.0))
-    Xd2,Yg2 = draw_layers_and_ground(ax, ground, n_layers, interfaces)
+    # --- 図化（ここからが今回の置換ポイント） ---
+    fig, ax = plt.subplots(figsize=(10.0, 7.0))
+    Xd2, Yg2 = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd2, Yg2)
 
-    xc,yc,R = arc["xc"],arc["yc"],arc["R"]
-    xs=np.linspace(arc["x1"], arc["x2"], 400)
-    ys=yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
+    xc, yc, R = arc["xc"], arc["yc"], arc["R"]
+    xs = np.linspace(arc["x1"], arc["x2"], 400)
+    ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
     ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Chosen slip arc (Fs={arc['Fs']:.3f})")
 
     NH = cfg_get("results.nail_heads", [])
     if NH:
         ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+
+    # ===== ネイル軸（頭→すべり面）とボンド区間を可視化 =====
+    def _slope_tangent_angle(ground, x):
+        x2 = x + 1e-4
+        y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
+        return math.atan2((y2 - y1), (x2 - x))
+
+    angle_mode = cfg_get("nails.angle_mode")
+    beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
+    delta_beta = float(cfg_get("nails.delta_beta", 0.0))
+    L_mode     = cfg_get("nails.L_mode")
+    L_nail     = float(cfg_get("nails.L_nail", 5.0))
+    d_embed    = float(cfg_get("nails.d_embed", 1.0))
+
+    try:
+        for (xh, yh) in NH:
+            # ネイル方向（斜面法線＝地山側へ +90°）
+            if str(angle_mode).startswith("Slope-Normal"):
+                tau = _slope_tangent_angle(ground, float(xh))
+                theta = tau + math.pi/2 + delta_beta * math.pi/180.0
+            else:
+                theta = -beta_deg * math.pi/180.0
+            ct, st = math.cos(theta), math.sin(theta)
+
+            # 頭→すべり面の交点（光線：t>0の最小根）
+            B = 2 * ((xh - xc) * ct + (yh - yc) * st)
+            C = (xh - xc)**2 + (yh - yc)**2 - R**2
+            disc = B*B - 4*C
+            if disc <= 0:
+                ax.plot([xh, xh + ct * L_nail], [yh, yh + st * L_nail], color="tab:blue", lw=1.5, alpha=0.4)
+                continue
+            sdisc = math.sqrt(max(0.0, disc))
+            t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
+            t_pos = [t for t in t_candidates if t > 1e-9]
+            if not t_pos:
+                ax.plot([xh, xh + ct * L_nail], [yh, yh + st * L_nail], color="tab:blue", lw=1.5, alpha=0.4)
+                continue
+            t = min(t_pos)
+            xq, yq = xh + ct * t, yh + st * t
+
+            # 軸（頭→すべり面）
+            ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
+
+            # ボンド区間（すべり面以深）
+            if str(L_mode).startswith("パターン2"):
+                Lb = max(0.0, d_embed)
+            else:
+                Lb = max(0.0, L_nail - t)
+            if Lb > 1e-3:
+                xb2, yb2 = xq + ct * Lb, yq + st * Lb
+                ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
+    except Exception as e:
+        st.warning(f"nail drawing skipped: {e}")
+
+    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
+    st.pyplot(fig); plt.close(fig)
 
     # ===== ネイル軸（頭→すべり面）とボンド区間を可視化 =====
 def _slope_tangent_angle(ground, x):
