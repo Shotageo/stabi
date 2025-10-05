@@ -84,6 +84,17 @@ def reinforce_nails(arc: dict, ground, soils, nails_cfg: dict, slices: dict):
 
         Tti = T_cap * proj
         Tt[idx] += Tti
-        hits.append(dict(reason="ok", xq=xq, yq=yq, idx=idx, Tt=Tti, L_bond=L_bond, T_bond=T_bond, T_steel=T_steel))
+                # ・・・略・・・
+
+        Tti = T_cap * proj
+        Tt[idx] += Tti
+        hits.append(dict(
+            reason="ok",
+            xq=xq, yq=yq, idx=idx, Tt=Tti,
+            L_bond=L_bond, T_bond=T_bond, T_steel=T_steel,
+            theta=theta,                # ← 追加：ネイル方向
+            t_head_to_slip=t            # ← 追加：頭→すべり面までの長さ
+        ))
+
 
     return Tt, {"hits": hits}
