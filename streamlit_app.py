@@ -567,6 +567,9 @@ elif page.startswith("3"):
 
 # ===================== Page4: ネイル配置 =====================
 elif page.startswith("4"):
+    # ← どこかで st が上書きされていても、ここで毎回復旧する
+    st = ST
+
     H, L, ground = make_ground_from_cfg()
 
     # レイヤー定義
@@ -697,8 +700,9 @@ elif page.startswith("4"):
                 theta = tau + math.pi/2 + delta_beta * math.pi/180.0
             else:
                 theta = -beta_deg * math.pi/180.0
-            ct, snt = math.cos(theta), math.sin(theta)  # sinθは snt （st と衝突回避）
+            ct, snt = math.cos(theta), math.sin(theta)  # sinθは snt（st と衝突回避）
 
+            # 頭→すべり面の交点（光線：t>0の最小根）
             B = 2 * ((xh - xc) * ct + (yh - yc) * snt)
             C = (xh - xc)**2 + (yh - yc)**2 - R**2
             disc = B*B - 4*C
@@ -714,8 +718,10 @@ elif page.startswith("4"):
             t = min(t_pos)
             xq, yq = xh + ct * t, yh + snt * t
 
+            # 軸（頭→すべり面）
             ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
 
+            # ボンド区間（すべり面以深）
             if str(L_mode).startswith("パターン2"):
                 Lb = max(0.0, d_embed)
             else:
@@ -724,10 +730,14 @@ elif page.startswith("4"):
                 xb2, yb2 = xq + ct * Lb, yq + snt * Lb
                 ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
     except Exception as e:
-        st.warning(f"nail drawing skipped: {e}")
+        # ← ここは ST.warning で“確実に”出す
+        ST.warning(f"nail drawing skipped: {e}")
 
     set_axes(ax, H4, L4, ground4)
     ax.grid(True); ax.legend()
+
+    # 念のためここでも st を復旧（どこかで上書きされてもここで戻す）
+    st = ST
     st.pyplot(fig); plt.close(fig)
 
 # ===================== Page5: 補強後解析 =====================
