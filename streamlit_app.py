@@ -6,6 +6,7 @@ import os, sys, math, time, heapq
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
+ST = st   # ← これを追加（STなら上書きされません）
 
 # ---- stabi_lem の import（パッケージ/単体の両対応）----
 try:
