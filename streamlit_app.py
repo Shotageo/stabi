@@ -3,6 +3,7 @@ from __future__ import annotations
 import streamlit as st
 import numpy as np, heapq, time
 import matplotlib.pyplot as plt
+import math
 
 from stabi_lem import (
     Soil, GroundPL,
@@ -662,11 +663,64 @@ elif page.startswith("4"):
     if NH:
         ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
+    # ===== ネイル軸（頭→すべり面）とボンド区間を可視化 =====
+def _slope_tangent_angle(ground, x):
+    x2 = x + 1e-4
+    y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
+    return math.atan2((y2 - y1), (x2 - x))
+
+# cfg から描画パラメータ取得
+angle_mode = cfg_get("nails.angle_mode")
+beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
+delta_beta = float(cfg_get("nails.delta_beta", 0.0))
+L_mode     = cfg_get("nails.L_mode")
+L_nail     = float(cfg_get("nails.L_nail", 5.0))
+d_embed    = float(cfg_get("nails.d_embed", 1.0))
+
+for (xh, yh) in NH:
+    # ネイル方向（斜面法線＝地山側へ +90°）
+    if str(angle_mode).startswith("Slope-Normal"):
+        tau = _slope_tangent_angle(ground, float(xh))
+        theta = tau + math.pi/2 + delta_beta*math.pi/180.0
+    else:
+        theta = -beta_deg*math.pi/180.0
+    ct, st = math.cos(theta), math.sin(theta)
+
+    # 頭→すべり面の交点（光線：t>0の最小根）
+    B = 2*((xh - xc)*ct + (yh - yc)*st)
+    C = (xh - xc)**2 + (yh - yc)**2 - R**2
+    disc = B*B - 4*C
+    if disc <= 0:
+        # 交点なし：固定長だけ淡色で描画
+        ax.plot([xh, xh+ct*L_nail], [yh, yh+st*L_nail], color="tab:blue", lw=1.5, alpha=0.5)
+        continue
+    sdisc = math.sqrt(max(0.0, disc))
+    t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
+    t_pos = [t for t in t_candidates if t > 1e-9]
+    if not t_pos:
+        ax.plot([xh, xh+ct*L_nail], [yh, yh+st*L_nail], color="tab:blue", lw=1.5, alpha=0.5)
+        continue
+    t = min(t_pos)
+    xq, yq = xh + ct*t, yh + st*t
+
+    # 軸（頭→すべり面）を青実線で
+    ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
+
+    # ボンド区間（すべり面以深）
+    if str(L_mode).startswith("パターン2"):   # すべり面より +Δm
+        Lb = max(0.0, d_embed)
+    else:                                     # 固定長
+        Lb = max(0.0, L_nail - t)
+    if Lb > 1e-3:
+        xb2 = xq + ct*Lb
+        yb2 = yq + st*Lb
+        ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
+
+
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
 
 
-# ===================== Page5: 補強後解析 =====================
 # ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
     import stabi_lem as lem
