@@ -1,4 +1,4 @@
-# streamlit_app.py — Stabi LEM + Soil Nail 可視化（フル版・一括置換用）
+# streamlit_app.py — Stabi LEM + Soil Nail（安定・一括貼替版）
 from __future__ import annotations
 
 # ====== Imports ======
@@ -6,7 +6,7 @@ import os, sys, math, time, heapq
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
-ST = st   # ← これを追加（STなら上書きされません）
+ST = st  # ← 保険：どこかで st を数値で上書きしても ST を残す
 
 # ---- stabi_lem の import（パッケージ/単体の両対応）----
 try:
@@ -14,20 +14,7 @@ try:
 except ModuleNotFoundError:
     import stabi_lem as lem
 
-# ====== Imports ======
-import os, sys, math, time, heapq
-import numpy as np
-import matplotlib.pyplot as plt
-import streamlit as st
-ST = st   # 保険：st上書き回避用
-
-# ---- stabi_lem の import（パッケージ/単体の両対応）----
-try:
-    import stabi.stabi_lem as lem
-except ModuleNotFoundError:
-    import stabi_lem as lem
-
-# ★★ ここが重要：lem 経由でシンボルをエイリアス化（from lem import ... は使わない）★★
+# ★ “lem”経由で必要シンボルを束ねる（from lem import ... は使わない）
 Soil = lem.Soil
 GroundPL = lem.GroundPL
 make_ground_example = lem.make_ground_example
@@ -39,7 +26,7 @@ fs_given_R_multi = lem.fs_given_R_multi
 arc_sample_poly_best_pair = lem.arc_sample_poly_best_pair
 driving_sum_for_R_multi = lem.driving_sum_for_R_multi
 
-# ---- 補強計算サブモジュール（既存のものを使用）----
+# ---- nail_engine / coupler が無い場合のフォールバック ----
 try:
     from nail_engine import reinforce_nails
 except Exception:
@@ -55,201 +42,55 @@ except Exception:
         if D <= 0: return slices.get("Fs0", np.nan)
         return slices.get("Fs0", 1.0) + float(np.sum(Tt)) / D
 
-st.set_page_config(page_title="Stabi LEM｜安定版", layout="wide")
-st.title("Stabi LEM｜多段UI（安定版・フル）")
+st.set_page_config(page_title="Stabi LEM｜cfg一元・安定版", layout="wide")
+st.title("Stabi LEM｜多段UI（cfg一元・安定版）")
 
-DEG = math.pi/180.0
+DEG = math.pi / 180.0
 
-# ---- 補強計算サブモジュール（既存のものを使用）----
-try:
-    from nail_engine import reinforce_nails
-except Exception:
-    # nail_engine が無い場合はダミー（計算なし）で落ちないように
-    def reinforce_nails(arc, ground, soils, nails_cfg, slices):
-        N = len(slices["x_mid"])
-        return np.zeros(N, dtype=float), {"hits": [], "notes": "nail_engine not found"}
+# ========= ここから共通ヘルパ（どのページでも使う） =========
+def inward_normal_angle(g, x, delta_beta_deg: float) -> float:
+    """
+    斜面接線角 tau から ±90° の法線2候補を作り，
+    **常に地山側（下向き: sinθ < 0）** を選んで返す。
+    """
+    x2 = x + 1e-4
+    y1 = float(g.y_at(x)); y2 = float(g.y_at(x2))
+    tau = math.atan2((y2 - y1), (x2 - x))
+    db = float(delta_beta_deg) * DEG
+    cand1 = tau - math.pi/2 + db
+    cand2 = tau + math.pi/2 + db
+    th = cand1 if math.sin(cand1) < 0 else cand2
+    if math.sin(th) >= 0:  # 念のため保険
+        th -= math.pi
+    return th
 
-try:
-    from coupler import bishop_with_reinforcement
-except Exception:
-    # coupler が無い場合は補強前Fsに依存した簡易計算にフォールバック
-    def bishop_with_reinforcement(slices, soil, Tt):
-        # きちんとした式は coupler.py を使う。ここはフォールバック。
-        D = float(np.sum(slices["W"] * np.sin(slices["alpha"])))
-        if D <= 0: return slices.get("Fs0", np.nan)
-        return slices.get("Fs0", 1.0) + float(np.sum(Tt)) / D
+def nail_ray_hit_circle(xh, yh, theta, xc, yc, R):
+    """ネイル頭(xh,yh)から方向thetaの光線と円の交点距離 t（t>0 の最小）"""
+    ct, snt = math.cos(theta), math.sin(theta)
+    B = 2 * ((xh - xc) * ct + (yh - yc) * snt)
+    C = (xh - xc)**2 + (yh - yc)**2 - R**2
+    disc = B*B - 4*C
+    if disc <= 0:
+        return None
+    rt = math.sqrt(max(0.0, disc))
+    cand = [(-B - rt) / 2.0, (-B + rt) / 2.0]
+    tpos = [t for t in cand if t > 1e-9]
+    return (min(tpos) if tpos else None)
 
-st.set_page_config(page_title="Stabi LEM｜安定版", layout="wide")
-st.title("Stabi LEM｜多段UI（安定版・フル）")
+def grout_pullout_capacity_kNm_per_m(d_g, Lb, tau_kPa):
+    """
+    グラウト側面摩擦 τ[kPa]=kN/m^2, 周長 π d_g, 長さ Lb → kN/m（2D 1m幅）
+    """
+    return math.pi * float(d_g) * float(max(0.0, Lb)) * float(max(0.0, tau_kPa))
 
-DEG = math.pi/180.0
-
-# ===================== cfg（正本） =====================
-def default_cfg():
-    return {
-        "geom": {"H": 25.0, "L": 60.0},
-        "water": {"mode": "WT", "ru": 0.0, "offset": -2.0, "wl_points": None},
-        "layers": {
-            "n": 3,
-            "mat": {
-                1: {"gamma": 18.0, "c": 5.0,  "phi": 30.0, "tau": 150.0},
-                2: {"gamma": 19.0, "c": 8.0,  "phi": 28.0, "tau": 180.0},
-                3: {"gamma": 20.0, "c": 12.0, "phi": 25.0, "tau": 200.0},
-            },
-            "tau_grout_cap_kPa": 150.0,
-            "d_g": 0.125,  # m
-            "d_s": 0.022,  # m
-            "fy": 1000.0, "gamma_m": 1.20, "mu": 0.0,
-        },
-        "grid": {
-            "x_min": None, "x_max": None, "y_min": None, "y_max": None,
-            "pitch": 5.0,
-            "method": "Bishop (simplified)",
-            "quality": "Normal",
-            "Fs_target": 1.20,
-            "allow_cross2": True, "allow_cross3": True,
-        },
-        "nails": {
-            "s_start": 5.0, "s_end": 35.0, "S_surf": 2.0, "S_row": 2.0,
-            "tiers": 1,
-            "angle_mode": "Slope-Normal (⊥斜面)",
-            "beta_deg": 15.0, "delta_beta": 0.0,
-            "L_mode": "パターン1：固定長", "L_nail": 5.0, "d_embed": 1.0,
-        },
-        "results": {
-            "unreinforced": None,   # {"center":(xc,yc),"refined":[...],"idx_minFs":int}
-            "chosen_arc": None,
-            "nail_heads": [],
-            "reinforced": None,
-        }
-    }
-
-# --- cfg helpers ---
-def _maybe_int_key(p):
-    if isinstance(p, str) and p.isdigit():
-        try: return int(p)
-        except Exception: return p
-    return p
-
-def cfg_get(path, default=None):
-    node = st.session_state["cfg"]
-    for p in path.split("."):
-        p_try = _maybe_int_key(p)
-        if isinstance(node, dict):
-            if p in node: node = node[p]
-            elif p_try in node: node = node[p_try]
-            else: return default
-        else:
-            return default
-    return node
-
-def cfg_set(path, value):
-    node = st.session_state["cfg"]
-    parts = path.split(".")
-    for p in parts[:-1]:
-        p_try = _maybe_int_key(p)
-        if isinstance(node, dict):
-            if p in node: node = node[p]
-            elif p_try in node: node = node[p_try]
-            else:
-                node[p_try] = {}
-                node = node[p_try]
-        else:
-            raise KeyError(f"cfg_set: '{p}' below is not a dict")
-    last = _maybe_int_key(parts[-1])
-    if isinstance(node, dict): node[last] = value
-    else: raise KeyError(f"cfg_set: cannot set at '{parts[-1]}'")
-
-def ui_seed(key, value):
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-# 起動時に cfg を1度だけ生成
-if "cfg" not in st.session_state:
-    st.session_state["cfg"] = default_cfg()
-
-# ===================== 共通小物 =====================
-QUALITY = {
-    "Coarse": dict(quick_slices=10, final_slices=30, n_entries_final=900,  probe_n_min_quick=81,
-                   limit_arcs_quick=80,  show_k=60,  coarse_subsample="every 3rd",
-                   coarse_entries=160, coarse_limit_arcs=50, coarse_probe_min=61,
-                   budget_coarse_s=0.6, budget_quick_s=0.9),
-    "Normal": dict(quick_slices=12, final_slices=40, n_entries_final=1300, probe_n_min_quick=101,
-                   limit_arcs_quick=120, show_k=120, coarse_subsample="every 2nd",
-                   coarse_entries=220, coarse_limit_arcs=70, coarse_probe_min=81,
-                   budget_coarse_s=0.8, budget_quick_s=1.2),
-    "Fine": dict(quick_slices=16, final_slices=50, n_entries_final=1700, probe_n_min_quick=121,
-                 limit_arcs_quick=160, show_k=180, coarse_subsample="full",
-                 coarse_entries=320, coarse_limit_arcs=100, coarse_probe_min=101,
-                 budget_coarse_s=1.2, budget_quick_s=1.8),
-    "Very-fine": dict(quick_slices=20, final_slices=60, n_entries_final=2200, probe_n_min_quick=141,
-                      limit_arcs_quick=220, show_k=240, coarse_subsample="full",
-                      coarse_entries=420, coarse_limit_arcs=140, coarse_probe_min=121,
-                      budget_coarse_s=1.8, budget_quick_s=2.6),
-}
-
-def make_ground_from_cfg():
-    H = float(cfg_get("geom.H")); L = float(cfg_get("geom.L"))
-    return H, L, make_ground_example(H, L)
-
-def set_axes(ax, H, L, ground):
-    x_upper = max(1.18*L, float(ground.X[-1])+0.05*L, 100.0)
-    y_upper = max(2.30*H, 0.05*H+2.0*H, 100.0)
-    ax.set_xlim(min(0.0-0.05*L, -2.0), x_upper)
-    ax.set_ylim(0.0, y_upper)
-    ax.set_aspect("equal", adjustable="box")
-
-def fs_to_color(fs):
-    if fs < 1.0: return (0.85,0,0)
-    if fs < 1.2:
-        t=(fs-1.0)/0.2; return (1.0,0.50+0.50*t,0.0)
-    return (0.0,0.55,0.0)
-
-def clip_yfloor(xs, ys, y_floor=0.0):
-    m = ys >= (y_floor - 1e-12)
-    if np.count_nonzero(m) < 2: return None
-    return xs[m], ys[m]
-
-def draw_layers_and_ground(ax, ground, n_layers, interfaces):
-    Xd = np.linspace(ground.X[0], ground.X[-1], 600)
-    Yg = np.array([float(ground.y_at(x)) for x in Xd])
-    if n_layers==1:
-        ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
-    elif n_layers==2:
-        Y1 = clip_interfaces_to_ground(ground, [interfaces[0]], Xd)[0]
-        ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
-        ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
-    else:
-        Y1,Y2 = clip_interfaces_to_ground(ground, [interfaces[0],interfaces[1]], Xd)
-        ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
-        ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
-        ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
-    ax.plot(ground.X, ground.Y, lw=2.0, label="Ground")
-    return Xd, Yg
-
-def draw_water(ax, ground, Xd, Yg):
-    wm = cfg_get("water.mode")
-    if not str(wm).startswith("WT"): return
-    W = cfg_get("water.wl_points")
-    if W is not None:
-        W = np.asarray(W, dtype=float)
-    if W is not None and isinstance(W, np.ndarray) and W.ndim==2 and W.shape[1]==2:
-        Yw = np.interp(Xd, W[:,0], W[:,1], left=W[0,1], right=W[-1,1])
-        Yw = np.clip(Yw, 0.0, Yg)
-        ax.plot(Xd, Yw, "-.", color="tab:blue", label="WT (saved)")
-    else:
-        off = float(cfg_get("water.offset",-2.0))
-        Yw = np.clip(Yg + off, 0.0, Yg)
-        ax.plot(Xd, Yw, "-.", color="tab:blue", label="WT (offset preview)")
-
-# ===================== サイドバー =====================
-with st.sidebar:
-    st.header("Pages")
-    page = st.radio("", ["1) 地形・水位", "2) 地層・材料", "3) 円弧探索（未補強）", "4) ネイル配置", "5) 補強後解析"], key="__page__")
-    st.caption("cfgが正本。保存しない限り自動上書きしません。")
-    if st.button("⚠ すべて初期化（cfgを再作成）"):
-        st.session_state["cfg"] = default_cfg()
-        st.success("初期化しました。")
+def steel_tension_capacity_kN_per_m(d_s, fy_MPa, gamma_m):
+    """
+    鉄筋降伏（kN/m）。As=π d^2/4, fy[MPa]=N/mm^2=MN/m^2=kN/mm^2*? → 変換簡略化:
+    fy[MPa]×10^3 = kN/m^2。d_s[m] で計算すると kN/m（2D 1m幅想定）
+    """
+    As = math.pi * (float(d_s)**2) / 4.0   # m^2
+    fy_kNm2 = float(fy_MPa) * 1000.0       # kN/m^2
+    return As * fy_kNm2 / max(1.0, float(gamma_m))
 
 # ===================== Page1: 地形・水位 =====================
 if page.startswith("1"):
