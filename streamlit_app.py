@@ -711,140 +711,153 @@ elif page.startswith("4"):
 
 # ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
-    H,L,ground = make_ground_from_cfg()
+    H, L, ground = make_ground_from_cfg()
     st.subheader("補強後解析（簡易合成）")
+
     arc = cfg_get("results.chosen_arc")
-    NH = cfg_get("results.nail_heads", [])
-    btn = st.button("▶ 補強後の計算を実行", disabled=not (arc and NH))
-    if not (arc and NH):
-        missing=[]
-        if not arc: missing.append("Page3のMin Fs円弧")
-        if not NH: missing.append("Page4のネイル頭配置")
-        st.info("必要情報: " + "、".join(missing))
-    elif btn:
-        # ---- D_sum（未補強の分母）----
-        n_layers = int(cfg_get("layers.n"))
-        ifaces=[]
-        if n_layers>=2: ifaces.append(lem.make_interface1_example(H,L))
-        if n_layers>=3: ifaces.append(lem.make_interface2_example(H,L))
+    NH  = cfg_get("results.nail_heads", [])
 
-        mats = cfg_get("layers.mat")
-        soils=[lem.Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
-        allow_cross=[]
-        if n_layers>=2:
-            soils.append(lem.Soil(mats[2]["gamma"], mats[2]["c"], mats[2]["phi"]))
-            allow_cross.append(bool(cfg_get("grid.allow_cross2")))
-        if n_layers>=3:
-            soils.append(lem.Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
-            allow_cross.append(bool(cfg_get("grid.allow_cross3")))
+    # 早期バリデーション
+    if not arc:
+        st.info("未補強の最小円弧が未確定です。Page3で未補強の計算を実行してください。")
+        st.stop()
+    if not NH:
+        st.info("ネイル頭が未配置です。Page4でネイルを配置してください。")
+        st.stop()
 
-        packD = lem.driving_sum_for_R_multi(ground, ifaces, soils, allow_cross,
-                                            arc["xc"], arc["yc"], arc["R"], n_slices=40)
-        if packD is None:
-            st.error("D_sum が取得できませんでした。円弧・範囲・層設定を確認してください。")
-            st.stop()
-        D_sum, _, _ = packD
-        Fs0 = float(arc["Fs"])
-        N0  = Fs0 * D_sum
+    # --- 材料パラメタ（kN単位系で扱う）
+    tau_cap_kPa = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))  # kPa
+    d_g         = float(cfg_get("layers.d_g", 0.125))                # m
+    d_s         = float(cfg_get("layers.d_s", 0.022))                # m
+    fy_MPa      = float(cfg_get("layers.fy", 1000.0))                # MPa
+    gamma_m     = float(cfg_get("layers.gamma_m", 1.2))
+    mu_decay    = float(cfg_get("layers.mu", 0.0))                   # 0..0.9 (任意)
 
-        # ---- ネイル合力（非常に簡易な合成）----
-        tau_cap = float(cfg_get("layers.tau_grout_cap_kPa"))   # kPa = kN/m^2
-        d_g     = float(cfg_get("layers.d_g"))
-        d_s     = float(cfg_get("layers.d_s"))
-        fy      = float(cfg_get("layers.fy"))                  # MPa
-        gamma_m = float(cfg_get("layers.gamma_m"))
-        mu      = float(cfg_get("layers.mu"))
+    # ネイル方向/長さモード
+    angle_mode = cfg_get("nails.angle_mode")
+    beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
+    delta_beta = float(cfg_get("nails.delta_beta", 0.0))
+    L_mode     = cfg_get("nails.L_mode")
+    L_nail     = float(cfg_get("nails.L_nail", 5.0))
+    d_embed    = float(cfg_get("nails.d_embed", 1.0))
 
-        # 補助：地表接線角
-        def slope_tangent_angle(ground, x):
-            x2 = x + 1e-4
-            y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
-            return math.atan2((y2 - y1), (x2 - x))
-        # 円の接線角（x位置）
-        def circle_tangent_angle(x):
-            denom = ( (arc["yc"] - (arc["yc"] - math.sqrt(max(1e-12, arc["R"]**2 - (x-arc["xc"])**2)))) - arc["yc"] )
-            # 上の式は y_arc - yc, 数値安定のため 1e-12 ガード
-            denom = -math.sqrt(max(1e-12, arc["R"]**2 - (x-arc["xc"])**2))
-            dydx  = -(x - arc["xc"]) / max(denom, 1e-12)
-            return math.atan2(dydx, 1.0)  # tan方向角
+    # --- 図の準備（地形・水位・未補強円弧）
+    n_layers = int(cfg_get("layers.n"))
+    interfaces = []
+    if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
+    if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
 
-        Tt_sum = 0.0
-        for (xh,yh) in NH:
-            # 方向決定
-            if str(cfg_get("nails.angle_mode")).startswith("Slope-Normal"):
-                tau = slope_tangent_angle(ground, float(xh))
-                cand = [tau + math.pi/2 + cfg_get("nails.delta_beta")*math.pi/180.0,
-                        tau - math.pi/2 + cfg_get("nails.delta_beta")*math.pi/180.0]
-            else:
-                cand = [-cfg_get("nails.beta_deg")*math.pi/180.0]
+    fig, ax = plt.subplots(figsize=(10.0, 7.0))
+    Xd, Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
+    draw_water(ax, ground, Xd, Yg)
 
-            hit = None
-            for th in cand:
-                ct, stn = math.cos(th), math.sin(th)
-                B = 2*((xh - arc["xc"])*ct + (yh - arc["yc"])*stn)
-                C = (xh - arc["xc"])**2 + (yh - arc["yc"])**2 - arc["R"]**2
-                disc = B*B - 4*C
-                if disc <= 0: continue
-                roots = [(-B - math.sqrt(disc))/2.0, (-B + math.sqrt(disc))/2.0]
-                roots = [t for t in roots if t>1e-9]
-                if not roots: continue
-                t = min(roots)
-                xq, yq = xh + ct*t, yh + stn*t
-                if yq <= float(ground.y_at(xq)) - 1e-6:
-                    hit = (th, t, xq, yq); break
-            if hit is None: continue
-            th, t_hit, xq, yq = hit
+    xc, yc, R = float(arc["xc"]), float(arc["yc"]), float(arc["R"])
+    xs = np.linspace(float(arc["x1"]), float(arc["x2"]), 400)
+    ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
+    ax.plot(xs, ys, lw=2.5, color="tab:red",
+            label=f"Slip arc (Fs0={arc['Fs']:.3f})")
 
-            # Lb
-            if str(cfg_get("nails.L_mode")).startswith("パターン2"):
-                Lb = max(0.0, float(cfg_get("nails.d_embed")))
-            else:
-                Lb = max(0.0, float(cfg_get("nails.L_nail")) - t_hit)
-            if Lb <= 1e-6: continue
+    # --- 便利関数：斜面接線角（水平から反時計＋）
+    def _slope_tangent_angle(x):
+        x2 = x + 1e-4
+        y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
+        return math.atan2((y2 - y1), (x2 - x))
 
-            # Pullout / Steel tension
-            perimeter = math.pi * d_g
-            T_pullout = tau_cap * perimeter * Lb          # kN
-            A_s = math.pi*(d_s/2.0)**2
-            T_tens = (A_s * fy * 1000.0) / max(gamma_m,1e-6)  # MPa→kN/m^2*area
-            Tn = mu * min(T_pullout, T_tens)              # 有効引張
+    # --- ネイル交点＆ボンド長／図示＆合力計算
+    tau_cap = tau_cap_kPa * 1e-3  # kPa→MPa→(kN/m^2)：kPa = kN/m^2
+    As = math.pi * (d_s**2) / 4.0 # m^2（1m幅）
+    T_steel = (fy_MPa * As) / max(gamma_m, 1e-6)   # kN（MPa=MN/m^2= kN/mm^2×? →ここは一貫系：MPa= N/mm^2。m系では fy[MPa]*As[m^2] = MN/m = 10^3 kN/m。）
+    # 上の単位換算を厳密に気にするなら fy を kN/m^2 (=MPa*1e3) として扱う：
+    T_steel = (fy_MPa * 1e3) * As / max(gamma_m, 1e-6)  # ← kN
 
-            # 接線へ投影
-            tan_th = circle_tangent_angle(xq)
-            dot = math.cos(th - tan_th)
-            if dot > 0:
-                Tt_sum += Tn * dot
+    T_sum = 0.0
+    heads_x = [float(p[0]) for p in NH]
+    heads_y = [float(p[1]) for p in NH]
+    ax.scatter(heads_x, heads_y, s=26, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
-        Fs1 = N0 / max(D_sum - 1e-12, 1e-12) + Tt_sum / max(D_sum, 1e-12)
-        cfg_set("results.reinforced", {
-            "n_nails": len(NH),
-            "arc_Fs_unreinforced": Fs0,
-            "arc_Fs_reinforced": float(Fs1),
-        })
+    for i, (xh, yh) in enumerate(NH):
+        xh = float(xh); yh = float(yh)
 
-    r = cfg_get("results.reinforced")
-    if r:
-        col1,col2,col3 = st.columns(3)
-        with col1: st.metric("ネイル本数", f"{r['n_nails']}")
-        with col2: st.metric("未補強Fs（参照）", f"{r['arc_Fs_unreinforced']:.3f}")
-        with col3: st.metric("補強後Fs（簡易）", f"{r.get('arc_Fs_reinforced',r['arc_Fs_unreinforced']):.3f}")
+        # 方向ベクトル（地山側へ向くよう修正済）
+        if str(angle_mode).startswith("Slope-Normal"):
+            tau = _slope_tangent_angle(xh)
+            theta = tau - math.pi/2 + delta_beta * DEG   # ← 地山側へ（法線＝接線−90°）
+        else:
+            theta = -abs(beta_deg) * DEG                  # 水平から下向き
+        ct, st = math.cos(theta), math.sin(theta)
 
-        # 図：Fs0→Fs1 を弧に表示
-        fig,ax = plt.subplots(figsize=(10.0,7.0))
-        n_layers = int(cfg_get("layers.n"))
-        interfaces=[]
-        if n_layers>=2: interfaces.append(lem.make_interface1_example(H,L))
-        if n_layers>=3: interfaces.append(lem.make_interface2_example(H,L))
-        Xd2,Yg2 = draw_layers_and_ground(ax, ground, n_layers, interfaces)
-        draw_water(ax, ground, Xd2, Yg2)
+        # すべり円との最初の交点（レイ方程式で t>0 最小）
+        B = 2.0 * ((xh - xc) * ct + (yh - yc) * st)
+        C = (xh - xc)**2 + (yh - yc)**2 - R**2
+        disc = B*B - 4.0*C
+        if disc <= 0:
+            # 交わらなければ固定長を薄色表示のみ
+            if L_nail > 1e-3:
+                ax.plot([xh, xh + ct*L_nail], [yh, yh + st*L_nail],
+                        color="tab:blue", lw=1.2, alpha=0.5)
+            continue
+        sdisc = math.sqrt(max(0.0, disc))
+        t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
+        t_pos = [t for t in t_candidates if t > 1e-9]
+        if not t_pos:
+            if L_nail > 1e-3:
+                ax.plot([xh, xh + ct*L_nail], [yh, yh + st*L_nail],
+                        color="tab:blue", lw=1.2, alpha=0.5)
+            continue
+        t = min(t_pos)
+        xq, yq = xh + ct*t, yh + st*t  # すべり面交点
 
-        xs=np.linspace(arc["x1"], arc["x2"], 400)
-        ys=arc["yc"] - np.sqrt(np.maximum(0.0, arc["R"]**2 - (xs - arc["xc"])**2))
-        Fs0 = float(arc["Fs"]); Fs1 = float(r.get("arc_Fs_reinforced", Fs0))
-        ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={Fs0:.3f} → {Fs1:.3f})")
+        # 地表→交点は青実線
+        ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.6, alpha=0.9)
 
-        NH = cfg_get("results.nail_heads", [])
-        if NH:
-            ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
-        set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
-        st.pyplot(fig); plt.close(fig)
+        # 埋込み長 Lb（モード別）
+        if str(L_mode).startswith("パターン2"):
+            Lb = max(0.0, d_embed)
+        else:
+            Lb = max(0.0, L_nail - t)
+
+        # ボンド区間を緑で
+        if Lb > 1e-3:
+            xb2, yb2 = xq + ct*Lb, yq + st*Lb
+            ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.95)
+
+            # 容量（グラウト付着 vs 鋼材）
+            T_grout = tau_cap * math.pi * d_g * Lb         # kN（1m幅）
+            T_cap   = min(T_grout, T_steel)
+            # 逓減（任意）— 列番号で弱める単純モデル
+            if mu_decay > 0 and len(NH) > 1:
+                w = 1.0 - mu_decay * (i / (len(NH)-1))
+                T_cap *= max(0.0, w)
+
+            T_sum += T_cap
+
+    # --- 駆動項 D を未補強スライスから取得（Fs合成に使用）
+    # soils・allow_cross は Page3 と同様に構築
+    mats = cfg_get("layers.mat")
+    soils = [Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
+    allow_cross = []
+    if n_layers >= 2:
+        soils.append(Soil(mats[2]["gamma"], mats[2]["c"], mats[2]["phi"]))
+        allow_cross.append(bool(cfg_get("grid.allow_cross2")))
+    if n_layers >= 3:
+        soils.append(Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
+        allow_cross.append(bool(cfg_get("grid.allow_cross3")))
+
+    packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross,
+                                    xc, yc, R, n_slices=QUALITY[cfg_get("grid.quality")]["final_slices"])
+    if packD is None:
+        st.error("D=Σ(W sinα) の評価に失敗しました。地形/層設定を見直してください。")
+        st.stop()
+    D_sum, _, _ = packD
+    Fs0 = float(arc["Fs"])
+    Fs_after = Fs0 + (T_sum / max(D_sum, 1e-9))
+
+    # --- 図・メトリクス
+    set_axes(ax, H, L, ground)
+    ax.grid(True); ax.legend()
+    st.pyplot(fig); plt.close(fig)
+
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("ネイル本数", f"{len(NH)}")
+    with c2: st.metric("未補強Fs（参照）", f"{Fs0:.3f}")
+    with c3: st.metric("補強後Fs（簡易）", f"{Fs_after:.3f}")
