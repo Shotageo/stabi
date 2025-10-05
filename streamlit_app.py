@@ -560,31 +560,33 @@ elif page.startswith("3"):
 
 # ===================== Page4: ネイル配置 =====================
 elif page.startswith("4"):
-    H,L,ground = make_ground_from_cfg()
+    H, L, ground = make_ground_from_cfg()
 
-    # ★ レイヤー定義（不足していたので追加）
+    # レイヤー定義
     n_layers = int(cfg_get("layers.n"))
     interfaces = []
-    if n_layers >= 2: interfaces.append(make_interface1_example(H, L))
-    if n_layers >= 3: interfaces.append(make_interface2_example(H, L))
+    if n_layers >= 2:
+        interfaces.append(make_interface1_example(H, L))
+    if n_layers >= 3:
+        interfaces.append(make_interface2_example(H, L))
 
     st.subheader("ソイルネイル配置（試作：頭位置＋可視化）")
 
-    # --- まず chosen_arc を堅牢化：無ければ unreinforced から復元して保存
+    # chosen_arc を確定（未補強結果から復元）
     arc = cfg_get("results.chosen_arc")
     if not arc:
         res_un = cfg_get("results.unreinforced")
         if res_un and "center" in res_un and "refined" in res_un and res_un["refined"]:
-            xc,yc = res_un["center"]
+            xc, yc = res_un["center"]
             idx = res_un.get("idx_minFs", int(np.argmin([d["Fs"] for d in res_un["refined"]])))
             d = res_un["refined"][idx]
             arc = dict(xc=xc, yc=yc, R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"])
             cfg_set("results.chosen_arc", arc)
         else:
-            st.info("未補強の Min Fs 円弧が未確定です。Page3 で「▶ 計算開始（未補強）」を実行してから来てください。")
+            st.info("未補強の Min Fs 円弧が未確定です。Page3 で「▶ 計算開始（未補強）」を実行してください。")
             st.stop()
 
-    # --- UI seed（現状は頭位置だけ）
+    # UI seed
     nails = cfg_get("nails")
     ui_seed("s_start", nails["s_start"]); ui_seed("s_end", nails["s_end"])
     ui_seed("S_surf", nails["S_surf"]);   ui_seed("S_row", nails["S_row"])
@@ -593,14 +595,14 @@ elif page.startswith("4"):
     ui_seed("beta_deg", nails["beta_deg"]); ui_seed("delta_beta", nails["delta_beta"])
     ui_seed("L_mode", nails["L_mode"]); ui_seed("L_nail", nails["L_nail"]); ui_seed("d_embed", nails["d_embed"])
 
-    # --- 斜面の測地長（s）をつくる
+    # 斜面の測地長 s
     Xd = np.linspace(ground.X[0], ground.X[-1], 1200)
     Yg = np.array([float(ground.y_at(x)) for x in Xd])
     seg = np.sqrt(np.diff(Xd)**2 + np.diff(Yg)**2)
     s_cum = np.concatenate([[0.0], np.cumsum(seg)])
     s_total = float(s_cum[-1])
 
-    # --- 入力 UI
+    # 入力UI
     st.slider("s_start (m)", 0.0, s_total, step=0.5, key="s_start", value=float(st.session_state["s_start"]))
     st.slider("s_end (m)", st.session_state["s_start"], s_total, step=0.5, key="s_end", value=float(st.session_state["s_end"]))
     st.slider("斜面ピッチ S_surf (m)", 0.5, 5.0, step=0.1, key="S_surf", value=float(st.session_state["S_surf"]))
@@ -623,15 +625,15 @@ elif page.startswith("4"):
     elif st.session_state["L_mode"]=="パターン2：すべり面より +Δm":
         st.slider("すべり面より +Δm (m)", 0.0, 5.0, step=0.5, key="d_embed", value=float(st.session_state["d_embed"]))
 
-    # --- s→(x,y)補間関数
+    # s→x 補間
     def x_at_s(sv):
-        idx = np.searchsorted(s_cum, sv, side="right")-1
-        idx = max(0, min(idx, len(Xd)-2))
-        t = (sv - s_cum[idx]) / (seg[idx] if seg[idx]>1e-12 else 1e-12)
-        return float((1-t)*Xd[idx] + t*Xd[idx+1])
+        idx = np.searchsorted(s_cum, sv, side="right") - 1
+        idx = max(0, min(idx, len(Xd) - 2))
+        t = (sv - s_cum[idx]) / (seg[idx] if seg[idx] > 1e-12 else 1e-12)
+        return float((1 - t) * Xd[idx] + t * Xd[idx + 1])
 
-    # --- 自動配置（頭位置）
-    s_vals = list(np.arange(st.session_state["s_start"], st.session_state["s_end"]+1e-9, st.session_state["S_surf"]))
+    # 自動配置（頭位置）
+    s_vals = list(np.arange(st.session_state["s_start"], st.session_state["s_end"] + 1e-9, st.session_state["S_surf"]))
     nail_heads = [(x_at_s(sv), float(ground.y_at(x_at_s(sv)))) for sv in s_vals]
     cfg_set("results.nail_heads", nail_heads)
 
@@ -649,7 +651,7 @@ elif page.startswith("4"):
         cfg_set("nails.d_embed", float(st.session_state.get("d_embed", 1.0)))
         st.success("cfgに保存しました。")
 
-    # --- 図化（ここからが今回の置換ポイント） ---
+    # === 図化 ===
     fig, ax = plt.subplots(figsize=(10.0, 7.0))
     Xd2, Yg2 = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd2, Yg2)
@@ -663,7 +665,7 @@ elif page.startswith("4"):
     if NH:
         ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
-    # ===== ネイル軸（頭→すべり面）とボンド区間を可視化 =====
+    # ネイル軸（頭→すべり面）とボンド区間を可視化
     def _slope_tangent_angle(ground, x):
         x2 = x + 1e-4
         y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
@@ -716,65 +718,10 @@ elif page.startswith("4"):
     except Exception as e:
         st.warning(f"nail drawing skipped: {e}")
 
-    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
+    set_axes(ax, H, L, ground)
+    ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
-
-    # ===== ネイル軸（頭→すべり面）とボンド区間を可視化 =====
-def _slope_tangent_angle(ground, x):
-    x2 = x + 1e-4
-    y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
-    return math.atan2((y2 - y1), (x2 - x))
-
-# cfg から描画パラメータ取得
-angle_mode = cfg_get("nails.angle_mode")
-beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
-delta_beta = float(cfg_get("nails.delta_beta", 0.0))
-L_mode     = cfg_get("nails.L_mode")
-L_nail     = float(cfg_get("nails.L_nail", 5.0))
-d_embed    = float(cfg_get("nails.d_embed", 1.0))
-
-for (xh, yh) in NH:
-    # ネイル方向（斜面法線＝地山側へ +90°）
-    if str(angle_mode).startswith("Slope-Normal"):
-        tau = _slope_tangent_angle(ground, float(xh))
-        theta = tau + math.pi/2 + delta_beta*math.pi/180.0
-    else:
-        theta = -beta_deg*math.pi/180.0
-    ct, st = math.cos(theta), math.sin(theta)
-
-    # 頭→すべり面の交点（光線：t>0の最小根）
-    B = 2*((xh - xc)*ct + (yh - yc)*st)
-    C = (xh - xc)**2 + (yh - yc)**2 - R**2
-    disc = B*B - 4*C
-    if disc <= 0:
-        # 交点なし：固定長だけ淡色で描画
-        ax.plot([xh, xh+ct*L_nail], [yh, yh+st*L_nail], color="tab:blue", lw=1.5, alpha=0.5)
-        continue
-    sdisc = math.sqrt(max(0.0, disc))
-    t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
-    t_pos = [t for t in t_candidates if t > 1e-9]
-    if not t_pos:
-        ax.plot([xh, xh+ct*L_nail], [yh, yh+st*L_nail], color="tab:blue", lw=1.5, alpha=0.5)
-        continue
-    t = min(t_pos)
-    xq, yq = xh + ct*t, yh + st*t
-
-    # 軸（頭→すべり面）を青実線で
-    ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
-
-    # ボンド区間（すべり面以深）
-    if str(L_mode).startswith("パターン2"):   # すべり面より +Δm
-        Lb = max(0.0, d_embed)
-    else:                                     # 固定長
-        Lb = max(0.0, L_nail - t)
-    if Lb > 1e-3:
-        xb2 = xq + ct*Lb
-        yb2 = yq + st*Lb
-        ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
-
-
-    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
-    st.pyplot(fig); plt.close(fig)
+# ===================== Page5: 補強後解析 =====================
 
 
 # ===================== Page5: 補強後解析 =====================
