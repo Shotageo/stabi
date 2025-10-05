@@ -779,62 +779,75 @@ elif page.startswith("5"):
         "diag": diag,
     })
 
-    # === 図化 ===
-    fig, ax = plt.subplots(figsize=(10.0,7.0))
-    Xd = np.linspace(ground.X[0], ground.X[-1], 600)
-    Yg = np.array([float(ground.y_at(x)) for x in Xd])
-    ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
-    ax.plot(ground.X, ground.Y, lw=2.0, label="Ground")
+  # --- 図化
+fig, ax = plt.subplots(figsize=(10.0, 7.0))
+Xd2, Yg2 = draw_layers_and_ground(ax, ground, n_layers, interfaces)
+draw_water(ax, ground, Xd2, Yg2)
 
-    xs = np.linspace(arc["x1"], arc["x2"], 400)
-    ys = arc["yc"] - np.sqrt(np.maximum(0.0, arc["R"]**2 - (xs - arc["xc"])**2))
-    ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={arc['Fs']:.3f} → {Fs_after:.3f})")
+xc, yc, R = arc["xc"], arc["yc"], arc["R"]
+xs = np.linspace(arc["x1"], arc["x2"], 400)
+ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
+ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Chosen slip arc (Fs={arc['Fs']:.3f})")
 
-        # ネイル頭
-    ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=16, color="tab:blue", label=f"Nail heads ({len(NH)})")
+NH = cfg_get("results.nail_heads", [])
+if NH:
+    ax.scatter([p[0] for p in NH], [p[1] for p in NH],
+               s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
-    # ネイル軸（頭 → すべり面）と、すべり面以深のボンド長（+Δm）を描画
-    #   - 頭→すべり面：青実線
-    #   - すべり面以深のボンド：緑実線
-    #   - 交点：黒点
-    for (xh, yh), h in zip(NH, (diag.get("hits") or [])):
-        xq = h.get("xq"); yq = h.get("yq")
-        if xq is None:
-            continue
-        # 交点マーク
-        ax.plot(xq, yq, marker="o", markersize=3.5, color="k")
+# ===== ネイル軸（頭→すべり面）とボンド区間を可視化 =====
+def _slope_tangent_angle(ground, x):
+    x2 = x + 1e-4
+    y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
+    return math.atan2((y2 - y1), (x2 - x))
 
-        # 頭→すべり面（光線長 t_head_to_slip があればそれを使用）
-        t = float(h.get("t_head_to_slip", 0.0))
-        th = float(h.get("theta", 0.0))
-        ct, st = math.cos(th), math.sin(th)
+# cfg から描画パラメータ取得
+angle_mode = cfg_get("nails.angle_mode")
+beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
+delta_beta = float(cfg_get("nails.delta_beta", 0.0))
+L_mode     = cfg_get("nails.L_mode")
+L_nail     = float(cfg_get("nails.L_nail", 5.0))
+d_embed    = float(cfg_get("nails.d_embed", 1.0))
 
-        # 安全側：もし t が無ければ頭と交点の距離から算出
-        if t <= 0:
-            t = math.hypot(xq - xh, yq - yh)
+for (xh, yh) in NH:
+    # ネイル方向（斜面法線＝地山側へ +90°）
+    if str(angle_mode).startswith("Slope-Normal"):
+        tau = _slope_tangent_angle(ground, float(xh))
+        theta = tau + math.pi/2 + delta_beta * math.pi/180.0
+    else:
+        theta = -beta_deg * math.pi/180.0
+    ct, st = math.cos(theta), math.sin(theta)
 
-        # 軸（頭→交点）
-        ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
+    # 頭→すべり面の交点（光線：t>0の最小根）
+    B = 2 * ((xh - xc) * ct + (yh - yc) * st)
+    C = (xh - xc)**2 + (yh - yc)**2 - R**2
+    disc = B*B - 4*C
+    if disc <= 0:
+        # 交点なし：固定長だけ淡色で描画
+        ax.plot([xh, xh + ct * L_nail], [yh, yh + st * L_nail],
+                color="tab:blue", lw=1.5, alpha=0.5)
+        continue
+    sdisc = math.sqrt(max(0.0, disc))
+    t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
+    t_pos = [t for t in t_candidates if t > 1e-9]
+    if not t_pos:
+        ax.plot([xh, xh + ct * L_nail], [yh, yh + st * L_nail],
+                color="tab:blue", lw=1.5, alpha=0.5)
+        continue
+    t = min(t_pos)
+    xq, yq = xh + ct * t, yh + st * t
 
-        # ボンド長（すべり面以深）
-        Lb = float(h.get("L_bond", 0.0))
-        if Lb > 1e-3:
-            xb2 = xq + ct*Lb
-            yb2 = yq + st*Lb
-            ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
+    # 軸（頭→すべり面）を青実線で
+    ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
 
-    # スライス別Tt（正規化して棒の長さに反映）
-    tmax = float(np.max(Tt)) if np.any(Tt>0) else 0.0
-    for xi,ti in zip(S["x_mid"], Tt):
-        if ti <= 0 or tmax <= 0: continue
-        y_top = float(ground.y_at(xi))
-        Lbar = 0.12*L * (ti/tmax)  # 画面スケールで見える長さに
-        ax.plot([xi, xi], [y_top, y_top + Lbar], color="tab:green", lw=2.0, alpha=0.9)
+    # ボンド区間（すべり面以深）
+    if str(L_mode).startswith("パターン2"):   # すべり面より +Δm
+        Lb = max(0.0, d_embed)
+    else:                                     # 固定長
+        Lb = max(0.0, L_nail - t)
+    if Lb > 1e-3:
+        xb2, yb2 = xq + ct * Lb, yq + st * Lb
+        ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
 
-    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
-    st.pyplot(fig); plt.close(fig)
-
-    col1,col2,col3 = st.columns(3)
-    with col1: st.metric("ネイル本数", f"{len(NH)}")
-    with col2: st.metric("未補強Fs", f"{arc['Fs']:.3f}")
-    with col3: st.metric("補強後Fs", f"{(Fs_after or float('nan')):.3f}")
+set_axes(ax, H, L, ground)
+ax.grid(True); ax.legend()
+st.pyplot(fig); plt.close(fig)
