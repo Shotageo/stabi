@@ -711,9 +711,16 @@ elif page.startswith("4"):
 
 # ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
+    # --- セッションの cfg を必ず用意（直リンク/再起動対策）---
+    def _ensure_cfg():
+        if "cfg" not in st.session_state or not isinstance(st.session_state["cfg"], dict):
+            st.session_state["cfg"] = default_cfg()
+    _ensure_cfg()
+
     H, L, ground = make_ground_from_cfg()
     st.subheader("補強後解析（簡易合成）")
 
+    # 必須情報
     arc = cfg_get("results.chosen_arc")
     NH  = cfg_get("results.nail_heads", [])
     if not arc:
@@ -723,13 +730,15 @@ elif page.startswith("5"):
         st.info("ネイル頭が未配置です。Page4でネイルを配置してください。")
         st.stop()
 
-    # --- レイヤ（★必ず lem. 経由）
-    n_layers = int(cfg_get("layers.n"))
+    # レイヤ（★ make_interfaceX_example は lem. 経由で安全に呼ぶ）
+    n_layers = int(cfg_get("layers.n") or 1)
     interfaces = []
-    if n_layers >= 2: interfaces.append(lem.make_interface1_example(H, L))
-    if n_layers >= 3: interfaces.append(lem.make_interface2_example(H, L))
+    if n_layers >= 2:
+        interfaces.append(lem.make_interface1_example(H, L))
+    if n_layers >= 3:
+        interfaces.append(lem.make_interface2_example(H, L))
 
-    # --- 図のベース
+    # 図ベース
     fig, ax = plt.subplots(figsize=(10.0, 7.0))
     Xd, Yg = draw_layers_and_ground(ax, ground, n_layers, interfaces)
     draw_water(ax, ground, Xd, Yg)
@@ -739,21 +748,25 @@ elif page.startswith("5"):
     ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
     ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={arc['Fs']:.3f})")
 
-    # --- 材料（kN 系）
+    # ===== 材料・ネイル設定（欠落時は既定を補う） =====
+    mats = cfg_get("layers.mat")
+    if mats is None:
+        mats = default_cfg()["layers"]["mat"]
+        cfg_set("layers.mat", mats)
+
     tau_cap_kPa = float(cfg_get("layers.tau_grout_cap_kPa", 150.0))  # kPa = kN/m^2
-    d_g         = float(cfg_get("layers.d_g", 0.125))                # m
-    d_s         = float(cfg_get("layers.d_s", 0.022))                # m
+    d_g         = float(cfg_get("layers.d_g", 0.125))                # m（削孔径）
+    d_s         = float(cfg_get("layers.d_s", 0.022))                # m（鉄筋径）
     fy_MPa      = float(cfg_get("layers.fy", 1000.0))                # MPa
     gamma_m     = float(cfg_get("layers.gamma_m", 1.2))
     mu_decay    = float(cfg_get("layers.mu", 0.0))                   # 0..0.9
 
-    # --- ネイル設定
-    angle_mode = cfg_get("nails.angle_mode")
-    beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
-    delta_beta = float(cfg_get("nails.delta_beta", 0.0))
-    L_mode     = cfg_get("nails.L_mode")
-    L_nail     = float(cfg_get("nails.L_nail", 5.0))
-    d_embed    = float(cfg_get("nails.d_embed", 1.0))
+    angle_mode  = cfg_get("nails.angle_mode")
+    beta_deg    = float(cfg_get("nails.beta_deg", 15.0))
+    delta_beta  = float(cfg_get("nails.delta_beta", 0.0))
+    L_mode      = cfg_get("nails.L_mode")
+    L_nail      = float(cfg_get("nails.L_nail", 5.0))
+    d_embed     = float(cfg_get("nails.d_embed", 1.0))
 
     # 斜面接線角（水平基準、反時計+）
     def _slope_tangent_angle(x):
@@ -761,10 +774,10 @@ elif page.startswith("5"):
         y1 = float(ground.y_at(x)); y2 = float(ground.y_at(x2))
         return math.atan2((y2 - y1), (x2 - x))
 
-    # 容量前処理
-    tau_cap = tau_cap_kPa * 1e-3                # kN/m^2
-    As = math.pi * (d_s**2) / 4.0               # m^2（1m幅）
-    T_steel = (fy_MPa * 1e3) * As / max(gamma_m, 1e-6)  # kN
+    # 容量前処理（kN 系）
+    tau_cap = tau_cap_kPa * 1e-3              # kN/m^2
+    As = math.pi * (d_s**2) / 4.0             # m^2（1m幅）
+    T_steel = (fy_MPa * 1e3) * As / max(gamma_m, 1e-6)  # kN（MPa→kN/m^2 換算）
 
     # 頭プロット
     ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=26, color="tab:blue",
@@ -775,22 +788,22 @@ elif page.startswith("5"):
     for i, (xh, yh) in enumerate(NH):
         xh = float(xh); yh = float(yh)
 
-        # 地山側へ向く角度：接線 − 90°（＋Δβ）
+        # 地山側へ向く角度：接線 − 90°（＋Δβ）／または水平から下向き β°
         if str(angle_mode).startswith("Slope-Normal"):
             tau = _slope_tangent_angle(xh)
-            theta = tau - math.pi/2 + math.radians(delta_beta)
+            theta = tau - math.pi/2 + math.radians(delta_beta)  # 地山側
         else:
-            theta = -abs(math.radians(beta_deg))   # 水平から下向き
+            theta = -abs(math.radians(beta_deg))                 # 下向き
 
-        ct, st = math.cos(theta), math.sin(theta)
+        ct, st_sin = math.cos(theta), math.sin(theta)
 
         # レイ×円（t>0 最小根）
-        B = 2.0 * ((xh - xc) * ct + (yh - yc) * st)
+        B = 2.0 * ((xh - xc) * ct + (yh - yc) * st_sin)
         C = (xh - xc)**2 + (yh - yc)**2 - R**2
         disc = B*B - 4.0*C
         if disc <= 0:
             if L_nail > 1e-3:
-                ax.plot([xh, xh + ct*L_nail], [yh, yh + st*L_nail],
+                ax.plot([xh, xh + ct*L_nail], [yh, yh + st_sin*L_nail],
                         color="tab:blue", lw=1.2, alpha=0.5)
             continue
 
@@ -799,12 +812,12 @@ elif page.startswith("5"):
         t_pos = [t for t in t_candidates if t > 1e-9]
         if not t_pos:
             if L_nail > 1e-3:
-                ax.plot([xh, xh + ct*L_nail], [yh, yh + st*L_nail],
+                ax.plot([xh, xh + ct*L_nail], [yh, yh + st_sin*L_nail],
                         color="tab:blue", lw=1.2, alpha=0.5)
             continue
 
         t = min(t_pos)
-        xq, yq = xh + ct*t, yh + st*t
+        xq, yq = xh + ct*t, yh + st_sin*t
 
         # 地表→交点（青）
         ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.6, alpha=0.9)
@@ -812,19 +825,18 @@ elif page.startswith("5"):
         # 埋込み長
         Lb = max(0.0, d_embed) if str(L_mode).startswith("パターン2") else max(0.0, L_nail - t)
         if Lb > 1e-3:
-            xb2, yb2 = xq + ct*Lb, yq + st*Lb
+            xb2, yb2 = xq + ct*Lb, yq + st_sin*Lb
             ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.95)
 
-            # 容量（グラウト vs 鋼材）
-            T_grout = tau_cap * math.pi * d_g * Lb   # kN
+            # 容量（グラウト付着 vs 鋼材）
+            T_grout = tau_cap * math.pi * d_g * Lb     # kN
             T_cap   = min(T_grout, T_steel)
             if mu_decay > 0 and len(NH) > 1:
-                w = 1.0 - mu_decay * (i / (len(NH) - 1))
+                w = 1.0 - mu_decay * (i / (len(NH) - 1))  # 列方向の単純逓減
                 T_cap *= max(0.0, w)
             T_sum += T_cap
 
-    # D = Σ(W sinα) を未補強切片から取得
-    mats = cfg_get("layers.mat")
+    # D = Σ(W sinα)（未補強切片から取得）
     soils = [Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
     allow_cross = []
     if n_layers >= 2:
@@ -834,11 +846,15 @@ elif page.startswith("5"):
         soils.append(Soil(mats[3]["gamma"], mats[3]["c"], mats[3]["phi"]))
         allow_cross.append(bool(cfg_get("grid.allow_cross3")))
 
-    n_slices = QUALITY.get(cfg_get("grid.quality"), QUALITY["Normal"])["final_slices"] if "QUALITY" in globals() else 40
+    n_slices = 40
+    if "QUALITY" in globals():
+        q = cfg_get("grid.quality", "Normal")
+        n_slices = QUALITY.get(q, QUALITY["Normal"])["final_slices"]
+
     packD = driving_sum_for_R_multi(ground, interfaces, soils, allow_cross,
                                     xc, yc, R, n_slices=n_slices)
     if packD is None:
-        st.error("D=Σ(W sinα) の評価に失敗しました。")
+        st.error("D=Σ(W sinα) の評価に失敗しました。地形/層設定を見直してください。")
         st.stop()
     D_sum, _, _ = packD
 
