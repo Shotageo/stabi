@@ -14,12 +14,51 @@ try:
 except ModuleNotFoundError:
     import stabi_lem as lem
 
-from lem import (
-    Soil, GroundPL,
-    make_ground_example, make_interface1_example, make_interface2_example,
-    clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
-    fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
-)
+# ====== Imports ======
+import os, sys, math, time, heapq
+import numpy as np
+import matplotlib.pyplot as plt
+import streamlit as st
+ST = st   # 保険：st上書き回避用
+
+# ---- stabi_lem の import（パッケージ/単体の両対応）----
+try:
+    import stabi.stabi_lem as lem
+except ModuleNotFoundError:
+    import stabi_lem as lem
+
+# ★★ ここが重要：lem 経由でシンボルをエイリアス化（from lem import ... は使わない）★★
+Soil = lem.Soil
+GroundPL = lem.GroundPL
+make_ground_example = lem.make_ground_example
+make_interface1_example = lem.make_interface1_example
+make_interface2_example = lem.make_interface2_example
+clip_interfaces_to_ground = lem.clip_interfaces_to_ground
+arcs_from_center_by_entries_multi = lem.arcs_from_center_by_entries_multi
+fs_given_R_multi = lem.fs_given_R_multi
+arc_sample_poly_best_pair = lem.arc_sample_poly_best_pair
+driving_sum_for_R_multi = lem.driving_sum_for_R_multi
+
+# ---- 補強計算サブモジュール（既存のものを使用）----
+try:
+    from nail_engine import reinforce_nails
+except Exception:
+    def reinforce_nails(arc, ground, soils, nails_cfg, slices):
+        N = len(slices["x_mid"])
+        return np.zeros(N, dtype=float), {"hits": [], "notes": "nail_engine not found"}
+
+try:
+    from coupler import bishop_with_reinforcement
+except Exception:
+    def bishop_with_reinforcement(slices, soil, Tt):
+        D = float(np.sum(slices["W"] * np.sin(slices["alpha"])))
+        if D <= 0: return slices.get("Fs0", np.nan)
+        return slices.get("Fs0", 1.0) + float(np.sum(Tt)) / D
+
+st.set_page_config(page_title="Stabi LEM｜安定版", layout="wide")
+st.title("Stabi LEM｜多段UI（安定版・フル）")
+
+DEG = math.pi/180.0
 
 # ---- 補強計算サブモジュール（既存のものを使用）----
 try:
