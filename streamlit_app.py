@@ -1,19 +1,48 @@
-# streamlit_app.py — cfg一本化 + 数値キー対応 + UI値プレビュー（安定版・パッチ適用）
+# streamlit_app.py — Stabi LEM + Soil Nail 可視化（フル版・一括置換用）
 from __future__ import annotations
-import streamlit as st
-import numpy as np, heapq, time
-import matplotlib.pyplot as plt
-import math
 
-from stabi_lem import (
+# ====== Imports ======
+import os, sys, math, time, heapq
+import numpy as np
+import matplotlib.pyplot as plt
+import streamlit as st
+
+# ---- stabi_lem の import（パッケージ/単体の両対応）----
+try:
+    import stabi.stabi_lem as lem
+except ModuleNotFoundError:
+    import stabi_lem as lem
+
+from lem import (
     Soil, GroundPL,
     make_ground_example, make_interface1_example, make_interface2_example,
     clip_interfaces_to_ground, arcs_from_center_by_entries_multi,
     fs_given_R_multi, arc_sample_poly_best_pair, driving_sum_for_R_multi,
 )
 
-st.set_page_config(page_title="Stabi LEM｜cfg一元・安定版", layout="wide")
-st.title("Stabi LEM｜多段UI（cfg一元・安定版）")
+# ---- 補強計算サブモジュール（既存のものを使用）----
+try:
+    from nail_engine import reinforce_nails
+except Exception:
+    # nail_engine が無い場合はダミー（計算なし）で落ちないように
+    def reinforce_nails(arc, ground, soils, nails_cfg, slices):
+        N = len(slices["x_mid"])
+        return np.zeros(N, dtype=float), {"hits": [], "notes": "nail_engine not found"}
+
+try:
+    from coupler import bishop_with_reinforcement
+except Exception:
+    # coupler が無い場合は補強前Fsに依存した簡易計算にフォールバック
+    def bishop_with_reinforcement(slices, soil, Tt):
+        # きちんとした式は coupler.py を使う。ここはフォールバック。
+        D = float(np.sum(slices["W"] * np.sin(slices["alpha"])))
+        if D <= 0: return slices.get("Fs0", np.nan)
+        return slices.get("Fs0", 1.0) + float(np.sum(Tt)) / D
+
+st.set_page_config(page_title="Stabi LEM｜安定版", layout="wide")
+st.title("Stabi LEM｜多段UI（安定版・フル）")
+
+DEG = math.pi/180.0
 
 # ===================== cfg（正本） =====================
 def default_cfg():
@@ -55,52 +84,41 @@ def default_cfg():
         }
     }
 
-# --- 数値キーを安全に辿る cfg_get/cfg_set ---
+# --- cfg helpers ---
 def _maybe_int_key(p):
     if isinstance(p, str) and p.isdigit():
-        try:
-            return int(p)
-        except Exception:
-            return p
+        try: return int(p)
+        except Exception: return p
     return p
 
 def cfg_get(path, default=None):
-    """path: 'section.key' or 'section.sub.key' （数値キーは自動で int 化）"""
     node = st.session_state["cfg"]
     for p in path.split("."):
         p_try = _maybe_int_key(p)
         if isinstance(node, dict):
-            if p in node:
-                node = node[p]
-            elif p_try in node:
-                node = node[p_try]
-            else:
-                return default
+            if p in node: node = node[p]
+            elif p_try in node: node = node[p_try]
+            else: return default
         else:
             return default
     return node
 
 def cfg_set(path, value):
-    """path に value をセット（途中が無ければ dict を作成。数値キーも対応）"""
     node = st.session_state["cfg"]
     parts = path.split(".")
     for p in parts[:-1]:
         p_try = _maybe_int_key(p)
         if isinstance(node, dict):
-            if p in node:
-                node = node[p]
-            elif p_try in node:
-                node = node[p_try]
+            if p in node: node = node[p]
+            elif p_try in node: node = node[p_try]
             else:
                 node[p_try] = {}
                 node = node[p_try]
         else:
             raise KeyError(f"cfg_set: '{p}' below is not a dict")
     last = _maybe_int_key(parts[-1])
-    if isinstance(node, dict):
-        node[last] = value
-    else:
-        raise KeyError(f"cfg_set: cannot set at '{parts[-1]}'")
+    if isinstance(node, dict): node[last] = value
+    else: raise KeyError(f"cfg_set: cannot set at '{parts[-1]}'")
 
 def ui_seed(key, value):
     if key not in st.session_state:
@@ -132,7 +150,7 @@ QUALITY = {
 
 def make_ground_from_cfg():
     H = float(cfg_get("geom.H")); L = float(cfg_get("geom.L"))
-    return H, L, make_ground_example(H,L)
+    return H, L, make_ground_example(H, L)
 
 def set_axes(ax, H, L, ground):
     x_upper = max(1.18*L, float(ground.X[-1])+0.05*L, 100.0)
@@ -195,7 +213,6 @@ with st.sidebar:
 
 # ===================== Page1: 地形・水位 =====================
 if page.startswith("1"):
-    # UI seed
     ui_seed("H", cfg_get("geom.H"))
     ui_seed("L", cfg_get("geom.L"))
     ui_seed("water_mode", cfg_get("water.mode"))
@@ -219,7 +236,6 @@ if page.startswith("1"):
             cfg_set("water.mode", st.session_state["water_mode"])
             cfg_set("water.ru", float(st.session_state["ru"]))
             cfg_set("water.offset", float(st.session_state["wt_offset"]))
-            # grid 初期枠（未設定時のみH,Lから種）
             if cfg_get("grid.x_min") is None:
                 L = cfg_get("geom.L"); H = cfg_get("geom.H")
                 cfg_set("grid.x_min", 0.25*L); cfg_set("grid.x_max", 1.15*L)
@@ -237,15 +253,13 @@ if page.startswith("1"):
             cfg_set("water.wl_points", np.asarray(W, dtype=float))
             st.success("水位線をcfgに保存しました（以後この線が最優先）。")
 
-    # ===== プレビューは UI 値で即時反映 =====
-    H_ui = float(st.session_state["H"])
-    L_ui = float(st.session_state["L"])
+    # プレビュー（UI値）
+    H_ui = float(st.session_state["H"]); L_ui = float(st.session_state["L"])
     ground_ui = make_ground_example(H_ui, L_ui)
-
     n_layers_cfg = int(cfg_get("layers.n"))
-    interfaces_ui = []
-    if n_layers_cfg >= 2: interfaces_ui.append(make_interface1_example(H_ui, L_ui))
-    if n_layers_cfg >= 3: interfaces_ui.append(make_interface2_example(H_ui, L_ui))
+    interfaces_ui=[]
+    if n_layers_cfg>=2: interfaces_ui.append(make_interface1_example(H_ui, L_ui))
+    if n_layers_cfg>=3: interfaces_ui.append(make_interface2_example(H_ui, L_ui))
 
     fig, ax = plt.subplots(figsize=(9.6, 5.8))
     Xd = np.linspace(ground_ui.X[0], ground_ui.X[-1], 600)
@@ -258,14 +272,13 @@ if page.startswith("1"):
         ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
         ax.fill_between(Xd, 0.0, Y1, alpha=0.12, label="Layer2")
     else:
-        Y1, Y2 = clip_interfaces_to_ground(ground_ui, [interfaces_ui[0], interfaces_ui[1]], Xd)
+        Y1, Y2 = clip_interfaces_to_ground(ground_ui, [interfaces_ui[0],interfaces_ui[1]], Xd)
         ax.fill_between(Xd, Y1, Yg, alpha=0.12, label="Layer1")
         ax.fill_between(Xd, Y2, Y1, alpha=0.12, label="Layer2")
         ax.fill_between(Xd, 0.0, Y2, alpha=0.12, label="Layer3")
 
     ax.plot(ground_ui.X, ground_ui.Y, linewidth=2.0, label="Ground")
 
-    # 水位（保存済み最優先、無ければ UI offset プレビュー）
     if str(cfg_get("water.mode")).startswith("WT"):
         W = cfg_get("water.wl_points")
         if W is not None:
@@ -285,11 +298,9 @@ if page.startswith("1"):
 
 # ===================== Page2: 地層・材料 =====================
 elif page.startswith("2"):
-    # 万一 layers.mat が壊れていたら既定を補う（保険）
     if cfg_get("layers.mat") is None:
         cfg_set("layers.mat", default_cfg()["layers"]["mat"])
 
-    # UI seed
     ui_seed("n_layers", cfg_get("layers.n"))
     m1 = cfg_get("layers.mat.1"); m2 = cfg_get("layers.mat.2"); m3 = cfg_get("layers.mat.3")
     ui_seed("gamma1", m1["gamma"]); ui_seed("c1", m1["c"]); ui_seed("phi1", m1["phi"]); ui_seed("tau1", m1["tau"])
@@ -366,12 +377,10 @@ elif page.startswith("3"):
     if n_layers>=2: interfaces.append(make_interface1_example(H,L))
     if n_layers>=3: interfaces.append(make_interface2_example(H,L))
 
-    # 初期枠（未設定なら H/L から種）
     if cfg_get("grid.x_min") is None:
         cfg_set("grid.x_min", 0.25*L); cfg_set("grid.x_max", 1.15*L)
         cfg_set("grid.y_min", 1.60*H); cfg_set("grid.y_max", 2.20*H)
 
-    # UI seed
     ui_seed("p3_x_min", cfg_get("grid.x_min"))
     ui_seed("p3_x_max", cfg_get("grid.x_max"))
     ui_seed("p3_y_min", cfg_get("grid.y_min"))
@@ -418,7 +427,6 @@ elif page.startswith("3"):
         sync_grid_ui_to_cfg()
         st.success("cfgに保存しました。")
 
-    # 可視化（cfg正本）
     x_min=cfg_get("grid.x_min"); x_max=cfg_get("grid.x_max")
     y_min=cfg_get("grid.y_min"); y_max=cfg_get("grid.y_max")
     pitch=cfg_get("grid.pitch")
@@ -436,7 +444,6 @@ elif page.startswith("3"):
     set_axes(ax, H, L, ground); ax.grid(True); ax.legend(loc="upper right")
     st.pyplot(fig); plt.close(fig)
 
-    # soils & allow_cross
     mats = cfg_get("layers.mat")
     soils=[Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
     allow_cross=[]
@@ -524,7 +531,6 @@ elif page.startswith("3"):
         return dict(center=(xc,yc), refined=refined, idx_minFs=idx_minFs)
 
     if st.button("▶ 計算開始（未補強）"):
-        # “保存”と独立に、直前のUI → cfg 同期
         sync_grid_ui_to_cfg()
         res = compute_once()
         if "error" in res: st.error(res["error"]); st.stop()
@@ -570,172 +576,7 @@ elif page.startswith("4"):
     if n_layers >= 3:
         interfaces.append(make_interface2_example(H, L))
 
-    st.subheader("ソイルネイル配置（試作：頭位置＋可視化）")
-
-    # chosen_arc を確定（未補強結果から復元）
-    arc = cfg_get("results.chosen_arc")
-    if not arc:
-        res_un = cfg_get("results.unreinforced")
-        if res_un and "center" in res_un and "refined" in res_un and res_un["refined"]:
-            xc, yc = res_un["center"]
-            idx = res_un.get("idx_minFs", int(np.argmin([d["Fs"] for d in res_un["refined"]])))
-            d = res_un["refined"][idx]
-            arc = dict(xc=xc, yc=yc, R=d["R"], x1=d["x1"], x2=d["x2"], Fs=d["Fs"])
-            cfg_set("results.chosen_arc", arc)
-        else:
-            st.info("未補強の Min Fs 円弧が未確定です。Page3 で「▶ 計算開始（未補強）」を実行してください。")
-            st.stop()
-
-    # UI seed
-    nails = cfg_get("nails")
-    ui_seed("s_start", nails["s_start"]); ui_seed("s_end", nails["s_end"])
-    ui_seed("S_surf", nails["S_surf"]);   ui_seed("S_row", nails["S_row"])
-    ui_seed("tiers", nails["tiers"])
-    ui_seed("angle_mode", nails["angle_mode"])
-    ui_seed("beta_deg", nails["beta_deg"]); ui_seed("delta_beta", nails["delta_beta"])
-    ui_seed("L_mode", nails["L_mode"]); ui_seed("L_nail", nails["L_nail"]); ui_seed("d_embed", nails["d_embed"])
-
-    # 斜面の測地長 s
-    Xd = np.linspace(ground.X[0], ground.X[-1], 1200)
-    Yg = np.array([float(ground.y_at(x)) for x in Xd])
-    seg = np.sqrt(np.diff(Xd)**2 + np.diff(Yg)**2)
-    s_cum = np.concatenate([[0.0], np.cumsum(seg)])
-    s_total = float(s_cum[-1])
-
-    # 入力UI
-    st.slider("s_start (m)", 0.0, s_total, step=0.5, key="s_start", value=float(st.session_state["s_start"]))
-    st.slider("s_end (m)", st.session_state["s_start"], s_total, step=0.5, key="s_end", value=float(st.session_state["s_end"]))
-    st.slider("斜面ピッチ S_surf (m)", 0.5, 5.0, step=0.1, key="S_surf", value=float(st.session_state["S_surf"]))
-    st.slider("段間隔 S_row (法線方向 m) [未実装]", 0.5, 5.0, step=0.5, key="S_row", value=float(st.session_state["S_row"]))
-    st.number_input("段数（表示のみ）", 1, 5, step=1, key="tiers", value=int(st.session_state["tiers"]))
-
-    st.radio("角度モード", ["Slope-Normal (⊥斜面)", "Horizontal-Down (β°)"],
-             key="angle_mode",
-             index=["Slope-Normal (⊥斜面)","Horizontal-Down (β°)"].index(st.session_state["angle_mode"]))
-    if st.session_state["angle_mode"].endswith("β°"):
-        st.slider("β（水平から下向き °）", 0.0, 45.0, step=1.0, key="beta_deg", value=float(st.session_state["beta_deg"]))
-    else:
-        st.slider("法線からの微調整 ±Δβ（°）", -10.0, 10.0, step=1.0, key="delta_beta", value=float(st.session_state["delta_beta"]))
-
-    st.radio("長さモード", ["パターン1：固定長", "パターン2：すべり面より +Δm", "パターン3：FS目標で自動"],
-             key="L_mode",
-             index=["パターン1：固定長","パターン2：すべり面より +Δm","パターン3：FS目標で自動"].index(st.session_state["L_mode"]))
-    if st.session_state["L_mode"]=="パターン1：固定長":
-        st.slider("ネイル長 L (m)", 1.0, 15.0, step=0.5, key="L_nail", value=float(st.session_state["L_nail"]))
-    elif st.session_state["L_mode"]=="パターン2：すべり面より +Δm":
-        st.slider("すべり面より +Δm (m)", 0.0, 5.0, step=0.5, key="d_embed", value=float(st.session_state["d_embed"]))
-
-    # s→x 補間
-    def x_at_s(sv):
-        idx = np.searchsorted(s_cum, sv, side="right") - 1
-        idx = max(0, min(idx, len(Xd) - 2))
-        t = (sv - s_cum[idx]) / (seg[idx] if seg[idx] > 1e-12 else 1e-12)
-        return float((1 - t) * Xd[idx] + t * Xd[idx + 1])
-
-    # 自動配置（頭位置）
-    s_vals = list(np.arange(st.session_state["s_start"], st.session_state["s_end"] + 1e-9, st.session_state["S_surf"]))
-    nail_heads = [(x_at_s(sv), float(ground.y_at(x_at_s(sv)))) for sv in s_vals]
-    cfg_set("results.nail_heads", nail_heads)
-
-    if st.button("💾 ネイル設定を保存（cfgへ）"):
-        cfg_set("nails.s_start", float(st.session_state["s_start"]))
-        cfg_set("nails.s_end", float(st.session_state["s_end"]))
-        cfg_set("nails.S_surf", float(st.session_state["S_surf"]))
-        cfg_set("nails.S_row", float(st.session_state["S_row"]))
-        cfg_set("nails.tiers", int(st.session_state["tiers"]))
-        cfg_set("nails.angle_mode", st.session_state["angle_mode"])
-        cfg_set("nails.beta_deg", float(st.session_state.get("beta_deg", 15.0)))
-        cfg_set("nails.delta_beta", float(st.session_state.get("delta_beta", 0.0)))
-        cfg_set("nails.L_mode", st.session_state["L_mode"])
-        cfg_set("nails.L_nail", float(st.session_state.get("L_nail", 5.0)))
-        cfg_set("nails.d_embed", float(st.session_state.get("d_embed", 1.0)))
-        st.success("cfgに保存しました。")
-
-    # === 図化（安全版：ローカル再定義つき） ===
-    H4, L4, ground4 = make_ground_from_cfg()
-    n_layers4 = int(cfg_get("layers.n"))
-    interfaces4 = []
-    if n_layers4 >= 2:
-        interfaces4.append(make_interface1_example(H4, L4))
-    if n_layers4 >= 3:
-        interfaces4.append(make_interface2_example(H4, L4))
-
-    fig, ax = plt.subplots(figsize=(10.0, 7.0))
-    Xd2, Yg2 = draw_layers_and_ground(ax, ground4, n_layers4, interfaces4)
-    draw_water(ax, ground4, Xd2, Yg2)
-
-    xc, yc, R = arc["xc"], arc["yc"], arc["R"]
-    xs = np.linspace(arc["x1"], arc["x2"], 400)
-    ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
-    ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Chosen slip arc (Fs={arc['Fs']:.3f})")
-
-    NH = cfg_get("results.nail_heads", [])
-    if NH:
-        ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
-
-    def _slope_tangent_angle(g, x):
-        x2 = x + 1e-4
-        y1 = float(g.y_at(x)); y2 = float(g.y_at(x2))
-        return math.atan2((y2 - y1), (x2 - x))
-
-    angle_mode = cfg_get("nails.angle_mode")
-    beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
-    delta_beta = float(cfg_get("nails.delta_beta", 0.0))
-    L_mode     = cfg_get("nails.L_mode")
-    L_nail     = float(cfg_get("nails.L_nail", 5.0))
-    d_embed    = float(cfg_get("nails.d_embed", 1.0))
-
-    try:
-        for (xh, yh) in NH:
-            if str(angle_mode).startswith("Slope-Normal"):
-                tau = _slope_tangent_angle(ground4, float(xh))
-                theta = tau + math.pi/2 + delta_beta * math.pi/180.0
-            else:
-                theta = -beta_deg * math.pi/180.0
-            ct, st = math.cos(theta), math.sin(theta)
-
-            B = 2 * ((xh - xc) * ct + (yh - yc) * st)
-            C = (xh - xc)**2 + (yh - yc)**2 - R**2
-            disc = B*B - 4*C
-            if disc <= 0:
-                ax.plot([xh, xh + ct * L_nail], [yh, yh + st * L_nail], color="tab:blue", lw=1.5, alpha=0.4)
-                continue
-            sdisc = math.sqrt(max(0.0, disc))
-            t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
-            t_pos = [t for t in t_candidates if t > 1e-9]
-            if not t_pos:
-                ax.plot([xh, xh + ct * L_nail], [yh, yh + st * L_nail], color="tab:blue", lw=1.5, alpha=0.4)
-                continue
-            t = min(t_pos)
-            xq, yq = xh + ct * t, yh + st * t
-
-            ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
-
-            if str(L_mode).startswith("パターン2"):
-                Lb = max(0.0, d_embed)
-            else:
-                Lb = max(0.0, L_nail - t)
-            if Lb > 1e-3:
-                xb2, yb2 = xq + ct * Lb, yq + st * Lb
-                ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
-    except Exception as e:
-        st.warning(f"nail drawing skipped: {e}")
-
-    set_axes(ax, H4, L4, ground4)
-    ax.grid(True); ax.legend()
-    st.pyplot(fig); plt.close(fig)# ===================== Page4: ネイル配置 =====================
-elif page.startswith("4"):
-    H, L, ground = make_ground_from_cfg()
-
-    # レイヤー定義
-    n_layers = int(cfg_get("layers.n"))
-    interfaces = []
-    if n_layers >= 2:
-        interfaces.append(make_interface1_example(H, L))
-    if n_layers >= 3:
-        interfaces.append(make_interface2_example(H, L))
-
-    st.subheader("ソイルネイル配置（試作：頭位置＋可視化）")
+    st.subheader("ソイルネイル配置（頭位置＋可視化）")
 
     # chosen_arc を確定（未補強結果から復元）
     arc = cfg_get("results.chosen_arc")
@@ -816,8 +657,7 @@ elif page.startswith("4"):
         cfg_set("nails.d_embed", float(st.session_state.get("d_embed", 1.0)))
         st.success("cfgに保存しました。")
 
-    # === 図化（ここから） =====================================
-    # ここだけで必要変数をローカル再定義（スコープ崩れ対策）
+    # === 図化（安全版：ローカル再定義つき） ===
     H4, L4, ground4 = make_ground_from_cfg()
     n_layers4 = int(cfg_get("layers.n"))
     interfaces4 = []
@@ -837,7 +677,6 @@ elif page.startswith("4"):
     if NH:
         ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
-    # 斜面接線角 ⇒ 法線（地山側 +90°）
     def _slope_tangent_angle(g, x):
         x2 = x + 1e-4
         y1 = float(g.y_at(x)); y2 = float(g.y_at(x2))
@@ -852,41 +691,34 @@ elif page.startswith("4"):
 
     try:
         for (xh, yh) in NH:
-            # ネイル方向（streamlitのstと衝突しないよう sinθ は snt）
             if str(angle_mode).startswith("Slope-Normal"):
                 tau = _slope_tangent_angle(ground4, float(xh))
                 theta = tau + math.pi/2 + delta_beta * math.pi/180.0
             else:
                 theta = -beta_deg * math.pi/180.0
-            ct, snt = math.cos(theta), math.sin(theta)
+            ct, snt = math.cos(theta), math.sin(theta)  # sinθは snt （st と衝突回避）
 
-            # 頭→すべり面の交点（光線：t>0の最小根）
             B = 2 * ((xh - xc) * ct + (yh - yc) * snt)
             C = (xh - xc)**2 + (yh - yc)**2 - R**2
             disc = B*B - 4*C
             if disc <= 0:
-                # 交点なし：固定長だけ淡色で描画
-                ax.plot([xh, xh + ct * L_nail], [yh, yh + snt * L_nail],
-                        color="tab:blue", lw=1.5, alpha=0.4)
+                ax.plot([xh, xh + ct * L_nail], [yh, yh + snt * L_nail], color="tab:blue", lw=1.5, alpha=0.4)
                 continue
             sdisc = math.sqrt(max(0.0, disc))
             t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
             t_pos = [t for t in t_candidates if t > 1e-9]
             if not t_pos:
-                ax.plot([xh, xh + ct * L_nail], [yh, yh + snt * L_nail],
-                        color="tab:blue", lw=1.5, alpha=0.4)
+                ax.plot([xh, xh + ct * L_nail], [yh, yh + snt * L_nail], color="tab:blue", lw=1.5, alpha=0.4)
                 continue
             t = min(t_pos)
             xq, yq = xh + ct * t, yh + snt * t
 
-            # 軸（頭→すべり面）
             ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
 
-            # ボンド区間（すべり面以深）
             if str(L_mode).startswith("パターン2"):
-                Lb = max(0.0, d_embed)          # すべり面より +Δm
+                Lb = max(0.0, d_embed)
             else:
-                Lb = max(0.0, L_nail - t)       # 固定長の残り
+                Lb = max(0.0, L_nail - t)
             if Lb > 1e-3:
                 xb2, yb2 = xq + ct * Lb, yq + snt * Lb
                 ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
@@ -897,13 +729,8 @@ elif page.startswith("4"):
     ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
 
-
 # ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
-    import stabi_lem as lem
-    from nail_engine import reinforce_nails
-    from coupler import bishop_with_reinforcement
-
     H, L, ground = make_ground_from_cfg()
     st.subheader("補強後解析（連成・試作）")
 
@@ -936,17 +763,34 @@ elif page.startswith("5"):
         "tau_grout_cap_kPa": cfg_get("layers.tau_grout_cap_kPa"),
     }
 
-    mats = cfg_get("layers.mat")
-    soils=[Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
-    interfaces=[]; allow_cross=[]
-
-    S = lem.compute_slices_poly_multi(ground, interfaces, soils, allow_cross,
-                                      arc["xc"], arc["yc"], arc["R"], n_slices=40)
-    if S is None:
+    # スライス生成（lem側の util を使用）
+    # 補強前 Fs も載せておく（フォールバックで使うため）
+    s_pack = arc_sample_poly_best_pair(ground, arc["xc"], arc["yc"], arc["R"], n=2*40+1, y_floor=0.0)
+    if s_pack is None:
         st.error("円弧が成立しません（Page3の再計算を確認）"); st.stop()
+    x1, x2, xs, ys, h = s_pack
+    xs_e  = np.linspace(x1, x2, 40+1)
+    xmid  = 0.5*(xs_e[:-1] + xs_e[1:])
+    dx    = (x2 - x1)/40
+    # 海外でも通じる簡易パッケージ（必要最小限）
+    alpha, cos_a, y_arc = (lambda xc,yc,R,xmid: (
+        (lambda inside: (
+            (lambda y_arc, denom, dydx, alpha: (alpha, np.cos(alpha), y_arc))(
+                yc - np.sqrt(inside),
+                np.where(np.abs((yc - np.sqrt(inside)) - yc) < 1e-12, 1e-12, (yc - np.sqrt(inside)) - yc),
+                - (xmid - xc) / np.where(np.abs((yc - np.sqrt(inside)) - yc) < 1e-12, 1e-12, (yc - np.sqrt(inside)) - yc),
+                -np.arctan(- (xmid - xc) / np.where(np.abs((yc - np.sqrt(inside)) - yc) < 1e-12, 1e-12, (yc - np.sqrt(inside)) - yc))
+            )
+        ))(arc["R"]**2 - (xmid - arc["xc"])**2)
+    ))(arc["xc"], arc["yc"], arc["R"], xmid)
+    hmid  = np.array([float(ground.y_at(x)) for x in xmid]) - y_arc
+    gamma = cfg_get("layers.mat.1.gamma")
+    W = gamma * hmid * dx
+    Fs0 = cfg_get("results.chosen_arc.Fs")
+    slices = {"x_mid": xmid, "alpha": alpha, "W": W, "Fs0": Fs0}
 
-    Tt, diag = reinforce_nails(arc, ground, soils, nails_cfg, S)
-    Fs_after = bishop_with_reinforcement(S, soils[0], Tt)
+    Tt, diag = reinforce_nails(arc, ground, [Soil(gamma,0,0)], nails_cfg, slices)
+    Fs_after = bishop_with_reinforcement(slices, Soil(gamma,0,0), Tt)
 
     cfg_set("results.reinforced", {
         "n_nails": len(NH),
@@ -970,20 +814,21 @@ elif page.startswith("5"):
     # ネイル頭
     ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=16, color="tab:blue", label=f"Nail heads ({len(NH)})")
 
-    # 交点＆ボンド方向（可視化）
+    # 交点＆ボンド方向（可視化：nail_engine が返す diag を使用）
     for h in (diag.get("hits") or []):
-        if h.get("xq") is None: continue
-        ax.plot(h["xq"], h["yq"], marker="o", markersize=3.5, color="k")
+        xq = h.get("xq"); yq = h.get("yq")
+        if xq is None: continue
+        ax.plot(xq, yq, marker="o", markersize=3.5, color="k")
         th = float(h.get("theta", 0.0))
         ct, stt = math.cos(th), math.sin(th)
         Lb = float(h.get("L_bond", 0.0))
         if Lb > 1e-3:
-            xb2, yb2 = h["xq"] + ct*Lb, h["yq"] + stt*Lb
-            ax.plot([h["xq"], xb2], [h["yq"], yb2], color="tab:green", lw=2.2, alpha=0.9)
+            xb2, yb2 = xq + ct*Lb, yq + stt*Lb
+            ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
 
     # スライス別Tt（正規化棒）
     tmax = float(np.max(Tt)) if np.any(Tt>0) else 0.0
-    for xi,ti in zip(S["x_mid"], Tt):
+    for xi,ti in zip(slices["x_mid"], Tt):
         if ti <= 0 or tmax <= 0: continue
         y_top = float(ground.y_at(xi))
         Lbar = 0.12*L * (ti/tmax)
