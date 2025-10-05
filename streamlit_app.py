@@ -723,7 +723,180 @@ elif page.startswith("4"):
 
     set_axes(ax, H4, L4, ground4)
     ax.grid(True); ax.legend()
+    st.pyplot(fig); plt.close(fig)# ===================== Page4: ネイル配置 =====================
+elif page.startswith("4"):
+    H, L, ground = make_ground_from_cfg()
+
+    # レイヤー定義
+    n_layers = int(cfg_get("layers.n"))
+    interfaces = []
+    if n_layers >= 2:
+        interfaces.append(make_interface1_example(H, L))
+    if n_layers >= 3:
+        interfaces.append(make_interface2_example(H, L))
+
+    st.subheader("ソイルネイル配置（試作：頭位置＋可視化）")
+
+    # chosen_arc を確定（未補強結果から復元）
+    arc = cfg_get("results.chosen_arc")
+    if not arc:
+        res_un = cfg_get("results.unreinforced")
+        if res_un and "center" in res_un and "refined" in res_un and res_un["refined"]:
+            xc0, yc0 = res_un["center"]
+            idx0 = res_un.get("idx_minFs", int(np.argmin([d["Fs"] for d in res_un["refined"]])))
+            d0 = res_un["refined"][idx0]
+            arc = dict(xc=xc0, yc=yc0, R=d0["R"], x1=d0["x1"], x2=d0["x2"], Fs=d0["Fs"])
+            cfg_set("results.chosen_arc", arc)
+        else:
+            st.info("未補強の Min Fs 円弧が未確定です。Page3 で「▶ 計算開始（未補強）」を実行してください。")
+            st.stop()
+
+    # --- UI seed
+    nails = cfg_get("nails")
+    ui_seed("s_start", nails["s_start"]); ui_seed("s_end", nails["s_end"])
+    ui_seed("S_surf", nails["S_surf"]);   ui_seed("S_row", nails["S_row"])
+    ui_seed("tiers", nails["tiers"])
+    ui_seed("angle_mode", nails["angle_mode"])
+    ui_seed("beta_deg", nails["beta_deg"]); ui_seed("delta_beta", nails["delta_beta"])
+    ui_seed("L_mode", nails["L_mode"]); ui_seed("L_nail", nails["L_nail"]); ui_seed("d_embed", nails["d_embed"])
+
+    # --- 斜面の測地長 s
+    Xd = np.linspace(ground.X[0], ground.X[-1], 1200)
+    Yg = np.array([float(ground.y_at(x)) for x in Xd])
+    seg = np.sqrt(np.diff(Xd)**2 + np.diff(Yg)**2)
+    s_cum = np.concatenate([[0.0], np.cumsum(seg)])
+    s_total = float(s_cum[-1])
+
+    # --- 入力 UI
+    st.slider("s_start (m)", 0.0, s_total, step=0.5, key="s_start", value=float(st.session_state["s_start"]))
+    st.slider("s_end (m)", st.session_state["s_start"], s_total, step=0.5, key="s_end", value=float(st.session_state["s_end"]))
+    st.slider("斜面ピッチ S_surf (m)", 0.5, 5.0, step=0.1, key="S_surf", value=float(st.session_state["S_surf"]))
+    st.slider("段間隔 S_row (法線方向 m) [未実装]", 0.5, 5.0, step=0.5, key="S_row", value=float(st.session_state["S_row"]))
+    st.number_input("段数（表示のみ）", 1, 5, step=1, key="tiers", value=int(st.session_state["tiers"]))
+
+    st.radio("角度モード", ["Slope-Normal (⊥斜面)", "Horizontal-Down (β°)"],
+             key="angle_mode",
+             index=["Slope-Normal (⊥斜面)","Horizontal-Down (β°)"].index(st.session_state["angle_mode"]))
+    if st.session_state["angle_mode"].endswith("β°"):
+        st.slider("β（水平から下向き °）", 0.0, 45.0, step=1.0, key="beta_deg", value=float(st.session_state["beta_deg"]))
+    else:
+        st.slider("法線からの微調整 ±Δβ（°）", -10.0, 10.0, step=1.0, key="delta_beta", value=float(st.session_state["delta_beta"]))
+
+    st.radio("長さモード", ["パターン1：固定長", "パターン2：すべり面より +Δm", "パターン3：FS目標で自動"],
+             key="L_mode",
+             index=["パターン1：固定長","パターン2：すべり面より +Δm","パターン3：FS目標で自動"].index(st.session_state["L_mode"]))
+    if st.session_state["L_mode"]=="パターン1：固定長":
+        st.slider("ネイル長 L (m)", 1.0, 15.0, step=0.5, key="L_nail", value=float(st.session_state["L_nail"]))
+    elif st.session_state["L_mode"]=="パターン2：すべり面より +Δm":
+        st.slider("すべり面より +Δm (m)", 0.0, 5.0, step=0.5, key="d_embed", value=float(st.session_state["d_embed"]))
+
+    # --- s→x 補間
+    def x_at_s(sv):
+        idx = np.searchsorted(s_cum, sv, side="right") - 1
+        idx = max(0, min(idx, len(Xd) - 2))
+        t = (sv - s_cum[idx]) / (seg[idx] if seg[idx] > 1e-12 else 1e-12)
+        return float((1 - t) * Xd[idx] + t * Xd[idx + 1])
+
+    # --- 自動配置（頭位置）
+    s_vals = list(np.arange(st.session_state["s_start"], st.session_state["s_end"] + 1e-9, st.session_state["S_surf"]))
+    nail_heads = [(x_at_s(sv), float(ground.y_at(x_at_s(sv)))) for sv in s_vals]
+    cfg_set("results.nail_heads", nail_heads)
+
+    if st.button("💾 ネイル設定を保存（cfgへ）"):
+        cfg_set("nails.s_start", float(st.session_state["s_start"]))
+        cfg_set("nails.s_end", float(st.session_state["s_end"]))
+        cfg_set("nails.S_surf", float(st.session_state["S_surf"]))
+        cfg_set("nails.S_row", float(st.session_state["S_row"]))
+        cfg_set("nails.tiers", int(st.session_state["tiers"]))
+        cfg_set("nails.angle_mode", st.session_state["angle_mode"])
+        cfg_set("nails.beta_deg", float(st.session_state.get("beta_deg", 15.0)))
+        cfg_set("nails.delta_beta", float(st.session_state.get("delta_beta", 0.0)))
+        cfg_set("nails.L_mode", st.session_state["L_mode"])
+        cfg_set("nails.L_nail", float(st.session_state.get("L_nail", 5.0)))
+        cfg_set("nails.d_embed", float(st.session_state.get("d_embed", 1.0)))
+        st.success("cfgに保存しました。")
+
+    # === 図化（ここから） =====================================
+    # ここだけで必要変数をローカル再定義（スコープ崩れ対策）
+    H4, L4, ground4 = make_ground_from_cfg()
+    n_layers4 = int(cfg_get("layers.n"))
+    interfaces4 = []
+    if n_layers4 >= 2: interfaces4.append(make_interface1_example(H4, L4))
+    if n_layers4 >= 3: interfaces4.append(make_interface2_example(H4, L4))
+
+    fig, ax = plt.subplots(figsize=(10.0, 7.0))
+    Xd2, Yg2 = draw_layers_and_ground(ax, ground4, n_layers4, interfaces4)
+    draw_water(ax, ground4, Xd2, Yg2)
+
+    xc, yc, R = arc["xc"], arc["yc"], arc["R"]
+    xs = np.linspace(arc["x1"], arc["x2"], 400)
+    ys = yc - np.sqrt(np.maximum(0.0, R**2 - (xs - xc)**2))
+    ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Chosen slip arc (Fs={arc['Fs']:.3f})")
+
+    NH = cfg_get("results.nail_heads", [])
+    if NH:
+        ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+
+    # 斜面接線角 ⇒ 法線（地山側 +90°）
+    def _slope_tangent_angle(g, x):
+        x2 = x + 1e-4
+        y1 = float(g.y_at(x)); y2 = float(g.y_at(x2))
+        return math.atan2((y2 - y1), (x2 - x))
+
+    angle_mode = cfg_get("nails.angle_mode")
+    beta_deg   = float(cfg_get("nails.beta_deg", 15.0))
+    delta_beta = float(cfg_get("nails.delta_beta", 0.0))
+    L_mode     = cfg_get("nails.L_mode")
+    L_nail     = float(cfg_get("nails.L_nail", 5.0))
+    d_embed    = float(cfg_get("nails.d_embed", 1.0))
+
+    try:
+        for (xh, yh) in NH:
+            # ネイル方向（streamlitのstと衝突しないよう sinθ は snt）
+            if str(angle_mode).startswith("Slope-Normal"):
+                tau = _slope_tangent_angle(ground4, float(xh))
+                theta = tau + math.pi/2 + delta_beta * math.pi/180.0
+            else:
+                theta = -beta_deg * math.pi/180.0
+            ct, snt = math.cos(theta), math.sin(theta)
+
+            # 頭→すべり面の交点（光線：t>0の最小根）
+            B = 2 * ((xh - xc) * ct + (yh - yc) * snt)
+            C = (xh - xc)**2 + (yh - yc)**2 - R**2
+            disc = B*B - 4*C
+            if disc <= 0:
+                # 交点なし：固定長だけ淡色で描画
+                ax.plot([xh, xh + ct * L_nail], [yh, yh + snt * L_nail],
+                        color="tab:blue", lw=1.5, alpha=0.4)
+                continue
+            sdisc = math.sqrt(max(0.0, disc))
+            t_candidates = [(-B - sdisc)/2.0, (-B + sdisc)/2.0]
+            t_pos = [t for t in t_candidates if t > 1e-9]
+            if not t_pos:
+                ax.plot([xh, xh + ct * L_nail], [yh, yh + snt * L_nail],
+                        color="tab:blue", lw=1.5, alpha=0.4)
+                continue
+            t = min(t_pos)
+            xq, yq = xh + ct * t, yh + snt * t
+
+            # 軸（頭→すべり面）
+            ax.plot([xh, xq], [yh, yq], color="tab:blue", lw=1.8, alpha=0.9)
+
+            # ボンド区間（すべり面以深）
+            if str(L_mode).startswith("パターン2"):
+                Lb = max(0.0, d_embed)          # すべり面より +Δm
+            else:
+                Lb = max(0.0, L_nail - t)       # 固定長の残り
+            if Lb > 1e-3:
+                xb2, yb2 = xq + ct * Lb, yq + snt * Lb
+                ax.plot([xq, xb2], [yq, yb2], color="tab:green", lw=2.2, alpha=0.9)
+    except Exception as e:
+        st.warning(f"nail drawing skipped: {e}")
+
+    set_axes(ax, H4, L4, ground4)
+    ax.grid(True); ax.legend()
     st.pyplot(fig); plt.close(fig)
+
 
 # ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
