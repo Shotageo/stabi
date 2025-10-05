@@ -668,26 +668,93 @@ elif page.startswith("4"):
 
 # ===================== Page5: 補強後解析 =====================
 elif page.startswith("5"):
+    import stabi_lem as lem
+    from nail_engine import reinforce_nails
+    from coupler import bishop_with_reinforcement
+
     H,L,ground = make_ground_from_cfg()
-    st.subheader("補強後解析（試作）")
+    st.subheader("補強後解析（連成・試作）")
+
     arc = cfg_get("results.chosen_arc")
-    NH = cfg_get("results.nail_heads", [])
-    btn = st.button("▶ 補強後の計算を実行", disabled=not (arc and NH))
+    NH  = cfg_get("results.nail_heads", [])
     if not (arc and NH):
         missing=[]
         if not arc: missing.append("Page3のMin Fs円弧")
-        if not NH: missing.append("Page4のネイル頭配置")
+        if not NH:  missing.append("Page4のネイル頭配置")
         st.info("必要情報: " + "、".join(missing))
-    elif btn:
-        with st.spinner("（将来）ネイル効果を連成計算中…"):
-            cfg_set("results.reinforced", {
-                "n_nails": len(NH),
-                "arc_Fs_unreinforced": arc["Fs"],
-                "note": "Phase-2で Tpullout/Tstrip(μ)/Ttens → Tt/Tn投影 → FS更新を実装予定。",
-            })
-    r = cfg_get("results.reinforced")
-    if r:
-        col1,col2 = st.columns(2)
-        with col1: st.metric("ネイル本数", f"{r['n_nails']}")
-        with col2: st.metric("未補強Fs（参照）", f"{r['arc_Fs_unreinforced']:.3f}")
-        st.caption(r["note"])
+        st.stop()
+
+    # nails_cfg を構成
+    nails_cfg = {
+        "heads": NH,
+        "angle_mode": cfg_get("nails.angle_mode"),
+        "beta_deg":   cfg_get("nails.beta_deg", 15.0),
+        "delta_beta": cfg_get("nails.delta_beta", 0.0),
+        "L_mode":     cfg_get("nails.L_mode"),
+        "L_nail":     cfg_get("nails.L_nail", 5.0),
+        "d_embed":    cfg_get("nails.d_embed", 1.0),
+        "d_g":        cfg_get("layers.d_g"),
+        "d_s":        cfg_get("layers.d_s"),
+        "fy":         cfg_get("layers.fy"),
+        "gamma_m":    cfg_get("layers.gamma_m"),
+        "tau_grout_cap_kPa": cfg_get("layers.tau_grout_cap_kPa"),
+    }
+
+    # soils（単層相当でOK。多層でも最上層を使う）
+    mats = cfg_get("layers.mat")
+    soils=[Soil(mats[1]["gamma"], mats[1]["c"], mats[1]["phi"])]
+    interfaces=[]; allow_cross=[]
+
+    # スライス抽出
+    S = lem.compute_slices_poly_multi(ground, interfaces, soils, allow_cross,
+                                      arc["xc"], arc["yc"], arc["R"], n_slices=40)
+    if S is None:
+        st.error("円弧が成立しません（Page3の再計算を確認）"); st.stop()
+
+    # ネイル→Tt
+    Tt, diag = reinforce_nails(arc, ground, soils, nails_cfg, S)
+
+    # CouplerでFs更新
+    Fs_after = bishop_with_reinforcement(S, soils[0], Tt)
+
+    # 保存
+    cfg_set("results.reinforced", {
+        "n_nails": len(NH),
+        "arc_Fs_unreinforced": arc["Fs"],
+        "Fs_after": Fs_after,
+        "Tt_sum": float(np.sum(Tt)),
+        "diag": diag,
+    })
+
+    # 図化
+    fig, ax = plt.subplots(figsize=(10.0,7.0))
+    # 地層は簡略（単層塗り）
+    Xd = np.linspace(ground.X[0], ground.X[-1], 600)
+    Yg = np.array([float(ground.y_at(x)) for x in Xd])
+    ax.fill_between(Xd, 0.0, Yg, alpha=0.12, label="Layer1")
+    ax.plot(ground.X, ground.Y, lw=2.0, label="Ground")
+
+    # すべり円弧
+    xs = np.linspace(arc["x1"], arc["x2"], 400)
+    ys = arc["yc"] - np.sqrt(np.maximum(0.0, arc["R"]**2 - (xs - arc["xc"])**2))
+    ax.plot(xs, ys, lw=2.5, color="tab:red", label=f"Slip arc (Fs0={arc['Fs']:.3f} → {Fs_after:.3f})")
+
+    # ネイル頭と交点・ボンド向き
+    ax.scatter([p[0] for p in NH], [p[1] for p in NH], s=30, color="tab:blue", label=f"Nail heads ({len(NH)})")
+    for h in (diag.get("hits") or []):
+        if h.get("xq") is None: continue
+        ax.plot([h["xq"], h["xq"]], [h["yq"], h["yq"]+0.01], color="k", lw=0.8)  # 小マーク
+    # スライス別Tt（棒）
+    for xi,ti in zip(S["x_mid"], Tt):
+        if ti <= 0: continue
+        y_top = float(ground.y_at(xi))
+        ax.plot([xi, xi], [y_top, y_top + 0.10*ti/max(1.0, np.max(Tt)) * (0.08*L)], color="tab:green", lw=2.0, alpha=0.8)
+
+    set_axes(ax, H, L, ground); ax.grid(True); ax.legend()
+    st.pyplot(fig); plt.close(fig)
+
+    # メトリクス
+    col1,col2,col3 = st.columns(3)
+    with col1: st.metric("ネイル本数", f"{len(NH)}")
+    with col2: st.metric("未補強Fs", f"{arc['Fs']:.3f}")
+    with col3: st.metric("補強後Fs", f"{(Fs_after or float('nan')):.3f}")
