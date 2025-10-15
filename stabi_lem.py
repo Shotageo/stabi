@@ -1,7 +1,11 @@
 # stabi_lem.py
 # ------------------------------------------------------------
-# 安定板３の骨格を維持しつつ、Quick段階での円弧診断（diagnostics）を追加。
-# 可視化は診断を読む側（streamlit_app.py）が担当。既存呼び出しは後方互換。
+# 安定板３ ベースライン（復旧版）
+# - LEM + Soil Nail の簡易連成： Fs_after = ΣT / Σ(W sinα)
+# - 探索フロー：Coarse -> Quick -> Refine（時間バジェット思想のみ保持）
+# - ground.y_at はベクトル安全実装
+# - NaN/inf ガード、品質フォールバック、Config自動初期化
+# - 戻り値は既存キーのみ（diagnostics等の追加なし）
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ from typing import List, Tuple, Dict, Any, Optional
 import math
 import numpy as np
 
-# ====== データモデル ======
+# ===== モデル定義 =====
 
 @dataclass
 class Ground:
@@ -40,43 +44,68 @@ class Nail:
     x: float
     y: float
     length: float
-    angle_deg: float
-    bond: float  # 1本あたりの簡略抵抗
+    angle_deg: float  # 地盤内向きに負角を推奨（例：斜面接線−90°+Δβ）
+    bond: float       # 付着・引抜き等を簡略化した抵抗（/本）
 
 @dataclass
 class Config:
+    # センター探索グリッド
     grid_xmin: float
     grid_xmax: float
     grid_ymin: float
     grid_ymax: float
     grid_step: float
+    # 円弧半径
     r_min: float
     r_max: float
+    # 段階ステップ（Coarse→Quick→Refine）
     coarse_step: int = 6
     quick_step: int = 3
     refine_step: int = 1
+    # 時間バジェット思想（参照用）
     budget_coarse_s: float = 0.8
     budget_quick_s: float = 1.2
 
-# ====== 評価関数（可視化向けの安定な簡略式） ======
+# ===== ユーティリティ =====
 
-def _fs_for_arc_simple(ground: Ground, layers: List[Layer], cx: float, cy: float, r: float) -> float:
+def _safe_isfinite(x: float) -> bool:
+    try:
+        return np.isfinite(x)
+    except Exception:
+        return False
+
+def _gen_centers(cfg: Config, step_mul: int) -> List[Tuple[float, float]]:
+    xs = np.arange(cfg.grid_xmin, cfg.grid_xmax + 1e-9, max(1e-6, cfg.grid_step * max(1, step_mul)))
+    ys = np.arange(cfg.grid_ymin, cfg.grid_ymax + 1e-9, max(1e-6, cfg.grid_step * max(1, step_mul)))
+    return [(float(x), float(y)) for x in xs for y in ys]
+
+def _radius_candidates(cfg: Config, step_mul: int, num: int) -> np.ndarray:
+    n = max(3, num // max(1, step_mul))
+    rmin = max(cfg.r_min, 1e-2)
+    rmax = max(cfg.r_max, rmin + 1e-2)
+    return np.geomspace(rmin, rmax, num=n)
+
+# ===== LEM（簡易相対式） =====
+# ※ 可視化ではなく相対比較のための安定な簡易式。安定板３の思想を踏襲。
+
+def _fs_segmental_simple(ground: Ground, layers: List[Layer], cx: float, cy: float, r: float) -> float:
+    """地表側弧のみを対象に、帯状片の力学で簡略FSを算出（ネイル抜き）"""
     th = np.linspace(0.0, 2*np.pi, 180)
     xs = cx + r * np.cos(th)
     ys = cy + r * np.sin(th)
     yg = ground.y_at(xs)
 
-    # 「地盤の下側」を原則として採用（点が少なければ上側を代替）
+    # 原則：地表線の下側（ys <= yg）を土塊側とみなす。点が少なければ上側代替。
     mask = ys <= yg
     if np.count_nonzero(mask) < 3:
-        mask_alt = ys >= yg
-        if np.count_nonzero(mask_alt) < 3:
+        alt = ys >= yg
+        if np.count_nonzero(alt) < 3:
             return float("inf")
-        mask = mask_alt
+        mask = alt
 
     xs = xs[mask]; ys = ys[mask]; yg = yg[mask]
 
-    # 代表材料（最上層）
+    # 代表物性（最上層）
     if layers:
         phi = float(layers[0].phi_deg)
         c   = float(layers[0].c)
@@ -84,25 +113,29 @@ def _fs_for_arc_simple(ground: Ground, layers: List[Layer], cx: float, cy: float
     else:
         phi, c, gamma = 30.0, 0.0, 18.0
 
-    # 接線近似（円：接線は(-sin, +cos)）
-    tx = -np.sin(th[mask]); ty = np.cos(th[mask])
+    # 接線ベクトル（円：(-sin, +cos)）
+    thm = th[mask]
+    tx = -np.sin(thm)
+    ty =  np.cos(thm)
     alpha = np.arctan2(ty, tx)
 
     dx = np.hypot(np.diff(xs, prepend=xs[0]), np.diff(ys, prepend=ys[0]))
     thickness = np.maximum(yg - ys, 0.0)
     W = thickness * gamma * dx
 
-    sin_a = np.abs(np.sin(alpha)); cos_a = np.abs(np.cos(alpha))
-    driving  = np.sum(W * sin_a + 1e-12)
+    sin_a = np.abs(np.sin(alpha))
+    cos_a = np.abs(np.cos(alpha))
+    driving   = np.sum(W * sin_a + 1e-12)
     resisting = np.sum(c * dx + W * cos_a * math.tan(math.radians(phi)))
     if driving <= 0:
         return float("inf")
     return max(1e-6, resisting / driving)
 
-def _nail_contribution_simple(nails: List[Nail], cx: float, cy: float, r: float) -> float:
+def _nail_T_simple(nails: List[Nail], cx: float, cy: float, r: float) -> float:
+    """円弧とネイルの交差本数に比例した追加抵抗（単純化）"""
     if not nails:
         return 0.0
-    contrib = 0.0
+    T = 0.0
     for n in nails:
         ang = math.radians(n.angle_deg)
         x2 = n.x + n.length * math.cos(ang)
@@ -112,77 +145,78 @@ def _nail_contribution_simple(nails: List[Nail], cx: float, cy: float, r: float)
         if d1 == 0: d1 = 1e-9
         if d2 == 0: d2 = -1e-9
         if d1 * d2 < 0:
-            contrib += max(0.0, n.bond)
-    return contrib
-
-# ====== 探索グリッド ======
-
-def _gen_centers(cfg: Config, step_mul: int) -> List[Tuple[float,float]]:
-    xs = np.arange(cfg.grid_xmin, cfg.grid_xmax + 1e-9, cfg.grid_step * step_mul)
-    ys = np.arange(cfg.grid_ymin, cfg.grid_ymax + 1e-9, cfg.grid_step * step_mul)
-    return [(float(x), float(y)) for x in xs for y in ys]
-
-def _radius_candidates(cfg: Config, step_mul: int, num: int) -> np.ndarray:
-    return np.geomspace(max(cfg.r_min, 1e-2), max(cfg.r_max, cfg.r_min + 1e-2), num=max(3, num // max(1, step_mul)))
+            T += max(0.0, float(n.bond))
+    return T
 
 def _evaluate_stage(ground: Ground, layers: List[Layer], nails: List[Nail],
-                    centers: List[Tuple[float,float]], radii: np.ndarray,
-                    collect_quick: bool, fs_cutoff_collect: float) -> Tuple[float, Tuple[float,float,float], List[Dict[str,Any]]]:
+                    centers: List[Tuple[float, float]], radii: np.ndarray) -> Tuple[float, Tuple[float, float, float]]:
+    """ある段階（ステップ倍率固定）での最小FS探索"""
     best_fs = float("inf")
-    best_arc = (0.0, 0.0, 1.0)
-    records: List[Dict[str,Any]] = []
-
+    best_arc = (0.0, 0.0, max(1.0, float(np.median(radii))))
     for cx, cy in centers:
         for r in radii:
-            fs0 = _fs_for_arc_simple(ground, layers, cx, cy, r)
-            fs = max(1e-6, fs0 + _nail_contribution_simple(nails, cx, cy, r))
+            if r <= 0 or not _safe_isfinite(r):  # ガード
+                continue
+            fs0 = _fs_segmental_simple(ground, layers, cx, cy, r)
+            if not _safe_isfinite(fs0):
+                continue
+            # ネイル連成：Fs_after = (抵抗+T)/駆動 ~ fs0 + T/Σ(W sinα)
+            # ここでは fs0 に T の相対寄与を線形加算（安定板３の簡易結合）
+            fs = max(1e-6, fs0 + _nail_T_simple(nails, cx, cy, r))
             if fs < best_fs:
                 best_fs = fs
                 best_arc = (cx, cy, r)
-            if collect_quick and (r > 0) and np.isfinite(fs) and (fs < fs_cutoff_collect):
-                records.append({"cx": float(cx), "cy": float(cy), "r": float(r), "fs": float(fs), "stage": "quick"})
-    return best_fs, best_arc, records
+    return float(best_fs), best_arc
 
-# ====== 公開API ======
+# ===== 公開API（既存I/F） =====
 
 def run_analysis(
     ground: Ground,
     layers: List[Layer],
     nails: List[Nail],
-    cfg: Config,
-    fs_cutoff_collect: float = 1.3
+    cfg: Optional[Config] = None
 ) -> Dict[str, Any]:
-    # Coarse
+    """安定板３：公開関数（戻り値キーは既存のまま）"""
+    # Config自動初期化（ガード）
+    if cfg is None:
+        xs = ground.xs
+        ys = ground.ys
+        cfg = Config(
+            grid_xmin=float(xs.min()+5), grid_xmax=float(xs.max()-5),
+            grid_ymin=float(ys.min()-30), grid_ymax=float(ys.max()+10),
+            grid_step=8.0,
+            r_min=5.0, r_max=max(10.0, (xs.max()-xs.min())*1.2),
+            coarse_step=6, quick_step=3, refine_step=1,
+            budget_coarse_s=0.8, budget_quick_s=1.2
+        )
+
+    # === Coarse ===
     centers_c = _gen_centers(cfg, cfg.coarse_step)
     radii_c   = _radius_candidates(cfg, cfg.coarse_step, num=12)
-    fs_c, arc_c, _ = _evaluate_stage(ground, layers, nails, centers_c, radii_c, collect_quick=False, fs_cutoff_collect=fs_cutoff_collect)
+    fs_c, arc_c = _evaluate_stage(ground, layers, nails, centers_c, radii_c)
 
-    # Quick（収集）
+    # === Quick ===
     centers_q = _gen_centers(cfg, cfg.quick_step)
     radii_q   = _radius_candidates(cfg, cfg.quick_step, num=16)
-    fs_q, arc_q, quick_records = _evaluate_stage(ground, layers, nails, centers_q, radii_q, collect_quick=True, fs_cutoff_collect=fs_cutoff_collect)
+    fs_q, arc_q = _evaluate_stage(ground, layers, nails, centers_q, radii_q)
 
-    # Refine（近傍）
-    cx_b, cy_b, r_b = arc_q
+    # === Refine ===（Quick最良近傍）
+    cx, cy, r = arc_q
     step = max(1, cfg.refine_step)
-    centers_r = [(cx_b + dx*cfg.grid_step/step, cy_b + dy*cfg.grid_step/step) for dx in (-1,0,1) for dy in (-1,0,1)]
-    radii_r   = np.geomspace(max(cfg.r_min, r_b*0.7), min(cfg.r_max, r_b*1.3), num=10)
-    fs_r, arc_r, _ = _evaluate_stage(ground, layers, nails, centers_r, radii_r, collect_quick=False, fs_cutoff_collect=fs_cutoff_collect)
+    centers_r = [(cx + dx*cfg.grid_step/step, cy + dy*cfg.grid_step/step) for dx in (-1,0,1) for dy in (-1,0,1)]
+    radii_r   = np.geomspace(max(cfg.r_min, r*0.7), min(cfg.r_max, r*1.3), num=10)
+    fs_r, arc_r = _evaluate_stage(ground, layers, nails, centers_r, radii_r)
 
-    # Fs（簡略）：before=Quick最良、after=Refine最良（ネイル寄与込み）
-    Fs_before = float(fs_q)
-    Fs_after  = float(fs_r)
+    # before/after（簡易定義）：before = Quick最良（ネイル寄与込み）、after = Refine最良
+    Fs_before = float(fs_q) if _safe_isfinite(fs_q) else float("inf")
+    Fs_after  = float(fs_r) if _safe_isfinite(fs_r) else float("inf")
 
-    diagnostics = {
-        "quick_arcs": quick_records,
-        "grid_bbox": (cfg.grid_xmin, cfg.grid_xmax, cfg.grid_ymin, cfg.grid_ymax),
-        "grid_step": float(cfg.grid_step),
-        "grid_centers_sampled": [(float(x), float(y)) for (x, y) in centers_q],
-        "quick_best": {"cx": cx_b, "cy": cy_b, "r": r_b, "fs": fs_q}
-    }
+    # NaN/inf フォールバック
+    if not np.isfinite(Fs_before): Fs_before = 9999.0
+    if not np.isfinite(Fs_after):  Fs_after  = 9999.0
 
     return {
         "Fs_before": Fs_before,
         "Fs_after":  Fs_after,
-        "diagnostics": diagnostics
+        # 必要があれば arc 等を追加しても良いが、既存互換のため最低限に留める
     }
