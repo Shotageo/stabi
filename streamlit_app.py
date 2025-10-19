@@ -275,12 +275,17 @@ if page.startswith("1"):
         try:
             if dxf_file is not None:
                 import tempfile, os
-                try:
-                    from io.dxf_sections import load_alignment, load_sections, attach_stationing
-                    from viz.plan_preview import plot_plan_preview
+                               try:
+                    # 標準ライブラリ io との衝突回避のため、パッケージ名は stabi_io / stabi_viz を使用
+                    from stabi_io.dxf_sections import load_alignment, load_sections, attach_stationing
+                    from stabi_viz.plan_preview import plot_plan_preview
                 except Exception as ie:
-                    st.error("必要なモジュールが見つかりません。`pip install ezdxf` を実行してください。")
+                    st.error("DXFプレビューの依存が見つかりません。以下を確認："
+                             " (1) フォルダ名が stabi_io / stabi_viz であること "
+                             " (2) それぞれに __init__.py があること "
+                             " (3) `pip install ezdxf` 済みであること")
                     raise
+
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tf:
                     tf.write(dxf_file.read())
                     dxf_path = tf.name
