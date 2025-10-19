@@ -261,56 +261,63 @@ if page.startswith("1"):
     set_axes(ax, H_ui, L_ui, ground_ui); ax.grid(True); ax.legend()
     ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     st.pyplot(fig); plt.close(fig)
-    # >>> DXF_PLAN_PREVIEW START（追記：DXFプレビュー） >>>
-    with st.expander("🗺️ DXF：中心線＋横断群のプレビュー（実験）", expanded=False):
-        st.caption("DXFから Alignment（中心線形）と XS*（横断法線）を読み込み、平面図に重ねて表示します。解析やcfgには影響しません。")
-        dxf_file = st.file_uploader("DXFファイルを選択", type=["dxf"], key="__dxf_plan__")
-        colA, colB, colC = st.columns([1,1,1])
-        with colA:
-            layer_align = st.text_input("中心線レイヤ名ヒント", value="ALIGN")
-        with colB:
-            layer_xs = st.text_input("横断レイヤ名（接頭辞OK）", value="XS")
-        with colC:
-            highlight = st.text_input("強調表示する横断ID（任意）", value="")
-        try:
-            if dxf_file is not None:
-                import tempfile, os
-                               try:
-                    # 標準ライブラリ io との衝突回避のため、パッケージ名は stabi_io / stabi_viz を使用
-                    from stabi_io.dxf_sections import load_alignment, load_sections, attach_stationing
-                    from stabi_viz.plan_preview import plot_plan_preview
-                except Exception as ie:
-                    st.error("DXFプレビューの依存が見つかりません。以下を確認："
-                             " (1) フォルダ名が stabi_io / stabi_viz であること "
-                             " (2) それぞれに __init__.py があること "
-                             " (3) `pip install ezdxf` 済みであること")
-                    raise
+   # >>> DXF_PLAN_PREVIEW START（追記：DXFプレビュー／完成版） >>>
+with st.expander("🗺️ DXF：中心線＋横断群のプレビュー（実験）", expanded=False):
+    st.caption("DXFから Alignment（中心線形）と XS*（横断法線）を読み込み、平面図に重ねて表示します。解析やcfgには影響しません。")
+    dxf_file = st.file_uploader("DXFファイルを選択", type=["dxf"], key="__dxf_plan__")
+    colA, colB, colC = st.columns([1, 1, 1])
+    with colA:
+        layer_align = st.text_input("中心線レイヤ名ヒント", value="ALIGN")
+    with colB:
+        layer_xs = st.text_input("横断レイヤ名（接頭辞OK）", value="XS")
+    with colC:
+        highlight = st.text_input("強調表示する横断ID（任意）", value="")
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tf:
-                    tf.write(dxf_file.read())
-                    dxf_path = tf.name
-                try:
-                    ali = load_alignment(dxf_path, layer_hint=layer_align.strip() or None)
-                    xs_raw = load_sections(dxf_path, layer_filter=layer_xs.strip() or "XS")
-                    xs = attach_stationing(xs_raw, ali)
-                    if not xs:
-                        st.warning("横断レイヤ（XS*）が見つかりません。")
-                    else:
-                        st.success(f"読み込み成功：Alignment={ali.length:.1f} m、横断本数={len(xs)}")
-                        fig2, ax2 = plt.subplots(figsize=(8.6, 6.0))
-                        plot_plan_preview(ax2, ali, xs, highlight_id=(highlight or None))
-                        st.pyplot(fig2); plt.close(fig2)
-                        st.caption("※ プレビューのみ。解析やcfgには影響しません。")
-                finally:
-                    try:
-                        os.unlink(dxf_path)
-                    except Exception:
-                        pass
+    if dxf_file is not None:
+        import tempfile, os
+        # 依存のimport（パッケージ名に注意：stabi_io / stabi_viz）
+        try:
+            from stabi_io.dxf_sections import load_alignment, load_sections, attach_stationing
+            from stabi_viz.plan_preview import plot_plan_preview
+        except Exception as ie:
+            st.error(
+                "DXFプレビューの依存が見つかりません。確認："
+                " (1) フォルダ名が stabi_io / stabi_viz であること"
+                " (2) それぞれに __init__.py があること"
+                " (3) `pip install ezdxf` 済みであること"
+            )
+            st.stop()
+
+        # DXFを一時保存して読み込む
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tf:
+            tf.write(dxf_file.read())
+            dxf_path = tf.name
+
+        try:
+            ali = load_alignment(dxf_path, layer_hint=layer_align.strip() or None)
+            xs_raw = load_sections(dxf_path, layer_filter=layer_xs.strip() or "XS")
+            xs = attach_stationing(xs_raw, ali)
+
+            if not xs:
+                st.warning("横断レイヤ（XS*）が見つかりません。")
             else:
-                st.info("DXFを選択すると平面図プレビューが表示されます。")
+                st.success(f"読み込み成功：Alignment={ali.length:.1f} m、横断本数={len(xs)}")
+                fig2, ax2 = plt.subplots(figsize=(8.6, 6.0))
+                plot_plan_preview(ax2, ali, xs, highlight_id=(highlight or None))
+                st.pyplot(fig2)
+                plt.close(fig2)
+                st.caption("※ プレビューのみ。解析やcfgには影響しません。")
         except Exception as e:
             st.error(f"DXFプレビューでエラーが発生しました：{e}")
-    # <<< DXF_PLAN_PREVIEW END <<<
+        finally:
+            try:
+                os.unlink(dxf_path)
+            except Exception:
+                pass
+    else:
+        st.info("DXFを選択すると平面図プレビューが表示されます。")
+# <<< DXF_PLAN_PREVIEW END <<<
+
 
 
 # ===================== Page2: 地層・材料 =====================
