@@ -81,6 +81,56 @@ if page.startswith("1"):
     ax.set_xlabel("X"); ax.set_ylabel("Y")
     apply_plot_style(ax, title=None, show_legend=False)
     st.pyplot(fig, use_container_width=True)
+# >>> DXF_PLAN_PREVIEW START（ここから追記：DXFの中心線＋横断群プレビュー。既存UI/計算は不変更） >>>
+with st.expander("🗺️ DXF：中心線＋横断群のプレビュー（実験）", expanded=False):
+    st.caption("DXFから Alignment（中心線形）と XS*（横断法線）を読み込み、平面図に重ねて表示します。解析・cfgには影響しません。")
+    dxf_file = st.file_uploader("DXFファイルを選択", type=["dxf"], key="__dxf_plan__")
+    colA, colB, colC = st.columns([1,1,1])
+    with colA:
+        layer_align = st.text_input("中心線レイヤ名ヒント", value="ALIGN")
+    with colB:
+        layer_xs = st.text_input("横断レイヤ名（接頭辞OK）", value="XS")
+    with colC:
+        highlight = st.text_input("強調表示する横断ID（任意）", value="")
+
+    try:
+        if dxf_file is not None:
+            # 依存ライブラリはローカルにのみ要求
+            try:
+                import tempfile, os
+                from io.dxf_sections import load_alignment, load_sections, attach_stationing
+                from viz.plan_preview import plot_plan_preview
+            except ImportError as e:
+                st.error("必要なモジュールが見つかりません。`pip install ezdxf` を実行してください。")
+                st.stop()
+
+            # 一時保存して ezdxf に渡す
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tf:
+                tf.write(dxf_file.read())
+                dxf_path = tf.name
+
+            try:
+                ali = load_alignment(dxf_path, layer_hint=layer_align.strip() or None)
+                xs_raw = load_sections(dxf_path, layer_filter=layer_xs.strip() or "XS")
+                xs = attach_stationing(xs_raw, ali)
+                if not xs:
+                    st.warning("横断レイヤ（XS*）が見つかりませんでした。レイヤ名を確認してください。")
+                else:
+                    st.success(f"読み込み成功：Alignment={ali.length:.1f} m、横断本数={len(xs)}")
+                    fig2, ax2 = plt.subplots(figsize=(8.6, 6.0))
+                    plot_plan_preview(ax2, ali, xs, highlight_id=(highlight or None))
+                    st.pyplot(fig2); plt.close(fig2)
+                    st.caption("※ ここは“プレビューのみ”。解析・cfgは変更しません。")
+            finally:
+                try:
+                    os.unlink(dxf_path)
+                except Exception:
+                    pass
+        else:
+            st.info("DXFを選択すると平面図プレビューが表示されます。レイヤ名は任意（既定：ALIGN/XS）。")
+    except Exception as e:
+        st.error(f"DXFプレビューでエラーが発生しました：{e}")
+# <<< DXF_PLAN_PREVIEW END（ここまで追記） <<<
 
 # ==== ページ2：地層 ====
 elif page.startswith("2"):
