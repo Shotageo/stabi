@@ -1,8 +1,7 @@
-# stabi_viz/plan_preview.py
+# stabi_viz/plan_preview_upload.py
 from __future__ import annotations
-import os, math
-from typing import Dict, List, Tuple, Optional
-
+import os, io, tempfile
+from typing import Dict, List, Optional
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
@@ -14,7 +13,6 @@ try:
 except Exception:
     _LEM_OK = False
     def compute_min_circle(cfg):
-        """Fallback mock: returns a simple circle & Fs so the page works even without LEM."""
         oz = np.asarray(cfg.get("section"))
         if oz is None or oz.size == 0:
             return {"fs": 1.10, "circle": {"oc": 0.0, "zc": 0.0, "R": 10.0, "x1": -5.0, "x2": 5.0}}
@@ -23,9 +21,8 @@ except Exception:
         R  = float(max(6.0, (np.max(oz[:,0]) - np.min(oz[:,0]))*0.35))
         return {"fs": 1.12, "circle": {"oc": oc, "zc": zc, "R": R, "x1": oc-R*0.6, "x2": oc+R*0.6}}
 
-from stabi_io.dxf_sections import list_layers, read_centerline, read_cross_sections_from_folder
+from stabi_io.dxf_sections import list_layers, read_centerline, read_cross_sections_from_folder, parse_station
 
-# --------- Utility: tangent/normal ----------
 def _tangent_normal(centerline: np.ndarray, s: float):
     lens = np.r_[0, np.cumsum(np.linalg.norm(np.diff(centerline, axis=0), axis=1))]
     s = float(np.clip(s, lens[0], lens[-1]))
@@ -43,83 +40,89 @@ def _xs_to_world3D(P, n, oz):
     Z = oz[:,1]
     return X, Y, Z
 
-# --------- Streamlit page entry ----------
+def _save_upload_to_temp(upload, suffix: str) -> str:
+    data = upload.read()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(data)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
+
 def page():
-    st.title("DXF取り込み・プレビュー")
-    st.caption("平面の中心線レイヤを選んで、横断（DXF/CSV）を取り込み、3Dで直交配置してプレビューします。")
+    st.title("DXF取り込み（ドラッグ＆ドロップ版）")
+    st.caption("平面DXFと横断DXF/CSVをドラッグ＆ドロップで読み込み、3Dプレビューします。" )
 
-    colL, colR = st.columns([2,1])
+    colA, colB = st.columns([1,1])
+    with colA:
+        st.subheader("① 平面（Centerline）")
+        plan_up = st.file_uploader("平面DXF（1ファイル）", type=["dxf"], accept_multiple_files=False)
+        unit_scale_plan = st.number_input("倍率（mm→mは0.001）", value=1.0, step=0.001, format="%.3f", key="u_plan")
 
-    with colL:
-        plan_path = st.text_input("平面図DXFへのパス（repo相対も可）", "io/plan.dxf")
-        xs_folder = st.text_input("横断DXF/CSVフォルダ（repo相対も可）", "io/sections")
-
-        unit_scale_plan = st.number_input("平面DXFの倍率（mm→m は 0.001）", value=1.0, step=0.001, format="%.3f")
-        unit_scale_xs   = st.number_input("横断の倍率（mm→m は 0.001）", value=1.0, step=0.001, format="%.3f")
-
-        if st.button("レイヤ一覧を読む", type="primary"):
+        if plan_up is not None:
+            temp_plan_path = _save_upload_to_temp(plan_up, ".dxf")
             try:
-                layers = list_layers(plan_path)
-                st.session_state._stabi_layers = layers
+                layers = list_layers(temp_plan_path)
+                st.session_state._layers = layers
                 st.success(f"{len(layers)} レイヤを検出")
             except Exception as e:
                 st.error(f"DXF読み込みに失敗: {e}")
+        else:
+            layers = []
 
-        layers = st.session_state.get("_stabi_layers", [])
-        center_layer = None
         if layers:
-            st.subheader("レイヤ選択（中心線候補）")
             options = [f"{L.name}  (ents: {sum(L.entity_counts.values())}, len≈{L.length_sum:.1f})" for L in layers]
-            idx = st.radio("中心線レイヤを1つ選択", list(range(len(options))), format_func=lambda i: options[i])
+            idx = st.radio("中心線レイヤを選択", list(range(len(options))), format_func=lambda i: options[i], key="laypick")
             center_layer = layers[int(idx)].name
+        else:
+            center_layer = None
 
-        if st.button("取り込み → プレビュー生成", disabled=(center_layer is None)):
-            try:
-                cl = read_centerline(plan_path, [center_layer], unit_scale=unit_scale_plan)
-                xs = read_cross_sections_from_folder(xs_folder, unit_scale=unit_scale_xs, layer_name=None)
-                st.session_state.centerline = cl
-                st.session_state.sections = xs
-                st.session_state.center_layer = center_layer
-                st.success(f"中心線: {len(cl)}点, 横断: {len(xs)}本")
-            except Exception as e:
-                st.error(f"取り込みに失敗: {e}")
+    with colB:
+        st.subheader("② 横断（Cross Sections）")
+        xs_files = st.file_uploader("横断DXF/CSV（複数可）", type=["dxf","csv"], accept_multiple_files=True)
+        unit_scale_xs = st.number_input("倍率（mm→mは0.001）", value=1.0, step=0.001, format="%.3f", key="u_xs" )
 
-    with colR:
-        st.caption("Tips / 注意")
-        st.write("- 平面は **LWPOLYLINE/LINE/SPLINE** から最長を採用します。")
-        st.write("- 横断はフォルダ内の **DXF(1断面=1ファイル)** または **CSV(offset,elev)** を読み取ります。")
-        st.write("- ファイル名やDXF内のTEXTに `100+00` / `KP12+350` があれば距離程を自動認識します。")
-        if not _LEM_OK:
-            st.warning("stabi_core.stabi_lem が見つからないため、円弧はダミーで表示しています。LEMが整ったら自動で切り替わります。")
+    run = st.button("読み込み → プレビュー", type="primary", disabled=plan_up is None or center_layer is None or not xs_files)
 
-    # --------- 3D Overview ---------
-    if "centerline" in st.session_state and "sections" in st.session_state:
-        cl: np.ndarray = st.session_state.centerline
-        sections: Dict[float, np.ndarray] = st.session_state.sections
+    if run:
+        import tempfile, os
+        tmpdir = tempfile.mkdtemp(prefix="stabi_xs_")
+        for f in xs_files:
+            path = os.path.join(tmpdir, f.name)
+            with open(path, "wb") as w:
+                w.write(f.getbuffer())
+
+        try:
+            cl = read_centerline(temp_plan_path, [center_layer], unit_scale=unit_scale_plan)
+            xs = read_cross_sections_from_folder(tmpdir, unit_scale=unit_scale_xs, layer_name=None)
+            st.session_state.centerline = cl
+            st.session_state.sections = xs
+            st.success(f"中心線: {len(cl)}点, 横断: {len(xs)}本 でプレビューを生成します。")
+        except Exception as e:
+            st.error(f"取り込みに失敗: {e}")
+            return
 
         fig = go.Figure()
         fig.add_trace(go.Scatter3d(x=cl[:,0], y=cl[:,1], z=np.zeros(len(cl)),
                                    mode="lines", name="Centerline",
                                    line=dict(width=4, color="#A0A6B3")))
-        pitch = st.slider("表示横断ピッチ[m]", 5, 50, 20, step=5, help="描画負荷を抑えるための間引き")
+
+        pitch = st.slider("表示横断ピッチ[m]", 5, 50, 20, step=5)
         show_keys = []
-        for s in sorted(sections.keys()):
+        for s in sorted(st.session_state.sections.keys()):
             if int(s) % pitch == 0:
                 show_keys.append(s)
         if not show_keys:
-            show_keys = list(sections.keys())[::max(1, len(sections)//10)]
+            show_keys = list(st.session_state.sections.keys())[::max(1, len(st.session_state.sections)//10)]
 
         for s in show_keys:
             P, t, n = _tangent_normal(cl, s)
-            oz = sections[s]
+            oz = st.session_state.sections[s]
             X,Y,Z = _xs_to_world3D(P, n, oz)
             fig.add_trace(go.Scatter3d(x=X, y=Y, z=Z, mode="lines",
                                        name=f"XS {s:.0f}", line=dict(width=5, color="#FFFFFF"), opacity=0.95))
-            # LEM result (real or mock)
             try:
                 res = compute_min_circle({"section": oz})
                 c = res["circle"]; fs = res["fs"]
-                # arc polyline
                 ph = np.linspace(-np.pi, np.pi, 241)
                 xo = c["oc"] + c["R"]*np.cos(ph)
                 zo = c["zc"] + c["R"]*np.sin(ph)
