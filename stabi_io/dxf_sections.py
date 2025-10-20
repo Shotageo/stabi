@@ -16,7 +16,7 @@ except Exception:
 _ST_RE = re.compile(r"(?:STA|KP|No\.?|NO\.?|No|NO)?\s*([0-9]+)\s*[+−-]\s*([0-9]+)", re.IGNORECASE)
 
 def parse_station(text: str) -> Optional[float]:
-    """Parse '100+00' or 'No.0+20' or 'KP12+350' -> meters (A*100 + B)."""
+    """'100+00' / 'No.0+20' / 'KP12+350' -> meters (A*100 + B)"""
     if not text:
         return None
     m = _ST_RE.search(str(text).replace("−", "-"))
@@ -26,7 +26,7 @@ def parse_station(text: str) -> Optional[float]:
     return float(a*100 + b)
 
 def normalize_no_key(text: str) -> Optional[str]:
-    """Return a normalized No key like 'No.0+20' if found; else None."""
+    """Return normalized No key like 'No.0+20' if found; else None."""
     m = _ST_RE.search(str(text).replace("−", "-"))
     if not m:
         return None
@@ -47,6 +47,7 @@ def _safe_len(entity) -> float:
         return 0.0
 
 def list_layers(dxf_path: str) -> List[LayerInfo]:
+    """Rough layer stats (counts + total length-like)."""
     if ezdxf is None:
         raise RuntimeError("ezdxf not installed. Add 'ezdxf' to requirements.txt.")
     doc = ezdxf.readfile(dxf_path)
@@ -79,6 +80,7 @@ def _sample_entity_2d(ent):
     return pts
 
 def read_centerline(dxf_path: str, layer_whitelist: List[str], unit_scale: float = 1.0) -> np.ndarray:
+    """Pick the longest curve in selected layers as centerline (2D XY)."""
     if ezdxf is None:
         raise RuntimeError("ezdxf not installed.")
     doc = ezdxf.readfile(dxf_path)
@@ -104,7 +106,6 @@ def read_centerline(dxf_path: str, layer_whitelist: List[str], unit_scale: float
 def project_point_to_polyline(poly: np.ndarray, pt: np.ndarray) -> Tuple[float, float]:
     """
     Project point pt onto polyline; return (s_along_polyline_m, distance_m).
-    Uses chord lengths as segment lengths.
     """
     if poly.shape[0] < 2:
         return 0.0, float("inf")
@@ -125,10 +126,11 @@ def project_point_to_polyline(poly: np.ndarray, pt: np.ndarray) -> Tuple[float, 
             best = (s, dist)
     return best
 
-def extract_no_labels_with_station(dxf_path: str, label_layers: List[str], centerline_xy: np.ndarray, unit_scale: float = 1.0) -> List[Dict]:
+# -------------------------------------------------------------
+# No. TEXT / MTEXT を位置だけ取得（投影は後段）
+def extract_no_labels(dxf_path: str, label_layers: List[str], unit_scale: float = 1.0) -> List[Dict]:
     """
-    Read TEXT/MTEXT from given layers, parse No.*, and project insertion points to centerline.
-    Returns list of dicts: { 'key': 'No.0+20', 'station_m': 20.4, 'dist': 0.12, 'raw': 'No.0+20', 'pos': (x,y) }
+    Returns: [{'key': 'No.0+80', 'pos': (x,y), 'raw': 'NO. 0+80', 'layer': '...'}, ...]
     """
     if ezdxf is None:
         raise RuntimeError("ezdxf not installed.")
@@ -145,16 +147,56 @@ def extract_no_labels_with_station(dxf_path: str, label_layers: List[str], cente
             if not key:
                 continue
             ins = e.dxf.insert
-            pos = np.array([float(ins.x), float(ins.y)], dtype=float) * unit_scale
-            s, dist = project_point_to_polyline(centerline_xy, pos)
-            out.append({"key": key, "station_m": s, "dist": dist, "raw": raw, "pos": (pos[0], pos[1])})
+            pos = (float(ins.x)*unit_scale, float(ins.y)*unit_scale)
+            out.append({"key": key, "pos": pos, "raw": raw, "layer": e.dxf.layer})
         except Exception:
             continue
-    # sort by s
-    out.sort(key=lambda d: d["station_m"])
     return out
 
+# 測点円（CIRCLE）抽出（INSERT内の仮想エンティティにもできる範囲で対応）
+def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float = 1.0) -> List[Dict]:
+    """
+    Returns: [{'center': (x,y), 'r': radius, 'layer': '...'}, ...]
+    """
+    if ezdxf is None:
+        raise RuntimeError("ezdxf not installed.")
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+    allow = set(circle_layers or [])
+    circles: List[Dict] = []
+
+    # 直接の CIRCLE
+    for c in msp.query("CIRCLE"):
+        if allow and c.dxf.layer not in allow:
+            continue
+        try:
+            cx, cy = float(c.dxf.center.x)*unit_scale, float(c.dxf.center.y)*unit_scale
+            r = float(c.dxf.radius)*unit_scale
+            circles.append({"center": (cx, cy), "r": r, "layer": c.dxf.layer})
+        except Exception:
+            pass
+
+    # ブロック参照 (INSERT) の仮想展開（対応可能な範囲）
+    try:
+        for ref in msp.query("INSERT"):
+            try:
+                for v in ref.virtual_entities():  # 既に座標系が適用された形で得られる
+                    if v.dxftype() == "CIRCLE":
+                        if allow and v.dxf.layer not in allow:
+                            continue
+                        cx, cy = float(v.dxf.center.x)*unit_scale, float(v.dxf.center.y)*unit_scale
+                        r = float(v.dxf.radius)*unit_scale
+                        circles.append({"center": (cx, cy), "r": r, "layer": v.dxf.layer})
+            except Exception:
+                continue
+    except Exception:
+        # ezdxf のバージョンによっては virtual_entities が無いことがある
+        pass
+
+    return circles
+
 # -------------------------------------------------------------
+# 断面ファイル（1枚）を (offset,elev) で取得
 def read_single_section_file(path: str, layer_name: Optional[str] = None, unit_scale: float = 1.0) -> Optional[np.ndarray]:
     """Read a single DXF/CSV as (offset, elev) array. Assumes X=offset, Y=elev for DXF."""
     if path.lower().endswith(".csv"):
@@ -174,16 +216,18 @@ def read_single_section_file(path: str, layer_name: Optional[str] = None, unit_s
         return None
     msp = doc.modelspace()
     polys = []
+    # LWPOLYLINE 優先（横断は1本の折線想定）
     for e in msp.query("LWPOLYLINE"):
         if (layer_name is None) or (e.dxf.layer == layer_name):
             pts = _sample_entity_2d(e)
             polys.append((e, pts))
     if not polys:
+        # 最低限のフォールバック：LINE 群をまとめる対応などは必要なら拡張
         return None
     ent, pts = max(polys, key=lambda t: _safe_len(t[0]))
     oz = pts * unit_scale
-    idx = np.argsort(oz[:,0])
-    oz = oz[idx]
+    # X昇順＋重複除去で安定化
+    idx = np.argsort(oz[:,0]); oz = oz[idx]
     _, uniq = np.unique(oz[:,0], return_index=True)
     oz = oz[np.sort(uniq)]
     return oz[:, :2]
