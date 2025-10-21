@@ -9,7 +9,7 @@ import streamlit as st
 import plotly.graph_objects as go
 
 # ──────────────────────────────────────────────────────────────
-# LEM が未実装でも動くようにフォールバック
+# LEM が未実装でも動くフォールバック
 try:
     from stabi_core.stabi_lem import compute_min_circle  # type: ignore
     _LEM_OK = True
@@ -17,7 +17,6 @@ except Exception:
     _LEM_OK = False
 
     def compute_min_circle(cfg):
-        """お試し用の簡易円（視覚確認目的）"""
         oz = np.asarray(cfg.get("section"))
         if oz is None or oz.size == 0:
             return {"fs": 1.10, "circle": {"oc": 0.0, "zc": 0.0, "R": 10.0}}
@@ -73,6 +72,41 @@ def _sync_ui_value(key: str, value):
 
 
 # ──────────────────────────────────────────────────────────────
+# s（中心線距離）を “生データから” 再計算（倍率変更後でも破綻しない）
+def _rebuild_s_map_from_raw() -> Dict[str, float]:
+    """
+    返り値: key(No.) -> s（現在の平面倍率を掛けたスケールでの距離）
+    """
+    s_map: Dict[str, float] = {}
+    if "centerline_raw" not in st.session_state or "no_table" not in st.session_state:
+        return s_map
+
+    cl_raw = st.session_state.centerline_raw            # 倍率1.0の生
+    k = float(st.session_state.get("unit_scale_plan_ui", 1.0))  # 現在の平面倍率
+
+    # ラベルの生座標（フォールバック用）
+    label_pos: Dict[str, np.ndarray] = {}
+    for lab in st.session_state.get("labels_raw", []):
+        key = lab.get("key")
+        pos = np.array(lab.get("pos"), float)
+        if key is not None:
+            label_pos[key] = pos
+
+    # Noテーブル内の circle_xy は “生単位” を保存している前提（Step1でそう保存）
+    for row in st.session_state.no_table:
+        key = row["key"]
+        circ_raw = np.array(row["circle_xy"], float) if row.get("circle_xy") is not None else None
+        src = circ_raw if circ_raw is not None else label_pos.get(key)
+        if src is None:
+            # 最後の手段：過去の s をそのまま使う（倍率変更時は誤差の元なので推奨しない）
+            s_map[key] = float(row.get("s", 0.0))
+            continue
+        s_raw, _ = project_point_to_polyline(cl_raw, src)  # 生で投影
+        s_map[key] = float(s_raw) * k                      # 現在の倍率で距離に換算
+    return s_map
+
+
+# ──────────────────────────────────────────────────────────────
 # 生データ raw_sections と 現在の UI 設定から assigned を再構築
 def build_assigned_from_raw():
     if "raw_sections" not in st.session_state:
@@ -87,10 +121,12 @@ def build_assigned_from_raw():
     cl_raw = st.session_state.centerline_raw
     cl = cl_raw * unit_scale_plan
 
-    # No→測点 s / 測点円中心
-    no_to_s = {d["key"]: d["s"] for d in st.session_state.no_table}
-    no_to_circle = {
-        d["key"]: (np.array(d["circle_xy"]) if d["circle_xy"] is not None else None)
+    # s を現在倍率で再計算
+    s_map = _rebuild_s_map_from_raw()
+
+    # No→測点円中心（生座標）
+    no_to_circle_raw = {
+        d["key"]: (np.array(d["circle_xy"]) if d.get("circle_xy") is not None else None)
         for d in st.session_state.no_table
     }
 
@@ -108,8 +144,7 @@ def build_assigned_from_raw():
 
     for fname, rec in st.session_state.raw_sections.items():
         sel = rec.get("no_key") or rec.get("guess_no")
-        if not sel or sel not in no_to_s:
-            # No 未確定はスキップ（UI側で選んでから適用で反映）
+        if not sel or sel not in s_map:
             continue
 
         oz_raw = np.asarray(rec["oz_raw"], float)
@@ -125,12 +160,12 @@ def build_assigned_from_raw():
             z *= -1.0
 
         # センタリング
-        s = float(no_to_s[sel])
+        s = float(s_map[sel])             # ← いまの倍率に合った s を使用
         P, _, n = _tangent_normal(cl, s)
-        circ = no_to_circle.get(sel)
-        if center_by_circle and circ is not None:
-            # UI倍率を掛けた円中心座標を使用
-            circ_scaled = circ * unit_scale_plan
+
+        circ_raw = no_to_circle_raw.get(sel)
+        if center_by_circle and circ_raw is not None:
+            circ_scaled = circ_raw * unit_scale_plan  # 円中心も現在倍率で
             oc0 = float(np.dot(circ_scaled - P, n))
             o = o - oc0
         elif center_o:
@@ -138,11 +173,11 @@ def build_assigned_from_raw():
         else:
             o = o - float(user_center_offset)
 
+        # 標高基準
         if elev_zero_mode == "最小を0":
             z = z - float(np.min(z))
         elif elev_zero_mode == "中央値を0":
             z = z - float(np.median(z))
-        # しない → 変更なし
 
         assigned[fname] = {"oz": np.column_stack([o, z]), "no_key": sel, "s": s}
 
@@ -170,29 +205,26 @@ def page():
         if plan_up is not None and st.button("中心線＋No.＋円 抽出を実行", type="primary"):
             # 一時ファイルとして保存
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
-            tmp.write(plan_up.read())
-            tmp.flush()
-            tmp.close()
+            tmp.write(plan_up.read()); tmp.flush(); tmp.close()
             st.session_state._plan_path = tmp.name
 
             try:
-                # 生のまま読み込んで保存（倍率は後段で適用）
+                # 生のまま読み込んで保存（倍率1.0）
                 cl_raw = read_centerline(tmp.name, allow_layers=[], unit_scale=1.0)
                 layers = list_layers(tmp.name)
-                # UI でレイヤ選択させるため、一度一覧を出す
-                st.info("中心線は最長形状を自動選択しました。必要ならレイヤ選択版に差し替え可能です。")
 
+                # ラベル・円も生で取得
                 labels = extract_no_labels(tmp.name, [L.name for L in layers], unit_scale=1.0)
                 circles = extract_circles(tmp.name, [L.name for L in layers], unit_scale=1.0)
 
-                # 円の中心を中心線上に投影して s を決定
-                no_rows = []
+                # 画面表示用に s を “いったん現在倍率で” 求めるが、保持は生データを優先
                 cl_scaled = cl_raw * float(unit_scale_plan)
+                no_rows = []
+                # ラベル→最近傍の円を関連付け
                 for lab in labels:
                     key = lab["key"]
-                    # ラベル近傍の円（最短）を探す
                     Lxy = np.array(lab["pos"], float) * float(unit_scale_plan)
-                    # 最も近い円
+                    # 近傍円を検索（find_radius 内に限定する場合は if d<=find_radius を付ける）
                     best = None
                     for c in circles:
                         Cxy = np.array(c["center"], float) * float(unit_scale_plan)
@@ -201,23 +233,23 @@ def page():
                             best = (d, Cxy, c.get("r", None), c.get("layer", ""))
                     if best is not None:
                         d, Cxy, r, lay = best
-                        s, dist = project_point_to_polyline(cl_scaled, Cxy)
+                        s_now, dist = project_point_to_polyline(cl_scaled, Cxy)
+                        # circle_xy は “生単位” で保存（倍率変更後の再計算に使う）
                         no_rows.append(
                             {
                                 "key": key,
-                                "s": s,
+                                "s": float(s_now),
                                 "label_to_circle": d,
                                 "circle_to_cl": dist,
                                 "circle_r": r,
                                 "circle_layer": lay,
-                                "circle_xy": tuple(Cxy / float(unit_scale_plan)),  # ←生単位で保存
+                                "circle_xy": tuple(Cxy / float(unit_scale_plan)),
                                 "status": "OK",
                             }
                         )
-
                 no_rows.sort(key=lambda d: d["s"])
 
-                # 生データとして保持（倍率は都度適用）
+                # 生データを保持（倍率変更後の s は毎回再計算する）
                 st.session_state.centerline_raw = cl_raw
                 st.session_state.labels_raw = labels
                 st.session_state.circles_raw = circles
@@ -280,15 +312,12 @@ def page():
         if xs_files:
             for f in xs_files:
                 with st.expander(f"割当：{f.name}", expanded=False):
-                    # ファイルを一旦解析して「素の offset/elev」を保存（軸入替のみ／倍率やセンタリングは未適用）
+                    # 一時ファイル
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + f.name.split(".")[-1])
-                    tmp.write(f.getbuffer())
-                    tmp.flush()
-                    tmp.close()
+                    tmp.write(f.getbuffer()); tmp.flush(); tmp.close()
 
                     layer_name: Optional[str] = None
                     if f.name.lower().endswith(".dxf"):
-                        # 参考用にレイヤ一覧（選択しない = 自動）
                         try:
                             scan_layers = list_layers(tmp.name)
                             layer_name = st.selectbox(
@@ -303,7 +332,7 @@ def page():
                     sec = read_single_section_file(
                         tmp.name,
                         layer_name=layer_name,
-                        unit_scale=1.0,  # 「生」で保持
+                        unit_scale=1.0,  # 生で保持
                         aggregate=agg_map[agg_mode],
                         smooth_k=int(smooth_k),
                         max_slope=float(max_slope),
@@ -315,45 +344,32 @@ def page():
 
                     # 軸入替だけ先に済ませて「生」を保存
                     if axis_mode.startswith("X=elev"):
-                        o_raw = sec[:, 1].astype(float)
-                        z_raw = sec[:, 0].astype(float)
+                        o_raw = sec[:, 1].astype(float); z_raw = sec[:, 0].astype(float)
                     else:
-                        o_raw = sec[:, 0].astype(float)
-                        z_raw = sec[:, 1].astype(float)
+                        o_raw = sec[:, 0].astype(float); z_raw = sec[:, 1].astype(float)
                     oz_raw = np.column_stack([o_raw, z_raw])
 
                     # No 推定（ファイル名から）
                     guess = normalize_no_key(f.name) or ""
-                    if no_choices and guess in no_choices:
-                        guess_idx = no_choices.index(guess) + 1
-                    else:
-                        guess_idx = 0
+                    guess_idx = no_choices.index(guess) + 1 if no_choices and guess in no_choices else 0
                     sel = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=guess_idx)
 
-                    # 生データ保存／No だけ持つ
+                    # 生データ保存
                     st.session_state.raw_sections[f.name] = {
                         "oz_raw": oz_raw,
                         "guess_no": sel if sel != "（未選択）" else None,
                         "no_key": sel if sel != "（未選択）" else None,
                     }
 
-                    # 断面プレビュー（生→現在UIで適用する簡易可視化）
-                    # ※ 見やすさ重視で 2D プロットにしておく
+                    # 2D プレビュー（倍率・反転のみ適用）
                     import matplotlib.pyplot as plt
-
-                    # 現在のUI適用（センタリングは無し、倍率と反転のみ）
                     o = o_raw * float(offset_scale)
                     z = z_raw * float(elev_scale)
-                    if flip_o:
-                        o *= -1.0
-                    if flip_z:
-                        z *= -1.0
-
+                    if flip_o: o *= -1.0
+                    if flip_z: z *= -1.0
                     fig2, ax = plt.subplots(figsize=(5.0, 2.4))
-                    ax.plot(o, z, lw=2.0)
-                    ax.grid(True, alpha=0.3)
-                    ax.set_xlabel("offset [m]")
-                    ax.set_ylabel("elev [m]")
+                    ax.plot(o, z, lw=2.0); ax.grid(True, alpha=0.3)
+                    ax.set_xlabel("offset [m]"); ax.set_ylabel("elev [m]")
                     st.pyplot(fig2, use_container_width=True)
 
         # 「変更を適用（再計算）」で生→現在UIを一括適用して割当辞書を再構築
@@ -364,7 +380,6 @@ def page():
             except Exception as e:
                 st.error(f"再適用でエラー: {e}")
 
-        # 状況表示
         assigned_cnt = len(st.session_state.get("_assigned", {}))
         raw_cnt = len(st.session_state.get("raw_sections", {}))
         st.info(f"割当済み：{assigned_cnt} / 取り込み済みファイル：{raw_cnt}")
@@ -390,47 +405,33 @@ def page():
         # 中心線
         fig.add_trace(
             go.Scatter3d(
-                x=cl[:, 0],
-                y=cl[:, 1],
-                z=np.zeros(len(cl)),
-                mode="lines",
-                name="Centerline",
+                x=cl[:, 0], y=cl[:, 1], z=np.zeros(len(cl)),
+                mode="lines", name="Centerline",
                 line=dict(width=4, color="#A0A6B3"),
             )
         )
 
         # 断面群
         for _, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
-            s = float(rec["s"])
-            oz = np.asarray(rec["oz"], float)
+            s = float(rec["s"]); oz = np.asarray(rec["oz"], float)
             P, t, n = _tangent_normal(cl, s)
 
             # 断面形状本体
             X, Y, Z = _xs_to_world3D(P, n, oz, z_scale=z_scale)
             fig.add_trace(
                 go.Scatter3d(
-                    x=X,
-                    y=Y,
-                    z=Z,
-                    mode="lines",
+                    x=X, y=Y, z=Z, mode="lines",
                     name=f"{rec['no_key']}",
-                    line=dict(width=5, color="#FFFFFF"),
-                    opacity=0.98,
+                    line=dict(width=5, color="#FFFFFF"), opacity=0.98,
                 )
             )
 
             # 基線（offset 範囲）
             omin, omax = float(np.min(oz[:, 0])), float(np.max(oz[:, 0]))
-            xb = np.array([omin, omax])
-            yb = np.zeros_like(xb)
-            Xb, Yb, Zb = _xs_to_world3D(P, n, np.column_stack([xb, yb]), z_scale=z_scale)
+            Xb, Yb, Zb = _xs_to_world3D(P, n, np.column_stack([[omin, omax], [0.0, 0.0]]).T, z_scale=z_scale)
             fig.add_trace(
                 go.Scatter3d(
-                    x=Xb,
-                    y=Yb,
-                    z=Zb,
-                    mode="lines",
-                    showlegend=False,
+                    x=Xb, y=Yb, z=Zb, mode="lines", showlegend=False,
                     line=dict(width=2, color="#777777"),
                 )
             )
@@ -440,12 +441,8 @@ def page():
             Xp, Yp, Zp = _xs_to_world3D(P, n, np.array([[0.0, zmin], [0.0, zmax]]), z_scale=1.0)
             fig.add_trace(
                 go.Scatter3d(
-                    x=Xp,
-                    y=Yp,
-                    z=Zp,
-                    mode="lines",
-                    showlegend=False,
-                    line=dict(width=3, color="#8888FF"),
+                    x=Xp, y=Yp, z=Zp, mode="lines",
+                    showlegend=False, line=dict(width=3, color="#8888FF"),
                 )
             )
 
@@ -454,33 +451,25 @@ def page():
                 res = compute_min_circle({"section": oz})
                 oc, zc, R = res["circle"]["oc"], res["circle"]["zc"], res["circle"]["R"]
                 ph = np.linspace(-np.pi, np.pi, 241)
-                xo = oc + R * np.cos(ph)
-                zo = zc + R * np.sin(ph)
-                X2 = P[0] + xo * n[0]
-                Y2 = P[1] + xo * n[1]
-                Z2 = zo * z_scale
+                xo = oc + R * np.cos(ph);  zo = zc * np.ones_like(ph) + R * np.sin(ph)
+                X2 = P[0] + xo * n[0]; Y2 = P[1] + xo * n[1]; Z2 = zo * z_scale
                 fig.add_trace(
-                    go.Scatter3d(
-                        x=X2, y=Y2, z=Z2, mode="lines", showlegend=False, line=dict(width=3, color="#E65454")
-                    )
+                    go.Scatter3d(x=X2, y=Y2, z=Z2, mode="lines",
+                                 showlegend=False, line=dict(width=3, color="#E65454"))
                 )
             except Exception:
                 pass
 
         fig.update_layout(
             scene=dict(
-                xaxis=dict(visible=False),
-                yaxis=dict(visible=False),
-                zaxis=dict(visible=False),
+                xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False),
                 aspectmode="data",
             ),
-            paper_bgcolor="#0f1115",
-            plot_bgcolor="#0f1115",
+            paper_bgcolor="#0f1115", plot_bgcolor="#0f1115",
             margin=dict(l=0, r=0, t=0, b=0),
         )
         st.plotly_chart(fig, use_container_width=True, height=780)
 
 
-# 単体実行用
 if __name__ == "__main__":
     page()
