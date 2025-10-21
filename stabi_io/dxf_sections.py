@@ -14,17 +14,9 @@ except Exception:
 # ----------------------- station text -----------------------
 _ST_RE = re.compile(r"(?:STA|KP|No\.?|NO\.?|No|NO)?\s*([0-9]+)\s*[+−-]\s*([0-9]+)", re.IGNORECASE)
 
-def parse_station(text: str) -> Optional[float]:
-    if not text:
-        return None
-    m = _ST_RE.search(str(text).replace("−", "-"))
-    if not m:
-        return None
-    a, b = int(m.group(1)), int(m.group(2))
-    return float(a*100 + b)
-
 def normalize_no_key(text: str) -> Optional[str]:
-    m = _ST_RE.search(str(text).replace("−", "-"))
+    t = str(text).replace("−", "-")
+    m = _ST_RE.search(t)
     if not m:
         return None
     a, b = int(m.group(1)), int(m.group(2))
@@ -79,8 +71,8 @@ def read_centerline(dxf_path: str, layer_whitelist: List[str], unit_scale: float
         raise RuntimeError("ezdxf not installed.")
     doc = ezdxf.readfile(dxf_path)
     msp = doc.modelspace()
-    candidates = []
     allow = set(layer_whitelist or [])
+    candidates = []
     for e in msp.query("*"):
         if allow and e.dxf.layer not in allow:
             continue
@@ -145,7 +137,6 @@ def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float =
     msp = doc.modelspace()
     allow = set(circle_layers or [])
     circles: List[Dict] = []
-
     for c in msp.query("CIRCLE"):
         if allow and c.dxf.layer not in allow:
             continue
@@ -155,8 +146,6 @@ def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float =
             circles.append({"center": (cx, cy), "r": r, "layer": c.dxf.layer})
         except Exception:
             pass
-
-    # best-effort for circles inside blocks
     try:
         for ref in msp.query("INSERT"):
             try:
@@ -171,67 +160,105 @@ def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float =
                 continue
     except Exception:
         pass
-
     return circles
 
-# ----------------- cross-section (multi-curve robust) -------------
-def _pca_2d(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    C = np.asarray(points, dtype=float)
-    mu = np.mean(C, axis=0)
-    X = C - mu
+# ----------------- cross-section (robust from messy DXF) -------------
+def _pca_local(points: np.ndarray):
+    """mean(mu), rotation V (2x2), centered coords X."""
+    mu = np.mean(points, axis=0)
+    X = points - mu
     cov = np.cov(X.T)
-    w, V = np.linalg.eigh(cov)   # ascending
-    V = V[:, ::-1]               # first column = major axis
+    w, V = np.linalg.eigh(cov)   # ascending → major axis last
+    V = V[:, ::-1]
     return mu, V, X
 
-def _aggregate_chain(u: np.ndarray, v: np.ndarray, nbin: int, mode: str) -> np.ndarray:
+def _segments_by_gap(u: np.ndarray, factor: float = 6.0) -> List[slice]:
+    """uを昇順に並べて、Δu が中央値×factor 以上の場所で分割→最長セグメントを返すための境界。"""
+    order = np.argsort(u)
+    uo = u[order]
+    du = np.diff(uo)
+    med = np.median(np.abs(du)) or 1.0
+    cuts = np.where(du > factor * med)[0]  # indices before gap
+    idxs = np.r_[0, cuts + 1, len(uo)]
+    segs = [slice(idxs[i], idxs[i+1]) for i in range(len(idxs)-1)]
+    # マッピングを呼び出し側で行うので order も返す
+    return order, segs
+
+def _bin_aggregate(u: np.ndarray, v: np.ndarray, nbin: int, mode: str) -> np.ndarray:
     umin, umax = float(np.min(u)), float(np.max(u))
     if umax - umin <= 0:
         return np.empty((0,2))
+    # 自動ビン数（過密/過疎どちらにも耐える）
+    nbin = int(np.clip(nbin, 80, 480))
     bins = np.linspace(umin, umax, nbin+1)
     idx = np.digitize(u, bins) - 1
     xs, ys = [], []
     for b in range(nbin):
         mask = (idx == b)
-        if np.count_nonzero(mask) >= 3:
+        cnt = np.count_nonzero(mask)
+        if cnt >= 5:  # スパースは捨てる
             xs.append(0.5*(bins[b]+bins[b+1]))
+            vb = v[mask]
             if mode == "lower":
-                ys.append(float(np.min(v[mask])))
+                ys.append(float(np.percentile(vb, 10)))
             elif mode == "upper":
-                ys.append(float(np.max(v[mask])))
+                ys.append(float(np.percentile(vb, 90)))
             else:
-                ys.append(float(np.median(v[mask])))
+                ys.append(float(np.median(vb)))
     if not xs:
         return np.empty((0,2))
     P = np.column_stack([np.asarray(xs), np.asarray(ys)])
+    # 近接重複除去
     order = np.argsort(P[:,0])
     P = P[order]
-    _, uniq = np.unique(P[:,0], return_index=True)
+    _, uniq = np.unique(np.round(P[:,0], 5), return_index=True)
     return P[np.sort(uniq)]
+
+def _median_filter(y: np.ndarray, k: int = 5) -> np.ndarray:
+    k = max(1, int(k) | 1)  # odd
+    if k <= 1: return y
+    r = k//2
+    yy = y.copy()
+    for i in range(len(y)):
+        a, b = max(0, i-r), min(len(y), i+r+1)
+        yy[i] = np.median(y[a:b])
+    return yy
+
+def _clip_slope(x: np.ndarray, y: np.ndarray, max_slope: float) -> np.ndarray:
+    """|dy/dx|が異常に大きい箇所をクリップ（縦スパイク抑制）。"""
+    if len(x) < 3 or max_slope <= 0:
+        return y
+    dy = np.diff(y); dx = np.diff(x); s = np.divide(dy, dx, out=np.zeros_like(dy), where=dx!=0)
+    y2 = y.copy()
+    for i in range(1, len(y)-1):
+        if abs(s[i-1]) > max_slope or abs(s[min(i, len(s)-1)]) > max_slope:
+            y2[i] = 0.5*(y2[i-1] + y2[i+1])
+    return y2
 
 def read_single_section_file(
     path: str,
     layer_name: Optional[str] = None,
     unit_scale: float = 1.0,
     aggregate: str = "median",   # "median" / "lower" / "upper"
+    smooth_k: int = 7,
+    max_slope: float = 10.0,
 ) -> Optional[np.ndarray]:
     """
-    Read one DXF/CSV and return Nx2 array in a *local PCA frame* (u: offset-like, v: elev-like).
-    - 集約: 複数曲線を u 方向のビンごとに中央値/下包絡/上包絡で1本化。
-    - NOTE: 軸/単位/基準シフトは呼び出し側で行う。
+    雑多なDXF/CSVから 横断1本 (u,v) を生成して返す。
+    - LWPOLYLINE/LINE 全取得 → 点群化
+    - PCAで横断主軸へ回転（u:横断, v:標高）
+    - uの大きなギャップでセグメント化 → 最長セグメントを採用
+    - uビンごとに中央値/上下包絡で集約
+    - 1Dメディアン平滑 + 勾配クリップでスパイク抑制
     """
-    # CSV
+    # 1) 点群取得
     if path.lower().endswith(".csv"):
         try:
             data = np.loadtxt(path, delimiter=",", dtype=float)
-            pts = np.asarray(data, dtype=float)
-            if pts.ndim != 2 or pts.shape[1] < 2:
-                return None
-            P = pts[:, :2] * unit_scale
+            P = np.asarray(data[:, :2], dtype=float) * unit_scale
         except Exception:
             return None
     else:
-        # DXF
         if ezdxf is None:
             raise RuntimeError("ezdxf not installed.")
         try:
@@ -239,28 +266,38 @@ def read_single_section_file(
         except Exception:
             return None
         msp = doc.modelspace()
-
-        # collect points from LWPOLYLINE and LINE (optionally filter by layer)
-        pts_list = []
+        pts = []
         for e in msp.query("LWPOLYLINE"):
             if (layer_name is None) or (e.dxf.layer == layer_name):
-                pts = _sample_entity_2d(e)
-                if pts.size:
-                    pts_list.append(pts)
+                xy = _sample_entity_2d(e)
+                if xy.size: pts.append(xy)
         for ln in msp.query("LINE"):
             if (layer_name is None) or (ln.dxf.layer == layer_name):
-                pts_list.append(np.array([[ln.dxf.start.x, ln.dxf.start.y],
-                                          [ln.dxf.end.x,   ln.dxf.end.y]], dtype=float))
-        if not pts_list:
+                pts.append(np.array([[ln.dxf.start.x, ln.dxf.start.y],
+                                     [ln.dxf.end.x,   ln.dxf.end.y]], dtype=float))
+        if not pts:
             return None
-        P = (np.vstack(pts_list)) * unit_scale
+        P = np.vstack(pts).astype(float) * unit_scale
 
-    # PCA → local frame
-    mu, V, Xc = _pca_2d(P)
-    U = Xc @ V  # (u,v)
+    # 2) PCA → ローカル座標
+    mu, V, Xc = _pca_local(P)
+    U = Xc @ V  # columns: [u, v]
 
-    # aggregate to a single chain
-    chain = _aggregate_chain(U[:,0], U[:,1], nbin=320, mode=aggregate)
+    # 3) セグメント化（最長セグメント採用）
+    order, segs = _segments_by_gap(U[:,0], factor=6.0)
+    uo, vo = U[order, 0], U[order, 1]
+    best = max(segs, key=lambda s: s.stop - s.start)
+    u_main = uo[best]; v_main = vo[best]
+
+    # 4) 集約
+    span = max(1, int((np.max(u_main) - np.min(u_main)) / max( (np.percentile(np.diff(u_main), 90) or 1e-3), 1e-3 )))
+    nbin = int(np.clip(span, 120, 480))
+    chain = _bin_aggregate(u_main, v_main, nbin=nbin, mode=aggregate)
     if chain.size == 0:
         return None
-    return chain  # (u,v)
+
+    # 5) スパイク抑制（平滑＋勾配クリップ）
+    x, y = chain[:,0], chain[:,1]
+    y = _median_filter(y, k=smooth_k)
+    y = _clip_slope(x, y, max_slope=max_slope)
+    return np.column_stack([x, y])
