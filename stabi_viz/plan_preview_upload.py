@@ -49,9 +49,9 @@ def _tangent_normal(centerline: np.ndarray, s: float):
     if centerline.shape[0] < 2:
         return centerline[0], np.array([1.0, 0.0]), np.array([0.0, 1.0])
 
-    segs = np.diff(centerline, axis=0)                     # 区間ベクトル
-    lens = np.linalg.norm(segs, axis=1)                    # 区間長
-    cum  = np.r_[0.0, np.cumsum(lens)]                     # 弧長累積
+    segs = np.diff(centerline, axis=0)                # 区間ベクトル
+    lens = np.linalg.norm(segs, axis=1)               # 区間長
+    cum  = np.r_[0.0, np.cumsum(lens)]                # 弧長累積
     Ltot = float(cum[-1])
     if Ltot <= 0:
         return centerline[0], np.array([1.0, 0.0]), np.array([0.0, 1.0])
@@ -64,13 +64,13 @@ def _tangent_normal(centerline: np.ndarray, s: float):
     i = max(0, min(i, len(segs) - 1))
 
     Li = lens[i] if lens[i] > 0 else 1.0
-    tau = (s - cum[i]) / Li                                 # 区間内パラメータ 0..1
+    tau = (s - cum[i]) / Li                           # 区間内パラメータ 0..1
     p0  = centerline[i]
     v   = segs[i]
 
-    P = p0 + tau * v                                        # 投影点（内挿）
-    t = v / Li                                              # 単位接線
-    n = np.array([-t[1], t[0]])                             # 左法線を正
+    P = p0 + tau * v                                  # 投影点（内挿）
+    t = v / Li                                        # 単位接線
+    n = np.array([-t[1], t[0]])                       # 左法線を正
     return P, t, n
 
 
@@ -110,12 +110,13 @@ def _sync_ui_value(key: str, value):
 def _rebuild_s_map_from_raw() -> Dict[str, float]:
     """
     返り値: key(No.) -> s（現在の平面倍率を掛けたスケールでの距離）
+    円が無い場合はラベル位置→中心線の射影でフォールバック。
     """
     s_map: Dict[str, float] = {}
     if "centerline_raw" not in st.session_state or "no_table" not in st.session_state:
         return s_map
 
-    cl_raw = st.session_state.centerline_raw            # 倍率1.0の生
+    cl_raw = st.session_state.centerline_raw              # 倍率1.0の生
     k = float(st.session_state.get("unit_scale_plan_ui", 1.0))  # 現在の平面倍率
 
     # ラベルの生座標（フォールバック用）
@@ -133,7 +134,7 @@ def _rebuild_s_map_from_raw() -> Dict[str, float]:
         src = circ_raw if circ_raw is not None else label_pos.get(key)
         if src is None:
             # 最後の手段：過去の s をそのまま使う（倍率変更時は誤差の元なので推奨しない）
-            s_map[key] = float(row.get("s", 0.0))
+            s_map[key] = float(row.get("s", 0.0)) * k
             continue
         s_raw, _ = project_point_to_polyline(cl_raw, src)  # 生で投影
         s_map[key] = float(s_raw) * k                      # 現在の倍率で距離に換算
@@ -157,6 +158,9 @@ def build_assigned_from_raw():
 
     # s を現在倍率で再計算
     s_map = _rebuild_s_map_from_raw()
+    delta_s = float(st.session_state.get("delta_s_all_ui", 0.0))  # 全体微調整[m]
+    for k in list(s_map.keys()):
+        s_map[k] += delta_s
 
     # No→測点円中心（生座標）
     no_to_circle_raw = {
@@ -168,7 +172,7 @@ def build_assigned_from_raw():
     offset_scale = float(st.session_state.get("offset_scale_ui", 1.0))
     elev_scale = float(st.session_state.get("elev_scale_ui", 1.0))
     center_o = bool(st.session_state.get("center_o_ui", True))
-    center_by_circle = bool(st.session_state.get("center_by_circle_ui", False))
+    center_by_circle = bool(st.session_state.get("center_by_circle_ui", True))  # 既定を True
     user_center_offset = float(st.session_state.get("user_center_offset_ui", 0.0))
     elev_zero_mode = st.session_state.get("elev_zero_mode_ui", "最小を0")
     flip_o = bool(st.session_state.get("flip_o_ui", False))
@@ -237,7 +241,7 @@ def page():
             "unit_scale_plan_ui",
             st.number_input("平面倍率（mm→m は 0.001）", value=1.0, step=0.001, format="%.3f"),
         )
-        find_radius = st.number_input("ラベル→円 検索半径[m]", value=15.0, step=1.0, format="%.1f")
+        find_radius = st.number_input("ラベル→円 紐付け距離しきい[m]", value=12.0, step=1.0, format="%.1f")
 
         if plan_up is not None and st.button("中心線＋No.＋円 抽出を実行", type="primary"):
             # 一時ファイルとして保存
@@ -248,32 +252,41 @@ def page():
             st.session_state._plan_path = tmp.name
 
             try:
-                # 生のまま読み込んで保存（倍率1.0）
-                cl_raw = read_centerline(tmp.name, allow_layers=[], unit_scale=1.0)
+                # レイヤ一覧を出し、中心線レイヤを選ばせる
                 layers = list_layers(tmp.name)
+                layer_names = [L.name for L in layers]
+                idx = st.radio(
+                    "中心線レイヤを選択",
+                    list(range(len(layer_names))),
+                    format_func=lambda i: f"{layer_names[i]}  (len≈{layers[i].length_sum:.1f})",
+                )
+                cl_layer = layer_names[int(idx)]
+                # ラベル/円のレイヤ選択（デフォルト：全レイヤ）
+                label_layers = st.multiselect("測点ラベルレイヤ（TEXT/MTEXT）", layer_names, default=layer_names)
+                circle_layers = st.multiselect("測点円レイヤ（CIRCLE）", layer_names, default=layer_names)
 
-                # ラベル・円も生で取得（全レイヤからざっくり抽出）
-                labels = extract_no_labels(tmp.name, [L.name for L in layers], unit_scale=1.0)
-                circles = extract_circles(tmp.name, [L.name for L in layers], unit_scale=1.0)
+                # 読み込み（※ 生で保存）
+                cl_raw = read_centerline(tmp.name, allow_layers=[cl_layer], unit_scale=1.0)
+                labels = extract_no_labels(tmp.name, label_layers, unit_scale=1.0)
+                circles = extract_circles(tmp.name, circle_layers, unit_scale=1.0)
 
-                # 画面表示用に s を “いったん現在倍率で” 求めるが、保持は生データを優先
                 cl_scaled = cl_raw * float(unit_scale_plan)
+
+                # ラベル→“距離しきい以内の円”のみ紐付け。無ければラベル→中心線の射影にフォールバック
                 no_rows = []
-                # ラベル→最近傍の円を関連付け
                 for lab in labels:
                     key = lab["key"]
-                    Lxy = np.array(lab["pos"], float) * float(unit_scale_plan)
-                    # 近傍円を探索（最短ひとつ）
-                    best = None
+                    Lxy_scaled = np.array(lab["pos"], float) * float(unit_scale_plan)
+                    # しきい内の候補
+                    candidates = []
                     for c in circles:
-                        Cxy = np.array(c["center"], float) * float(unit_scale_plan)
-                        d = float(np.linalg.norm(Lxy - Cxy))
-                        if best is None or d < best[0]:
-                            best = (d, Cxy, c.get("r", None), c.get("layer", ""))
-                    if best is not None:
-                        d, Cxy, r, lay = best
-                        s_now, dist = project_point_to_polyline(cl_scaled, Cxy)
-                        # circle_xy は “生単位” で保存（倍率変更後の再計算に使う）
+                        Cxy_scaled = np.array(c["center"], float) * float(unit_scale_plan)
+                        d = float(np.linalg.norm(Lxy_scaled - Cxy_scaled))
+                        if d <= float(find_radius):
+                            candidates.append((d, Cxy_scaled, c.get("r", None), c.get("layer", "")))
+                    if candidates:
+                        d, Cxy_s, r, lay = min(candidates, key=lambda t: t[0])
+                        s_now, dist = project_point_to_polyline(cl_scaled, Cxy_s)
                         no_rows.append(
                             {
                                 "key": key,
@@ -282,10 +295,26 @@ def page():
                                 "circle_to_cl": dist,
                                 "circle_r": r,
                                 "circle_layer": lay,
-                                "circle_xy": tuple(Cxy / float(unit_scale_plan)),
-                                "status": "OK",
+                                "circle_xy": tuple(Cxy_s / float(unit_scale_plan)),  # ←生単位で保存
+                                "status": "OK(circle)",
                             }
                         )
+                    else:
+                        # 円が見つからなければラベル自体を投影
+                        s_now, dist = project_point_to_polyline(cl_scaled, Lxy_scaled)
+                        no_rows.append(
+                            {
+                                "key": key,
+                                "s": float(s_now),
+                                "label_to_circle": None,
+                                "circle_to_cl": dist,
+                                "circle_r": None,
+                                "circle_layer": None,
+                                "circle_xy": None,  # 円なし
+                                "status": "FALLBACK(label→CL)",
+                            }
+                        )
+
                 no_rows.sort(key=lambda d: d["s"])
 
                 # 生データを保持（倍率変更後の s は毎回再計算する）
@@ -293,6 +322,7 @@ def page():
                 st.session_state.labels_raw = labels
                 st.session_state.circles_raw = circles
                 st.session_state.no_table = no_rows
+                st.session_state.cl_layer = cl_layer
 
                 st.success(
                     f"中心線: {len(cl_raw)} 点（表示倍率 {unit_scale_plan:g}）、No.: {len(no_rows)} 件"
@@ -333,7 +363,7 @@ def page():
         center_o = _sync_ui_value("center_o_ui", st.checkbox("オフセット中央値を0に", value=True))
         center_by_circle = _sync_ui_value(
             "center_by_circle_ui",
-            st.checkbox("道路中心オフセット値を0に（円中心=0, 自動）", value=False),
+            st.checkbox("道路中心オフセット値を0に（円中心=0, 自動）", value=True),
         )
         user_center_offset = _sync_ui_value(
             "user_center_offset_ui",
@@ -486,6 +516,10 @@ def page():
             "断面1本あたりの最大点数（3D間引き）", min_value=200, max_value=10000, value=1200, step=100
         )
         show_arcs = st.checkbox("最小円（LEM円弧）を表示する", value=False)
+        # 仕上げ用：全体 Δs 微調整
+        delta_s = _sync_ui_value(
+            "delta_s_all_ui", st.number_input("Δs 全体 [m]（微調整、±2m 程度）", value=0.0, step=0.1, format="%.1f")
+        )
 
         fig = go.Figure()
 
