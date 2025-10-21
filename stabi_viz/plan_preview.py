@@ -1,4 +1,3 @@
-# stabi_viz/plan_preview_upload.py
 from __future__ import annotations
 import tempfile
 from typing import Dict, Optional
@@ -142,7 +141,6 @@ def page():
                     sec = read_single_section_file(tmp.name, layer_name=layer_name, unit_scale=1.0,
                                                    aggregate=agg_key, smooth_k=int(smooth_k), max_slope=float(max_slope))
                     if sec is not None:
-                        # sec=(u,v) → (offset,elev) を構成
                         if axis_mode.startswith("X=elev"):
                             o = sec[:,1].astype(float); z = sec[:,0].astype(float)
                         else:
@@ -156,7 +154,6 @@ def page():
                         elif elev_zero_mode == "中央値を0":  z = z - float(np.median(z))
                         oz = np.column_stack([o, z])
 
-                        # 2Dプレビュー
                         import matplotlib.pyplot as plt
                         fig2, ax = plt.subplots(figsize=(5.2,2.6))
                         ax.plot(oz[:,0], oz[:,1], lw=2.0)
