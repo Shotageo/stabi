@@ -119,9 +119,17 @@ def page():
         axis_mode = st.selectbox("軸割り", ["X=offset / Y=elev（標準）", "X=elev / Y=offset（入替）"])
         flip_o = st.checkbox("オフセット左右反転", value=False)
         flip_z = st.checkbox("標高上下反転", value=False)
+
+        # ローカル化オプション
         center_o = st.checkbox("オフセット中央値を0に（世界座標の場合に推奨）", value=True)
         center_by_circle = st.checkbox("道路中心オフセット値を0にシフト（円中心=0）", value=False)
         user_center_offset = st.number_input("道路中心オフセット値（断面側の中心が0でないとき）", value=0.0, step=0.1, format="%.3f")
+
+        elev_zero_mode = st.selectbox("標高の基準シフト", ["しない", "最小を0", "中央値を0", "指定値を0"])
+        user_elev0 = st.number_input("標高の指定基準値（上で「指定値を0」を選んだ時に有効）", value=0.0, step=0.1, format="%.3f")
+
+        agg_mode = st.selectbox("複数線の集約方法（LINE/LWPOLYLINE混在時）", ["中央値（推奨）", "下包絡（最小）", "上包絡（最大）"])
+        agg_key = {"中央値（推奨）":"median", "下包絡（最小）":"lower", "上包絡（最大）":"upper"}[agg_mode]
 
         if xs_files and "no_table" in st.session_state:
             no_choices = [d["key"] for d in st.session_state.no_table]
@@ -143,7 +151,6 @@ def page():
                             )
                             if layer_name == "（未選択）":
                                 layer_name = None
-                            # 読み込みは別 tmp にもう一度保存（上のgetbufferは消費済み）
                             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
                             with open(tmp_scan.name, "rb") as r: tmp.write(r.read())
                             tmp.flush(); tmp.close()
@@ -158,10 +165,10 @@ def page():
                     idx = (no_choices.index(guess)+1) if guess in no_choices else 0
                     sel = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=idx, key=f"sel_{f.name}")
 
-                    # 断面読込（ここでは unit_scale=1.0 固定。後段で倍率を軸ごとに適用）
-                    sec = read_single_section_file(tmp.name, layer_name=layer_name, unit_scale=1.0)
+                    # 断面読込（PCAローカルフレームで返る）
+                    sec = read_single_section_file(tmp.name, layer_name=layer_name, unit_scale=1.0, aggregate=agg_key)
                     if sec is not None:
-                        # sec は (X, Y)。LWPOLYLINEならファイル座標、LINE群ならPCAフレーム(u,v)。
+                        # sec は (u,v)。ここから (offset, elev) を構成
                         if axis_mode.startswith("X=elev"):
                             o = sec[:, 1].astype(float)   # offset
                             z = sec[:, 0].astype(float)   # elev
@@ -182,6 +189,14 @@ def page():
                             o = o - float(user_center_offset)
                         elif center_o:
                             o = o - float(np.median(o))
+
+                        # 標高の基準シフト
+                        if elev_zero_mode == "最小を0":
+                            z = z - float(np.min(z))
+                        elif elev_zero_mode == "中央値を0":
+                            z = z - float(np.median(z))
+                        elif elev_zero_mode == "指定値を0":
+                            z = z - float(user_elev0)
 
                         oz = np.column_stack([o, z])
 
