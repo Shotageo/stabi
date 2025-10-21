@@ -17,6 +17,7 @@ except Exception:
     _LEM_OK = False
 
     def compute_min_circle(cfg):
+        """お試し用の簡易円（視覚確認目的）"""
         oz = np.asarray(cfg.get("section"))
         if oz is None or oz.size == 0:
             return {"fs": 1.10, "circle": {"oc": 0.0, "zc": 0.0, "R": 10.0}}
@@ -62,6 +63,22 @@ def _xs_to_world3D(P: np.ndarray, n: np.ndarray, oz: np.ndarray, z_scale: float 
     Y = P[1] + oz[:, 0] * n[1]
     Z = oz[:, 1] * float(z_scale)
     return X, Y, Z
+
+
+# ──────────────────────────────────────────────────────────────
+# 軽量化用：3D間引き
+def _decimate(arr: np.ndarray, max_pts: int) -> np.ndarray:
+    if arr is None or arr.ndim != 2 or arr.shape[0] <= max_pts:
+        return arr
+    idx = np.linspace(0, arr.shape[0] - 1, max_pts).astype(int)
+    return arr[idx]
+
+
+def _decimate1d(arr: np.ndarray, max_pts: int) -> np.ndarray:
+    if arr is None or arr.ndim != 2 or arr.shape[0] <= max_pts:
+        return arr
+    idx = np.linspace(0, arr.shape[0] - 1, max_pts).astype(int)
+    return arr[idx]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -181,9 +198,12 @@ def build_assigned_from_raw():
 
         assigned[fname] = {"oz": np.column_stack([o, z]), "no_key": sel, "s": s}
 
-    # 出力を反映
-    st.session_state.centerline = cl
-    st.session_state._assigned = assigned
+    # 出力を反映（メモリ節約のため float32 で保持）
+    st.session_state.centerline = cl.astype(np.float32)
+    st.session_state._assigned = {
+        k: {"oz": v["oz"].astype(np.float32), "no_key": v["no_key"], "s": float(v["s"])}
+        for k, v in assigned.items()
+    }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -205,7 +225,9 @@ def page():
         if plan_up is not None and st.button("中心線＋No.＋円 抽出を実行", type="primary"):
             # 一時ファイルとして保存
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
-            tmp.write(plan_up.read()); tmp.flush(); tmp.close()
+            tmp.write(plan_up.read())
+            tmp.flush()
+            tmp.close()
             st.session_state._plan_path = tmp.name
 
             try:
@@ -213,7 +235,7 @@ def page():
                 cl_raw = read_centerline(tmp.name, allow_layers=[], unit_scale=1.0)
                 layers = list_layers(tmp.name)
 
-                # ラベル・円も生で取得
+                # ラベル・円も生で取得（全レイヤからざっくり抽出）
                 labels = extract_no_labels(tmp.name, [L.name for L in layers], unit_scale=1.0)
                 circles = extract_circles(tmp.name, [L.name for L in layers], unit_scale=1.0)
 
@@ -224,7 +246,7 @@ def page():
                 for lab in labels:
                     key = lab["key"]
                     Lxy = np.array(lab["pos"], float) * float(unit_scale_plan)
-                    # 近傍円を検索（find_radius 内に限定する場合は if d<=find_radius を付ける）
+                    # 近傍円を探索（最短ひとつ）
                     best = None
                     for c in circles:
                         Cxy = np.array(c["center"], float) * float(unit_scale_plan)
@@ -267,6 +289,10 @@ def page():
             "横断DXF/CSV（複数可）", type=["dxf", "csv"], accept_multiple_files=True, key="xs"
         )
 
+        # 追加の軽量化スイッチ
+        reparse_all = st.checkbox("取り込み済みでも再解析する（重い）", value=False)
+        show_2d_preview = st.checkbox("2Dプレビューも描画する（重い時はOFF）", value=False)
+
         # 軸と倍率・反転
         axis_mode = st.selectbox("軸割り", ["X=offset / Y=elev（標準）", "X=elev / Y=offset（入替）"])
         offset_scale = _sync_ui_value(
@@ -284,7 +310,7 @@ def page():
         agg_mode = st.selectbox("複数線の集約", ["中央値（推奨）", "下包絡（最小）", "上包絡（最大）"])
         smooth_k = st.slider("平滑ウィンドウ（奇数、0で無効）", 0, 21, 0, step=1)
         max_slope = st.slider("最大許容勾配 |dz/dx|（0で無効）", 0.0, 30.0, 0.0, step=0.5)
-        target_step = st.number_input("出力間隔 step [m]（小さいほど精細）", value=0.20, step=0.05, format="%.2f")
+        target_step = st.number_input("出力間隔 step [m]（小さいほど精細）", value=0.50, step=0.05, format="%.2f")
 
         # センタリング・基準
         center_o = _sync_ui_value("center_o_ui", st.checkbox("オフセット中央値を0に", value=True))
@@ -312,9 +338,38 @@ def page():
         if xs_files:
             for f in xs_files:
                 with st.expander(f"割当：{f.name}", expanded=False):
-                    # 一時ファイル
+                    # 既に取り込み済みなら再解析をスキップ
+                    existing = st.session_state.raw_sections.get(f.name)
+                    if existing and not reparse_all:
+                        guess = existing.get("no_key") or existing.get("guess_no") or ""
+                        idx = (no_choices.index(guess) + 1) if (guess and guess in no_choices) else 0
+                        sel = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=idx)
+                        existing["no_key"] = sel if sel != "（未選択）" else None
+
+                        if show_2d_preview:
+                            import matplotlib.pyplot as plt
+                            o_raw = existing["oz_raw"][:, 0]
+                            z_raw = existing["oz_raw"][:, 1]
+                            # 現在UI倍率で軽く適用（センタリングなし）
+                            o = o_raw * float(offset_scale)
+                            z = z_raw * float(elev_scale)
+                            if st.session_state.get("flip_o_ui", False):
+                                o *= -1.0
+                            if st.session_state.get("flip_z_ui", False):
+                                z *= -1.0
+                            fig2, ax = plt.subplots(figsize=(5.0, 2.2))
+                            ax.plot(o, z, lw=2.0)
+                            ax.grid(True, alpha=0.3)
+                            ax.set_xlabel("offset [m]")
+                            ax.set_ylabel("elev [m]")
+                            st.pyplot(fig2, use_container_width=True)
+                        continue
+
+                    # ここから新規解析
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + f.name.split(".")[-1])
-                    tmp.write(f.getbuffer()); tmp.flush(); tmp.close()
+                    tmp.write(f.getbuffer())
+                    tmp.flush()
+                    tmp.close()
 
                     layer_name: Optional[str] = None
                     if f.name.lower().endswith(".dxf"):
@@ -344,9 +399,11 @@ def page():
 
                     # 軸入替だけ先に済ませて「生」を保存
                     if axis_mode.startswith("X=elev"):
-                        o_raw = sec[:, 1].astype(float); z_raw = sec[:, 0].astype(float)
+                        o_raw = sec[:, 1].astype(float)
+                        z_raw = sec[:, 0].astype(float)
                     else:
-                        o_raw = sec[:, 0].astype(float); z_raw = sec[:, 1].astype(float)
+                        o_raw = sec[:, 0].astype(float)
+                        z_raw = sec[:, 1].astype(float)
                     oz_raw = np.column_stack([o_raw, z_raw])
 
                     # No 推定（ファイル名から）
@@ -361,16 +418,20 @@ def page():
                         "no_key": sel if sel != "（未選択）" else None,
                     }
 
-                    # 2D プレビュー（倍率・反転のみ適用）
-                    import matplotlib.pyplot as plt
-                    o = o_raw * float(offset_scale)
-                    z = z_raw * float(elev_scale)
-                    if flip_o: o *= -1.0
-                    if flip_z: z *= -1.0
-                    fig2, ax = plt.subplots(figsize=(5.0, 2.4))
-                    ax.plot(o, z, lw=2.0); ax.grid(True, alpha=0.3)
-                    ax.set_xlabel("offset [m]"); ax.set_ylabel("elev [m]")
-                    st.pyplot(fig2, use_container_width=True)
+                    if show_2d_preview:
+                        import matplotlib.pyplot as plt
+                        o = o_raw * float(offset_scale)
+                        z = z_raw * float(elev_scale)
+                        if flip_o:
+                            o *= -1.0
+                        if flip_z:
+                            z *= -1.0
+                        fig2, ax = plt.subplots(figsize=(5.0, 2.4))
+                        ax.plot(o, z, lw=2.0)
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xlabel("offset [m]")
+                        ax.set_ylabel("elev [m]")
+                        st.pyplot(fig2, use_container_width=True)
 
         # 「変更を適用（再計算）」で生→現在UIを一括適用して割当辞書を再構築
         if st.button("変更を適用（再計算）", type="primary"):
@@ -398,78 +459,119 @@ def page():
         cl = st.session_state.centerline
         assigned = st.session_state._assigned
 
+        # 3D 負荷制御
         z_scale = st.number_input("縦倍率（標高）", value=1.0, step=0.1, format="%.1f")
         _ = st.number_input("表示ピッチ（情報用・今は配置に影響しません）", value=20.0, step=1.0, format="%.1f")
+        max_pts_cl = st.number_input(
+            "中心線の最大点数（3D間引き）", min_value=500, max_value=20000, value=4000, step=500
+        )
+        max_pts_xs = st.number_input(
+            "断面1本あたりの最大点数（3D間引き）", min_value=200, max_value=10000, value=1200, step=100
+        )
+        show_arcs = st.checkbox("最小円（LEM円弧）を表示する", value=False)
 
         fig = go.Figure()
-        # 中心線
+
+        # 中心線（間引きして描画）
+        cl_plot = _decimate1d(cl, int(max_pts_cl))
         fig.add_trace(
             go.Scatter3d(
-                x=cl[:, 0], y=cl[:, 1], z=np.zeros(len(cl)),
-                mode="lines", name="Centerline",
+                x=cl_plot[:, 0],
+                y=cl_plot[:, 1],
+                z=np.zeros(len(cl_plot)),
+                mode="lines",
+                name="Centerline",
                 line=dict(width=4, color="#A0A6B3"),
             )
         )
 
         # 断面群
         for _, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
-            s = float(rec["s"]); oz = np.asarray(rec["oz"], float)
+            s = float(rec["s"])
+            oz = np.asarray(rec["oz"], float)
             P, t, n = _tangent_normal(cl, s)
 
-            # 断面形状本体
-            X, Y, Z = _xs_to_world3D(P, n, oz, z_scale=z_scale)
+            # 断面形状本体（間引き）
+            oz_plot = _decimate(oz, int(max_pts_xs))
+            X, Y, Z = _xs_to_world3D(P, n, oz_plot, z_scale=z_scale)
             fig.add_trace(
                 go.Scatter3d(
-                    x=X, y=Y, z=Z, mode="lines",
+                    x=X,
+                    y=Y,
+                    z=Z,
+                    mode="lines",
                     name=f"{rec['no_key']}",
-                    line=dict(width=5, color="#FFFFFF"), opacity=0.98,
+                    line=dict(width=5, color="#FFFFFF"),
+                    opacity=0.98,
                 )
             )
 
             # 基線（offset 範囲）
-            omin, omax = float(np.min(oz[:, 0])), float(np.max(oz[:, 0]))
-            Xb, Yb, Zb = _xs_to_world3D(P, n, np.column_stack([[omin, omax], [0.0, 0.0]]).T, z_scale=z_scale)
+            omin, omax = float(np.min(oz_plot[:, 0])), float(np.max(oz_plot[:, 0]))
+            Xb, Yb, Zb = _xs_to_world3D(P, n, np.array([[omin, 0.0], [omax, 0.0]]), z_scale=z_scale)
             fig.add_trace(
                 go.Scatter3d(
-                    x=Xb, y=Yb, z=Zb, mode="lines", showlegend=False,
+                    x=Xb,
+                    y=Yb,
+                    z=Zb,
+                    mode="lines",
+                    showlegend=False,
                     line=dict(width=2, color="#777777"),
                 )
             )
 
             # 縦ポール（offset=0）
-            zmin, zmax = float(np.min(oz[:, 1])) * z_scale, float(np.max(oz[:, 1])) * z_scale
+            zmin, zmax = float(np.min(oz_plot[:, 1])) * z_scale, float(np.max(oz_plot[:, 1])) * z_scale
             Xp, Yp, Zp = _xs_to_world3D(P, n, np.array([[0.0, zmin], [0.0, zmax]]), z_scale=1.0)
             fig.add_trace(
                 go.Scatter3d(
-                    x=Xp, y=Yp, z=Zp, mode="lines",
-                    showlegend=False, line=dict(width=3, color="#8888FF"),
+                    x=Xp,
+                    y=Yp,
+                    z=Zp,
+                    mode="lines",
+                    showlegend=False,
+                    line=dict(width=3, color="#8888FF"),
                 )
             )
 
-            # 円弧（LEMの最小円）
-            try:
-                res = compute_min_circle({"section": oz})
-                oc, zc, R = res["circle"]["oc"], res["circle"]["zc"], res["circle"]["R"]
-                ph = np.linspace(-np.pi, np.pi, 241)
-                xo = oc + R * np.cos(ph);  zo = zc * np.ones_like(ph) + R * np.sin(ph)
-                X2 = P[0] + xo * n[0]; Y2 = P[1] + xo * n[1]; Z2 = zo * z_scale
-                fig.add_trace(
-                    go.Scatter3d(x=X2, y=Y2, z=Z2, mode="lines",
-                                 showlegend=False, line=dict(width=3, color="#E65454"))
-                )
-            except Exception:
-                pass
+            # 円弧（LEMの最小円）※重い場合があるのでトグル
+            if show_arcs:
+                try:
+                    res = compute_min_circle({"section": oz})
+                    oc, zc, R = res["circle"]["oc"], res["circle"]["zc"], res["circle"]["R"]
+                    ph = np.linspace(-np.pi, np.pi, 241)
+                    xo = oc + R * np.cos(ph)
+                    zo = zc + R * np.sin(ph)
+                    X2 = P[0] + xo * n[0]
+                    Y2 = P[1] + xo * n[1]
+                    Z2 = zo * z_scale
+                    fig.add_trace(
+                        go.Scatter3d(
+                            x=X2,
+                            y=Y2,
+                            z=Z2,
+                            mode="lines",
+                            showlegend=False,
+                            line=dict(width=3, color="#E65454"),
+                        )
+                    )
+                except Exception:
+                    pass
 
         fig.update_layout(
             scene=dict(
-                xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False),
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+                zaxis=dict(visible=False),
                 aspectmode="data",
             ),
-            paper_bgcolor="#0f1115", plot_bgcolor="#0f1115",
+            paper_bgcolor="#0f1115",
+            plot_bgcolor="#0f1115",
             margin=dict(l=0, r=0, t=0, b=0),
         )
         st.plotly_chart(fig, use_container_width=True, height=780)
 
 
+# 単体実行用
 if __name__ == "__main__":
     page()
