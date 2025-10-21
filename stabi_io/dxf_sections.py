@@ -127,7 +127,6 @@ def project_point_to_polyline(poly: np.ndarray, pt: np.ndarray) -> Tuple[float, 
     return best
 
 # -------------------------------------------------------------
-# No. TEXT / MTEXT を位置だけ取得（投影は後段）
 def extract_no_labels(dxf_path: str, label_layers: List[str], unit_scale: float = 1.0) -> List[Dict]:
     """
     Returns: [{'key': 'No.0+80', 'pos': (x,y), 'raw': 'NO. 0+80', 'layer': '...'}, ...]
@@ -153,7 +152,6 @@ def extract_no_labels(dxf_path: str, label_layers: List[str], unit_scale: float 
             continue
     return out
 
-# 測点円（CIRCLE）抽出（INSERT内の仮想エンティティにもできる範囲で対応）
 def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float = 1.0) -> List[Dict]:
     """
     Returns: [{'center': (x,y), 'r': radius, 'layer': '...'}, ...]
@@ -165,7 +163,7 @@ def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float =
     allow = set(circle_layers or [])
     circles: List[Dict] = []
 
-    # 直接の CIRCLE
+    # direct circles
     for c in msp.query("CIRCLE"):
         if allow and c.dxf.layer not in allow:
             continue
@@ -176,11 +174,11 @@ def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float =
         except Exception:
             pass
 
-    # ブロック参照 (INSERT) の仮想展開（対応可能な範囲）
+    # circles inside blocks (best-effort)
     try:
         for ref in msp.query("INSERT"):
             try:
-                for v in ref.virtual_entities():  # 既に座標系が適用された形で得られる
+                for v in ref.virtual_entities():
                     if v.dxftype() == "CIRCLE":
                         if allow and v.dxf.layer not in allow:
                             continue
@@ -190,13 +188,11 @@ def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float =
             except Exception:
                 continue
     except Exception:
-        # ezdxf のバージョンによっては virtual_entities が無いことがある
         pass
 
     return circles
 
 # -------------------------------------------------------------
-# 断面ファイル（1枚）を (offset,elev) で取得
 def read_single_section_file(path: str, layer_name: Optional[str] = None, unit_scale: float = 1.0) -> Optional[np.ndarray]:
     """Read a single DXF/CSV as (offset, elev) array. Assumes X=offset, Y=elev for DXF."""
     if path.lower().endswith(".csv"):
@@ -216,17 +212,14 @@ def read_single_section_file(path: str, layer_name: Optional[str] = None, unit_s
         return None
     msp = doc.modelspace()
     polys = []
-    # LWPOLYLINE 優先（横断は1本の折線想定）
     for e in msp.query("LWPOLYLINE"):
         if (layer_name is None) or (e.dxf.layer == layer_name):
             pts = _sample_entity_2d(e)
             polys.append((e, pts))
     if not polys:
-        # 最低限のフォールバック：LINE 群をまとめる対応などは必要なら拡張
         return None
     ent, pts = max(polys, key=lambda t: _safe_len(t[0]))
     oz = pts * unit_scale
-    # X昇順＋重複除去で安定化
     idx = np.argsort(oz[:,0]); oz = oz[idx]
     _, uniq = np.unique(oz[:,0], return_index=True)
     oz = oz[np.sort(uniq)]
