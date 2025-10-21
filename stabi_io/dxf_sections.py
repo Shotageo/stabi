@@ -57,7 +57,7 @@ def _sample_entity_2d(ent) -> np.ndarray:
                          [ent.dxf.end.x,   ent.dxf.end.y]], dtype=float)
     else:
         try:
-            pts = _np.array([[p[0], p[1]] for p in ent.flattening(1.0)], dtype=float)
+            pts = _np.array([[p[0], p[1]] for p in ent.flattening(0.25)], dtype=float)  # finer
         except Exception:
             try:
                 pts = _np.array([[v[0], v[1]] for v in ent.get_points()], dtype=float)
@@ -145,6 +145,7 @@ def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float =
             circles.append({"center": (cx, cy), "r": r, "layer": c.dxf.layer})
         except Exception:
             pass
+    # INSERT内の仮想エンティティも探索
     try:
         for ref in msp.query("INSERT"):
             try:
@@ -218,11 +219,12 @@ def read_single_section_file(
     aggregate: str = "median",   # "median" / "lower" / "upper"
     smooth_k: int = 7,
     max_slope: float = 10.0,
+    target_step: float = 0.20,   # 断面の出力間隔[m]（小さいほど精細）
 ) -> Optional[np.ndarray]:
     """
     Strategy:
-      1) Score LWPOLYLINE one-by-one (ground-likeness). If top score>=0.45, return that chain.
-      2) Else fallback: collect all (LWPOLYLINE + LINE) points → PCA → segment by gaps → bin-aggregate → smooth.
+      1) Score LWPOLYLINE one-by-one (ground-likeness). If top score>=0.45, return that chain (高解像度化して単調化)。
+      2) Else fallback: collect all (LWPOLYLINE + LINE) points → PCA → segment by gaps → bin-aggregate → smooth。
     Returns Nx2 array in a local (u,v) frame.
     """
     if path.lower().endswith(".csv"):
@@ -234,6 +236,14 @@ def read_single_section_file(
         except Exception:
             return None
         P = pts
+        # CSVはそのまま等間隔リサンプリング
+        order = np.argsort(P[:,0]); P = P[order]
+        if len(P) >= 4:
+            u = P[:,0]; v = P[:,1]
+            uu = np.linspace(u.min(), u.max(), max(10, int((u.max()-u.min())/max(target_step,1e-3))))
+            vv = np.interp(uu, u, v)
+            return np.column_stack([uu, vv])
+        return P
     else:
         if ezdxf is None:
             raise RuntimeError("ezdxf not installed.")
@@ -253,16 +263,17 @@ def read_single_section_file(
         scored.sort(key=lambda t: t[0], reverse=True)
         if scored and scored[0][0] >= 0.45:
             pts = scored[0][1]
-            order = np.argsort(pts[:,0]); Q = pts[order]
-            x = Q[:,0]; y = Q[:,1]
-            xx = np.round(x, 4)
-            _, first = np.unique(xx, return_index=True)
-            out_x, out_y = [], []
-            for i0, i1 in zip(first, list(first[1:]) + [len(xx)]):
-                out_x.append(float(np.median(x[i0:i1])))
-                out_y.append(float(np.median(y[i0:i1])))
-            return np.column_stack([out_x, out_y])
+            # 等間隔リサンプリング（高精細維持）
+            d = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]
+            if d[-1] <= 0:
+                return None
+            uu = np.arange(0, d[-1]+target_step*0.5, max(target_step,1e-3))
+            # 線形補間
+            x = np.interp(uu, d, pts[:,0])
+            y = np.interp(uu, d, pts[:,1])
+            return np.column_stack([x, y])
 
+        # fallback: 全点群 → PCA集約
         pts_list = []
         for e in msp.query("LWPOLYLINE"):
             if (layer_name is None) or (e.dxf.layer == layer_name):
@@ -276,6 +287,7 @@ def read_single_section_file(
             return None
         P = (np.vstack(pts_list)).astype(float) * unit_scale
 
+    # ---- PCA系（従来） ----
     def _pca_local(points: np.ndarray):
         mu = np.mean(points, axis=0)
         X = points - mu
@@ -294,17 +306,17 @@ def read_single_section_file(
         segs = [slice(idxs[i], idxs[i+1]) for i in range(len(idxs)-1)]
         return order, segs
 
-    def _bin_aggregate(u: np.ndarray, v: np.ndarray, nbin: int, mode: str) -> np.ndarray:
+    def _bin_aggregate(u: np.ndarray, v: np.ndarray, step: float, mode: str) -> np.ndarray:
         umin, umax = float(np.min(u)), float(np.max(u))
         if umax - umin <= 0:
             return np.empty((0,2))
-        nbin = int(np.clip(nbin, 120, 480))
+        nbin = max(60, int((umax-umin)/max(step,1e-3)))
         bins = np.linspace(umin, umax, nbin+1)
         idx = np.digitize(u, bins) - 1
         xs, ys = [], []
         for b in range(nbin):
             mask = (idx == b)
-            if np.count_nonzero(mask) >= 5:
+            if np.count_nonzero(mask) >= 3:
                 xs.append(0.5*(bins[b]+bins[b+1]))
                 vb = v[mask]
                 if mode == "lower":
@@ -348,13 +360,13 @@ def read_single_section_file(
     best = max(segs, key=lambda s: s.stop - s.start)
     u_main = uo[best]; v_main = vo[best]
 
-    span = max(1, int((np.max(u_main) - np.min(u_main)) / max((np.percentile(np.diff(u_main), 90) or 1e-3), 1e-3)))
-    nbin = int(np.clip(span, 120, 480))
-    chain = _bin_aggregate(u_main, v_main, nbin=nbin, mode=aggregate)
+    chain = _bin_aggregate(u_main, v_main, step=target_step, mode=aggregate)
     if chain.size == 0:
         return None
 
     x, y = chain[:,0], chain[:,1]
-    y = _median_filter(y, k=smooth_k)
-    y = _clip_slope(x, y, max_slope=max_slope)
+    if smooth_k > 1:
+        y = _median_filter(y, k=smooth_k)
+    if max_slope > 0:
+        y = _clip_slope(x, y, max_slope=max_slope)
     return np.column_stack([x, y])
