@@ -1,7 +1,7 @@
 # stabi_viz/plan_preview_upload.py
 from __future__ import annotations
 import tempfile
-from typing import Dict, List, Optional
+from typing import Dict
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
@@ -56,12 +56,10 @@ def page():
         find_radius = st.number_input("ラベル→円 検索半径[m]", value=15.0, step=1.0, format="%.1f")
 
         if plan_up is not None:
-            # save temp
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
             tmp.write(plan_up.read()); tmp.flush(); tmp.close()
             st.session_state._plan_path = tmp.name
 
-            # レイヤ一覧 → 選択
             layers = list_layers(st.session_state._plan_path)
             st.success(f"レイヤ検出：{len(layers)}")
             options = [f"{L.name}  (len≈{L.length_sum:.1f})" for L in layers]
@@ -82,27 +80,24 @@ def page():
 
                     # 3) ラベル→最近接の円 を紐付け（閾値内）
                     no_rows = []
-                    circle_used = set()
                     for lab in labels:
                         key = lab["key"]; Lxy = np.array(lab["pos"], dtype=float)
                         # 最近接円を探索
                         best = None
-                        for i, c in enumerate(circles):
+                        for c in circles:
                             Cxy = np.array(c["center"], dtype=float)
                             d = float(np.linalg.norm(Lxy - Cxy))
                             if d <= find_radius:
                                 if (best is None) or (d < best[0]):
-                                    best = (d, i, Cxy, c["r"], c["layer"])
+                                    best = (d, Cxy, c["r"], c["layer"])
                         if best is not None:
-                            d, ci, Cxy, r, lay = best
-                            # 円→中心線へ投影して s を確定
+                            d, Cxy, r, lay = best
                             s, dist_pc = project_point_to_polyline(cl, Cxy)
                             no_rows.append({
                                 "key": key, "s": s, "label_to_circle": d,
                                 "circle_to_cl": dist_pc, "circle_r": r, "circle_layer": lay,
                                 "status": "OK"
                             })
-                            circle_used.add(ci)
                         else:
                             # フォールバック：ラベル→中心線 投影（暫定）
                             s_fb, dist_fb = project_point_to_polyline(cl, Lxy)
@@ -117,14 +112,12 @@ def page():
                     st.session_state.centerline = cl
                     st.session_state.no_table = no_rows
 
-                    # 表示
                     ok = sum(1 for r in no_rows if r["status"] == "OK")
                     fb = len(no_rows) - ok
                     st.success(f"中心線: {len(cl)}点, No.: {len(no_rows)}件（円スナップ OK: {ok}, フォールバック: {fb}）")
                 except Exception as e:
                     st.error(f"抽出失敗: {e}")
 
-        # テーブル相当の簡易出力
         if "no_table" in st.session_state:
             st.write("検出結果（円スナップ基準の s[m] を採用）")
             lines = []
@@ -137,16 +130,21 @@ def page():
                 lines.append(msg)
             st.code("\n".join(lines))
 
-    # ------------------- Step 2: 横断割当 -------------------
+    # ------------------- Step 2: 横断割当（mm↔m混在に対応） -------------------
     with st.expander("Step 2｜横断ファイルをアップロードしてNo.を割当", expanded=True):
         xs_files = st.file_uploader("横断DXF/CSV（複数可）", type=["dxf","csv"], accept_multiple_files=True, key="xs")
-        unit_scale_xs = st.number_input("横断倍率（mm→m は 0.001）", value=1.0, step=0.001, format="%.3f", key="u_xs")
+
+        st.caption("単位が混在する場合は、オフセットと標高に別々の倍率を設定してください。")
+        offset_scale = st.number_input("オフセット倍率（mm→m は 0.001）", value=1.0, step=0.001, format="%.3f")
+        elev_scale   = st.number_input("標高倍率（mm→m は 0.001）",   value=1.0, step=0.001, format="%.3f")
 
         st.caption("補正（必要に応じてON）")
         axis_mode = st.selectbox("軸割り", ["X=offset / Y=elev（標準）", "X=elev / Y=offset（入替）"])
         flip_o = st.checkbox("オフセット左右反転", value=False)
         flip_z = st.checkbox("標高上下反転", value=False)
-        center_o = st.checkbox("オフセット中央値を0に", value=True)
+        center_o = st.checkbox("オフセット中央値を0に（後段の道路中心オフセットが優先）", value=False)
+        center_by_circle = st.checkbox("道路中心オフセット値を0にシフト（円中心=0）", value=True)
+        user_center_offset = st.number_input("道路中心オフセット値（断面データ側の中心が0でない場合）", value=0.0, step=0.1, format="%.3f")
 
         if xs_files and "no_table" in st.session_state:
             no_choices = [d["key"] for d in st.session_state.no_table]
@@ -155,23 +153,42 @@ def page():
             assigned: Dict[str, Dict] = {}
             for f in xs_files:
                 with st.expander(f"割当：{f.name}", expanded=False):
-                    # 推定 No（ファイル名から）
                     guess = normalize_no_key(f.name) or ""
                     idx = (no_choices.index(guess)+1) if guess in no_choices else 0
                     sel = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=idx, key=f"sel_{f.name}")
 
-                    # 2Dクイックプレビュー
+                    # 断面の2Dプレビュー（※unit_scale=1.0で読み、ここで各軸に倍率適用）
                     import matplotlib.pyplot as plt
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix="."+f.name.split(".")[-1])
                     tmp.write(f.getbuffer()); tmp.flush(); tmp.close()
-                    sec = read_single_section_file(tmp.name, layer_name=None, unit_scale=unit_scale_xs)
+                    sec = read_single_section_file(tmp.name, layer_name=None, unit_scale=1.0)  # ←ここは1.0に固定
                     if sec is not None:
-                        oz = sec.copy()
+                        # --- 軸の割当：必ず o=offset, z=elev を作る ---
                         if axis_mode.startswith("X=elev"):
-                            oz = oz[:, [1,0]]
-                        if flip_o: oz[:,0] *= -1
-                        if flip_z: oz[:,1] *= -1
-                        if center_o: oz[:,0] -= np.median(oz[:,0])
+                            o = sec[:, 1].astype(float)   # offset  ← 元Y
+                            z = sec[:, 0].astype(float)   # elev    ← 元X
+                        else:
+                            o = sec[:, 0].astype(float)   # offset  ← 元X
+                            z = sec[:, 1].astype(float)   # elev    ← 元Y
+
+                        # --- mm↔mの混在補正（軸ごと倍率） ---
+                        o = o * float(offset_scale)
+                        z = z * float(elev_scale)
+
+                        # --- 反転 ---
+                        if flip_o: o *= -1.0
+                        if flip_z: z *= -1.0
+
+                        # --- センタリング ---
+                        if center_by_circle:
+                            # 道路中心オフセット値（ユーザー指定。通常0.0）
+                            o = o - float(user_center_offset)
+                        elif center_o:
+                            o = o - float(np.median(o))
+
+                        oz = np.column_stack([o, z])   # 以降は (offset, elev)
+
+                        # 2D表示
                         fig2, ax = plt.subplots(figsize=(5.2,2.6))
                         ax.plot(oz[:,0], oz[:,1], lw=2.0)
                         ax.grid(True, alpha=0.3); ax.set_xlabel("offset [m]"); ax.set_ylabel("elev [m]")
@@ -197,7 +214,6 @@ def page():
                                    mode="lines", name="Centerline",
                                    line=dict(width=4, color="#A0A6B3")))
 
-        # place sections
         for name, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
             s = float(rec["s"]); oz = rec["oz"]; P, t, n = _tangent_normal(cl, s)
             X,Y,Z = _xs_to_world3D(P, n, oz)
