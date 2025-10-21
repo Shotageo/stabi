@@ -30,7 +30,10 @@ def _tangent_normal(centerline: np.ndarray, s: float):
     i = int(np.searchsorted(lens, s))
     i0 = max(1, min(len(centerline)-1, i))
     t = centerline[i0] - centerline[i0-1]
-    t = t / np.linalg.norm(t)
+    if np.linalg.norm(t) == 0:
+        t = np.array([1.0, 0.0])
+    else:
+        t = t / np.linalg.norm(t)
     n = np.array([-t[1], t[0]])
     P = centerline[i0]
     return P, t, n
@@ -70,21 +73,23 @@ def page():
                     for lab in labels:
                         key = lab["key"]; Lxy = np.array(lab["pos"], dtype=float)
                         best = None
+                        best_circle_xy = None
                         for c in circles:
                             Cxy = np.array(c["center"], dtype=float)
                             d = float(np.linalg.norm(Lxy - Cxy))
                             if d <= find_radius:
                                 if (best is None) or (d < best[0]):
                                     best = (d, Cxy, c["r"], c["layer"])
+                                    best_circle_xy = Cxy
                         if best is not None:
                             d, Cxy, r, lay = best
                             s, dist_pc = project_point_to_polyline(cl, Cxy)
                             no_rows.append({"key": key, "s": s, "label_to_circle": d, "circle_to_cl": dist_pc,
-                                            "circle_r": r, "circle_layer": lay, "status": "OK"})
+                                            "circle_r": r, "circle_layer": lay, "circle_xy": tuple(Cxy), "status": "OK"})
                         else:
                             s_fb, dist_fb = project_point_to_polyline(cl, Lxy)
                             no_rows.append({"key": key, "s": s_fb, "label_to_circle": None, "circle_to_cl": dist_fb,
-                                            "circle_r": None, "circle_layer": None, "status": "FALLBACK(label→CL)"})
+                                            "circle_r": None, "circle_layer": None, "circle_xy": None, "status": "FALLBACK(label→CL)"})
                     no_rows.sort(key=lambda d: d["s"])
                     st.session_state.centerline = cl
                     st.session_state.no_table = no_rows
@@ -103,17 +108,20 @@ def page():
         flip_z = st.checkbox("標高上下反転", value=False)
 
         agg_mode = st.selectbox("複数線の集約", ["中央値（推奨）", "下包絡（最小）", "上包絡（最大）"])
-        smooth_k = st.slider("平滑ウィンドウ（奇数）", 3, 21, 7, step=2)
-        max_slope = st.slider("最大許容勾配 |dz/dx|（スパイク抑制）", 2.0, 30.0, 10.0, step=0.5)
+        smooth_k = st.slider("平滑ウィンドウ（奇数、0で無効）", 0, 21, 7, step=1)
+        max_slope = st.slider("最大許容勾配 |dz/dx|（0で無効）", 0.0, 30.0, 10.0, step=0.5)
+        target_step = st.number_input("出力間隔 step [m]（小さいほど精細）", value=0.20, step=0.05, format="%.2f")
 
-        center_o = st.checkbox("オフセット中央値を0に", value=True)
-        center_by_circle = st.checkbox("道路中心オフセット値を0に（円中心=0）", value=False)
-        user_center_offset = st.number_input("道路中心オフセット値", value=0.0, step=0.1, format="%.3f")
+        center_o = st.checkbox("オフセット中央値を0に", value=False)
+        center_by_circle = st.checkbox("道路中心オフセット値を0に（円中心=0, 自動）", value=True)
+        user_center_offset = st.number_input("（手動）道路中心オフセット値", value=0.0, step=0.1, format="%.3f")
         elev_zero_mode = st.selectbox("標高の基準シフト", ["しない", "最小を0", "中央値を0"])
         
         if xs_files and "no_table" in st.session_state:
             no_choices = [d["key"] for d in st.session_state.no_table]
             no_to_s = {d["key"]: d["s"] for d in st.session_state.no_table}
+            no_to_circle = {d["key"]: np.array(d["circle_xy"]) if d["circle_xy"] is not None else None
+                            for d in st.session_state.no_table}
             agg_key = {"中央値（推奨）":"median", "下包絡（最小）":"lower", "上包絡（最大）":"upper"}[agg_mode]
 
             assigned: Dict[str, Dict] = {}
@@ -139,7 +147,8 @@ def page():
                     sel = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=idx, key=f"sel_{f.name}")
 
                     sec = read_single_section_file(tmp.name, layer_name=layer_name, unit_scale=1.0,
-                                                   aggregate=agg_key, smooth_k=int(smooth_k), max_slope=float(max_slope))
+                                                   aggregate=agg_key, smooth_k=int(smooth_k),
+                                                   max_slope=float(max_slope), target_step=float(target_step))
                     if sec is not None:
                         if axis_mode.startswith("X=elev"):
                             o = sec[:,1].astype(float); z = sec[:,0].astype(float)
@@ -148,12 +157,27 @@ def page():
                         o *= float(offset_scale); z *= float(elev_scale)
                         if flip_o: o *= -1.0
                         if flip_z: z *= -1.0
-                        if center_by_circle: o = o - float(user_center_offset)
-                        elif center_o:      o = o - float(np.median(o))
+
+                        # —— 中心合わせ（自動：円中心を0に）——
+                        if sel != "（未選択）":
+                            s = float(no_to_s[sel]); P, t, n = _tangent_normal(st.session_state.centerline, s)
+                            circ = no_to_circle.get(sel)
+                            if center_by_circle and circ is not None:
+                                oc0 = float(np.dot(circ - P, n))  # 円中心の横断オフセット
+                                o = o - oc0
+                            elif center_o:
+                                o = o - float(np.median(o))
+                            else:
+                                o = o - float(user_center_offset)
+                        else:
+                            if center_o:
+                                o = o - float(np.median(o))
+
                         if elev_zero_mode == "最小を0":      z = z - float(np.min(z))
                         elif elev_zero_mode == "中央値を0":  z = z - float(np.median(z))
                         oz = np.column_stack([o, z])
 
+                        # 2Dプレビュー
                         import matplotlib.pyplot as plt
                         fig2, ax = plt.subplots(figsize=(5.2,2.6))
                         ax.plot(oz[:,0], oz[:,1], lw=2.0)
