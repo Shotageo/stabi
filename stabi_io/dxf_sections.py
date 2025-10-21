@@ -174,19 +174,17 @@ def extract_circles(dxf_path: str, circle_layers: List[str], unit_scale: float =
 
     return circles
 
-# ----------------- read a cross-section (robust) -------------
+# ----------------- cross-section (multi-curve robust) -------------
 def _pca_2d(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return mean, eigvecs(2x2), centered points."""
     C = np.asarray(points, dtype=float)
     mu = np.mean(C, axis=0)
     X = C - mu
     cov = np.cov(X.T)
-    w, V = np.linalg.eigh(cov)          # ascending
-    V = V[:, ::-1]                      # first column = major axis
+    w, V = np.linalg.eigh(cov)   # ascending
+    V = V[:, ::-1]               # first column = major axis
     return mu, V, X
 
-def _median_chain(u: np.ndarray, v: np.ndarray, nbin: int = 200) -> np.ndarray:
-    """Make a single polyline by binning along u and taking median v."""
+def _aggregate_chain(u: np.ndarray, v: np.ndarray, nbin: int, mode: str) -> np.ndarray:
     umin, umax = float(np.min(u)), float(np.max(u))
     if umax - umin <= 0:
         return np.empty((0,2))
@@ -197,22 +195,30 @@ def _median_chain(u: np.ndarray, v: np.ndarray, nbin: int = 200) -> np.ndarray:
         mask = (idx == b)
         if np.count_nonzero(mask) >= 3:
             xs.append(0.5*(bins[b]+bins[b+1]))
-            ys.append(float(np.median(v[mask])))
+            if mode == "lower":
+                ys.append(float(np.min(v[mask])))
+            elif mode == "upper":
+                ys.append(float(np.max(v[mask])))
+            else:
+                ys.append(float(np.median(v[mask])))
     if not xs:
         return np.empty((0,2))
     P = np.column_stack([np.asarray(xs), np.asarray(ys)])
-    # remove duplicates / sort
     order = np.argsort(P[:,0])
     P = P[order]
     _, uniq = np.unique(P[:,0], return_index=True)
     return P[np.sort(uniq)]
 
-def read_single_section_file(path: str, layer_name: Optional[str] = None, unit_scale: float = 1.0) -> Optional[np.ndarray]:
+def read_single_section_file(
+    path: str,
+    layer_name: Optional[str] = None,
+    unit_scale: float = 1.0,
+    aggregate: str = "median",   # "median" / "lower" / "upper"
+) -> Optional[np.ndarray]:
     """
-    Read one DXF/CSV and return Nx2 array (X, Y) in the *file's coordinates*.
-    - If LWPOLYLINE exists → use the longest one.
-    - Else if LINE only → collect endpoints, PCA → bin-median to a single chain.
-    NOTE: 軸の意味（offset/elev）やローカル化は呼び出し側で行います。
+    Read one DXF/CSV and return Nx2 array in a *local PCA frame* (u: offset-like, v: elev-like).
+    - 集約: 複数曲線を u 方向のビンごとに中央値/下包絡/上包絡で1本化。
+    - NOTE: 軸/単位/基準シフトは呼び出し側で行う。
     """
     # CSV
     if path.lower().endswith(".csv"):
@@ -221,51 +227,40 @@ def read_single_section_file(path: str, layer_name: Optional[str] = None, unit_s
             pts = np.asarray(data, dtype=float)
             if pts.ndim != 2 or pts.shape[1] < 2:
                 return None
-            return pts[:, :2] * unit_scale
+            P = pts[:, :2] * unit_scale
         except Exception:
             return None
+    else:
+        # DXF
+        if ezdxf is None:
+            raise RuntimeError("ezdxf not installed.")
+        try:
+            doc = ezdxf.readfile(path)
+        except Exception:
+            return None
+        msp = doc.modelspace()
 
-    # DXF
-    if ezdxf is None:
-        raise RuntimeError("ezdxf not installed.")
-    try:
-        doc = ezdxf.readfile(path)
-    except Exception:
-        return None
-    msp = doc.modelspace()
+        # collect points from LWPOLYLINE and LINE (optionally filter by layer)
+        pts_list = []
+        for e in msp.query("LWPOLYLINE"):
+            if (layer_name is None) or (e.dxf.layer == layer_name):
+                pts = _sample_entity_2d(e)
+                if pts.size:
+                    pts_list.append(pts)
+        for ln in msp.query("LINE"):
+            if (layer_name is None) or (ln.dxf.layer == layer_name):
+                pts_list.append(np.array([[ln.dxf.start.x, ln.dxf.start.y],
+                                          [ln.dxf.end.x,   ln.dxf.end.y]], dtype=float))
+        if not pts_list:
+            return None
+        P = (np.vstack(pts_list)) * unit_scale
 
-    # 1) LWPOLYLINE 優先
-    polys = []
-    for e in msp.query("LWPOLYLINE"):
-        if (layer_name is None) or (e.dxf.layer == layer_name):
-            pts = _sample_entity_2d(e)
-            if pts.size:
-                polys.append((e, pts))
-    if polys:
-        ent, pts = max(polys, key=lambda t: _safe_len(t[0]))
-        P = pts * unit_scale
-        # sort by X to stabilize
-        order = np.argsort(P[:,0])
-        P = P[order]
-        _, uniq = np.unique(P[:,0], return_index=True)
-        return P[np.sort(uniq)][:, :2]
+    # PCA → local frame
+    mu, V, Xc = _pca_2d(P)
+    U = Xc @ V  # (u,v)
 
-    # 2) LINE 群から推定
-    pts_list = []
-    for ln in msp.query("LINE"):
-        if (layer_name is None) or (ln.dxf.layer == layer_name):
-            pts_list.append([ln.dxf.start.x, ln.dxf.start.y])
-            pts_list.append([ln.dxf.end.x,   ln.dxf.end.y])
-    if len(pts_list) < 6:
-        return None
-
-    P = np.asarray(pts_list, dtype=float) * unit_scale
-    mu, V, Xc = _pca_2d(P)             # mean, eigenvectors, centered
-    U = Xc @ V                         # rotate to PCA frame (u: major, v: minor)
-
-    chain = _median_chain(U[:,0], U[:,1], nbin=240)
+    # aggregate to a single chain
+    chain = _aggregate_chain(U[:,0], U[:,1], nbin=320, mode=aggregate)
     if chain.size == 0:
         return None
-
-    # return in PCA frame (u,v)  ← 呼び出し側で offset/elev として扱う想定
-    return chain
+    return chain  # (u,v)
