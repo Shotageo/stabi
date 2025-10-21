@@ -6,17 +6,16 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
-# LEM optional
 try:
     from stabi_core.stabi_lem import compute_min_circle
     _LEM_OK = True
 except Exception:
     _LEM_OK = False
     def compute_min_circle(cfg):
-        oz = np.asarray(cfg.get("section"))
+        oz = np.asarray(cfg.get("section")); 
         if oz is None or oz.size == 0:
             return {"fs": 1.10, "circle": {"oc": 0.0, "zc": 0.0, "R": 10.0}}
-        oc = float(np.median(oz[:,0])); zc = float(np.min(oz[:,1]) + (np.max(oz[:,1])-np.min(oz[:,1]))*0.25)
+        oc = float(np.median(oz[:,0])); zc = float(np.percentile(oz[:,1], 25))
         R  = float(max(6.0, (np.max(oz[:,0])-np.min(oz[:,0]))*0.35))
         return {"fs": 1.12, "circle": {"oc": oc, "zc": zc, "R": R}}
 
@@ -26,7 +25,6 @@ from stabi_io.dxf_sections import (
     read_single_section_file, normalize_no_key
 )
 
-# -------------- helpers --------------
 def _tangent_normal(centerline: np.ndarray, s: float):
     lens = np.r_[0, np.cumsum(np.linalg.norm(np.diff(centerline, axis=0), axis=1))]
     s = float(np.clip(s, lens[0], lens[-1]))
@@ -44,16 +42,14 @@ def _xs_to_world3D(P, n, oz):
     Z = oz[:,1]
     return X, Y, Z
 
-# -------------- page --------------
 def page():
-    st.title("DXF取り込み（No.×測点円スナップ・割当ウィザード）")
+    st.title("DXF取り込み（No×測点円スナップ → 横断集約 → 3D）")
 
-    # ---------- Step 1 ----------
+    # --- Step1 平面 ---
     with st.expander("Step 1｜平面（中心線＋No.ラベル＋測点円）", expanded=True):
         plan_up = st.file_uploader("平面DXF（1ファイル）", type=["dxf"], accept_multiple_files=False, key="plan")
         unit_scale_plan = st.number_input("平面倍率（mm→m は 0.001）", value=1.0, step=0.001, format="%.3f")
         find_radius = st.number_input("ラベル→円 検索半径[m]", value=15.0, step=1.0, format="%.1f")
-
         if plan_up is not None:
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
             tmp.write(plan_up.read()); tmp.flush(); tmp.close()
@@ -63,7 +59,6 @@ def page():
             options = [f"{L.name}  (len≈{L.length_sum:.1f})" for L in layers]
             idx = st.radio("中心線レイヤ", list(range(len(options))), format_func=lambda i: options[i])
             cl_layer = layers[int(idx)].name
-
             label_layers = st.multiselect("測点ラベルレイヤ（TEXT/MTEXT）", [L.name for L in layers], default=[])
             circle_layers = st.multiselect("測点円レイヤ（CIRCLE）", [L.name for L in layers], default=[])
 
@@ -72,7 +67,6 @@ def page():
                     cl = read_centerline(st.session_state._plan_path, [cl_layer], unit_scale=unit_scale_plan)
                     labels = extract_no_labels(st.session_state._plan_path, label_layers, unit_scale=unit_scale_plan)
                     circles = extract_circles(st.session_state._plan_path, circle_layers, unit_scale=unit_scale_plan)
-
                     no_rows = []
                     for lab in labels:
                         key = lab["key"]; Lxy = np.array(lab["pos"], dtype=float)
@@ -99,64 +93,44 @@ def page():
                 except Exception as e:
                     st.error(f"抽出失敗: {e}")
 
-        if "no_table" in st.session_state:
-            st.write("検出結果（円スナップ基準の s[m]）")
-            st.code("\n".join([
-                (f"{d['key']} → s={d['s']:.2f} m  "
-                 + (f"(label→circle={d['label_to_circle']:.2f} m, circle→CL={d['circle_to_cl']:.2f} m)" if d["status"]=="OK"
-                    else f"[fallback: label→CL={d['circle_to_cl']:.2f} m]"))
-                for d in st.session_state.no_table
-            ]))
-
-    # ---------- Step 2 ----------
-    with st.expander("Step 2｜横断ファイルをアップロードしてNo.を割当", expanded=True):
+    # --- Step2 横断 ---
+    with st.expander("Step 2｜横断を読み込み→集約→No割当", expanded=True):
         xs_files = st.file_uploader("横断DXF/CSV（複数可）", type=["dxf","csv"], accept_multiple_files=True, key="xs")
 
-        st.caption("単位が混在する場合は、オフセットと標高に別々の倍率を設定してください。")
         offset_scale = st.number_input("オフセット倍率（mm→m は 0.001）", value=1.0, step=0.001, format="%.3f")
         elev_scale   = st.number_input("標高倍率（mm→m は 0.001）",   value=1.0, step=0.001, format="%.3f")
-
         axis_mode = st.selectbox("軸割り", ["X=offset / Y=elev（標準）", "X=elev / Y=offset（入替）"])
         flip_o = st.checkbox("オフセット左右反転", value=False)
         flip_z = st.checkbox("標高上下反転", value=False)
 
-        # ローカル化オプション
-        center_o = st.checkbox("オフセット中央値を0に（世界座標の場合に推奨）", value=True)
-        center_by_circle = st.checkbox("道路中心オフセット値を0にシフト（円中心=0）", value=False)
-        user_center_offset = st.number_input("道路中心オフセット値（断面側の中心が0でないとき）", value=0.0, step=0.1, format="%.3f")
+        agg_mode = st.selectbox("複数線の集約", ["中央値（推奨）", "下包絡（最小）", "上包絡（最大）"])
+        smooth_k = st.slider("平滑ウィンドウ（奇数）", 3, 21, 7, step=2)
+        max_slope = st.slider("最大許容勾配 |dz/dx|（スパイク抑制）", 2.0, 30.0, 10.0, step=0.5)
 
-        elev_zero_mode = st.selectbox("標高の基準シフト", ["しない", "最小を0", "中央値を0", "指定値を0"])
-        user_elev0 = st.number_input("標高の指定基準値（上で「指定値を0」を選んだ時に有効）", value=0.0, step=0.1, format="%.3f")
-
-        agg_mode = st.selectbox("複数線の集約方法（LINE/LWPOLYLINE混在時）", ["中央値（推奨）", "下包絡（最小）", "上包絡（最大）"])
-        agg_key = {"中央値（推奨）":"median", "下包絡（最小）":"lower", "上包絡（最大）":"upper"}[agg_mode]
-
+        center_o = st.checkbox("オフセット中央値を0に", value=True)
+        center_by_circle = st.checkbox("道路中心オフセット値を0に（円中心=0）", value=False)
+        user_center_offset = st.number_input("道路中心オフセット値", value=0.0, step=0.1, format="%.3f")
+        elev_zero_mode = st.selectbox("標高の基準シフト", ["しない", "最小を0", "中央値を0"])
+        
         if xs_files and "no_table" in st.session_state:
             no_choices = [d["key"] for d in st.session_state.no_table]
             no_to_s = {d["key"]: d["s"] for d in st.session_state.no_table}
+            agg_key = {"中央値（推奨）":"median", "下包絡（最小）":"lower", "上包絡（最大）":"upper"}[agg_mode]
 
             assigned: Dict[str, Dict] = {}
             for f in xs_files:
                 with st.expander(f"割当：{f.name}", expanded=False):
-                    # レイヤ選択（DXFのみ）
                     layer_name: Optional[str] = None
                     if f.name.lower().endswith(".dxf"):
-                        try:
-                            tmp_scan = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
-                            tmp_scan.write(f.getbuffer()); tmp_scan.flush(); tmp_scan.close()
-                            layers = list_layers(tmp_scan.name)
-                            layer_name = st.selectbox(
-                                "横断レイヤ（任意／未選択=自動）",
-                                ["（未選択）"] + [L.name for L in layers]
-                            )
-                            if layer_name == "（未選択）":
-                                layer_name = None
-                            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
-                            with open(tmp_scan.name, "rb") as r: tmp.write(r.read())
-                            tmp.flush(); tmp.close()
-                        except Exception:
-                            tmp = tempfile.NamedTemporaryFile(delete=False, suffix="."+f.name.split(".")[-1])
-                            tmp.write(f.getbuffer()); tmp.flush(); tmp.close()
+                        tmp_scan = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
+                        tmp_scan.write(f.getbuffer()); tmp_scan.flush(); tmp_scan.close()
+                        layers = list_layers(tmp_scan.name)
+                        layer_name = st.selectbox("横断レイヤ（任意／未選択=自動）",
+                                                  ["（未選択）"] + [L.name for L in layers])
+                        if layer_name == "（未選択）": layer_name = None
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".dxf")
+                        with open(tmp_scan.name, "rb") as r: tmp.write(r.read())
+                        tmp.flush(); tmp.close()
                     else:
                         tmp = tempfile.NamedTemporaryFile(delete=False, suffix="."+f.name.split(".")[-1])
                         tmp.write(f.getbuffer()); tmp.flush(); tmp.close()
@@ -165,42 +139,24 @@ def page():
                     idx = (no_choices.index(guess)+1) if guess in no_choices else 0
                     sel = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=idx, key=f"sel_{f.name}")
 
-                    # 断面読込（PCAローカルフレームで返る）
-                    sec = read_single_section_file(tmp.name, layer_name=layer_name, unit_scale=1.0, aggregate=agg_key)
+                    sec = read_single_section_file(tmp.name, layer_name=layer_name, unit_scale=1.0,
+                                                   aggregate=agg_key, smooth_k=int(smooth_k), max_slope=float(max_slope))
                     if sec is not None:
-                        # sec は (u,v)。ここから (offset, elev) を構成
+                        # sec=(u,v) → (offset,elev) を構成
                         if axis_mode.startswith("X=elev"):
-                            o = sec[:, 1].astype(float)   # offset
-                            z = sec[:, 0].astype(float)   # elev
+                            o = sec[:,1].astype(float); z = sec[:,0].astype(float)
                         else:
-                            o = sec[:, 0].astype(float)
-                            z = sec[:, 1].astype(float)
-
-                        # 軸ごとの倍率
-                        o = o * float(offset_scale)
-                        z = z * float(elev_scale)
-
-                        # 反転
+                            o = sec[:,0].astype(float); z = sec[:,1].astype(float)
+                        o *= float(offset_scale); z *= float(elev_scale)
                         if flip_o: o *= -1.0
                         if flip_z: z *= -1.0
-
-                        # オフセットのローカル化
-                        if center_by_circle:
-                            o = o - float(user_center_offset)
-                        elif center_o:
-                            o = o - float(np.median(o))
-
-                        # 標高の基準シフト
-                        if elev_zero_mode == "最小を0":
-                            z = z - float(np.min(z))
-                        elif elev_zero_mode == "中央値を0":
-                            z = z - float(np.median(z))
-                        elif elev_zero_mode == "指定値を0":
-                            z = z - float(user_elev0)
-
+                        if center_by_circle: o = o - float(user_center_offset)
+                        elif center_o:      o = o - float(np.median(o))
+                        if elev_zero_mode == "最小を0":      z = z - float(np.min(z))
+                        elif elev_zero_mode == "中央値を0":  z = z - float(np.median(z))
                         oz = np.column_stack([o, z])
 
-                        # 2Dクイックプレビュー
+                        # 2Dプレビュー
                         import matplotlib.pyplot as plt
                         fig2, ax = plt.subplots(figsize=(5.2,2.6))
                         ax.plot(oz[:,0], oz[:,1], lw=2.0)
@@ -208,25 +164,21 @@ def page():
                         st.pyplot(fig2, use_container_width=True)
 
                         if sel != "（未選択）":
-                            assigned[f.name] = {"path": tmp.name, "oz": oz, "no_key": sel, "s": no_to_s[sel]}
-
+                            assigned[f.name] = {"oz": oz, "no_key": sel, "s": no_to_s[sel]}
             st.session_state._assigned = assigned
             st.info(f"割当済み：{len(assigned)} / {len(xs_files)}")
 
-    # ---------- Step 3 ----------
+    # --- Step3 3D ---
     with st.expander("Step 3｜3Dプレビュー", expanded=True):
         can_run = ("centerline" in st.session_state) and ("_assigned" in st.session_state) and st.session_state._assigned
         if not can_run:
-            st.warning("中心線＋No. と 横断の割当を完了してください。")
-            return
+            st.warning("中心線＋No. と 横断の割当を完了してください。"); return
         cl = st.session_state.centerline
         assigned = st.session_state._assigned
 
         fig = go.Figure()
         fig.add_trace(go.Scatter3d(x=cl[:,0], y=cl[:,1], z=np.zeros(len(cl)),
-                                   mode="lines", name="Centerline",
-                                   line=dict(width=4, color="#A0A6B3")))
-
+                                   mode="lines", name="Centerline", line=dict(width=4, color="#A0A6B3")))
         for _, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
             s = float(rec["s"]); oz = rec["oz"]; P, t, n = _tangent_normal(cl, s)
             X,Y,Z = _xs_to_world3D(P, n, oz)
@@ -237,16 +189,14 @@ def page():
                 oc, zc, R = res["circle"]["oc"], res["circle"]["zc"], res["circle"]["R"]
                 ph = np.linspace(-np.pi, np.pi, 241)
                 xo = oc + R*np.cos(ph);  zo = zc + R*np.sin(ph)
-                X2 = P[0] + xo * n[0];   Y2 = P[1] + xo * n[1];   Z2 = zo
+                X2 = P[0] + xo*n[0]; Y2 = P[1] + xo*n[1]; Z2 = zo
                 fig.add_trace(go.Scatter3d(x=X2, y=Y2, z=Z2, mode="lines",
                                            showlegend=False, line=dict(width=3, color="#E65454")))
             except Exception:
                 pass
-
         fig.update_layout(scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False),
                                      aspectmode="data"),
-                          paper_bgcolor="#0f1115", plot_bgcolor="#0f1115",
-                          margin=dict(l=0,r=0,t=0,b=0))
+                          paper_bgcolor="#0f1115", plot_bgcolor="#0f1115", margin=dict(l=0,r=0,t=0,b=0))
         st.plotly_chart(fig, use_container_width=True, height=720)
 
 if __name__ == "__main__":
