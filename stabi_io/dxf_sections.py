@@ -9,11 +9,11 @@ import numpy as np
 
 try:
     import ezdxf  # type: ignore
-except Exception:  # ezdxf が未インストールでも他ページが動くように
-    ezdxf = None  # noqa: N816
+except Exception:
+    ezdxf = None  # 依存なしでも他ページが動くようにフォールバック
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # No. ラベル正規化（例: "No.0+40", "NO 0-40", "KP12+350" などを No.0+40 に統一）
 _ST_RE = re.compile(r"(?:STA|KP|No\.?|NO\.?)?\s*([0-9]+)\s*[+\-−]\s*([0-9]+)", re.IGNORECASE)
 
@@ -27,7 +27,7 @@ def normalize_no_key(text: str) -> Optional[str]:
     return f"No.{a}+{b:02d}"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # レイヤ一覧（長さ合計でソート）
 @dataclass
 class LayerInfo:
@@ -61,7 +61,7 @@ def list_layers(path: str) -> List[LayerInfo]:
     return sorted(table.values(), key=lambda L: (-L.length_sum, L.name.lower()))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # 線形・線分の座標列取得
 def _sample_entity_2d(ent):
     """DXFエンティティから 2D 点列を抽出"""
@@ -125,7 +125,7 @@ def project_point_to_polyline(poly: np.ndarray, pt: np.ndarray) -> Tuple[float, 
     return best_s, best_dist
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # No.ラベルと測点円の抽出
 def extract_no_labels(path: str, label_layers: List[str], unit_scale: float = 1.0) -> List[Dict]:
     if ezdxf is None:
@@ -185,7 +185,7 @@ def extract_circles(path: str, circle_layers: List[str], unit_scale: float = 1.0
     return out
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # 横断抽出（DXF/CSV） ― 高精細リサンプリング + ロバスト集約
 def _is_closed_poly(pts: np.ndarray, tol: float = 1e-6) -> bool:
     return pts.shape[0] >= 3 and float(np.linalg.norm(pts[0] - pts[-1])) < tol
@@ -351,3 +351,72 @@ def read_single_section_file(
     P2 = np.column_stack([np.asarray(xs), np.asarray(ys)])
     order = np.argsort(P2[:, 0])
     return P2[order]
+
+
+# ──────────────────────────────────────────────────────────────
+# 追加：横断内「CL縦線」を検出し、その u 座標（横方向）を返す
+def detect_section_centerline_u(
+    path: str,
+    layer_hint: Optional[List[str]] = None,
+    unit_scale: float = 1.0,
+    angle_tol_deg: float = 8.0,
+    min_v_span: float = 0.2,
+) -> Optional[float]:
+    """
+    横断DXF内の「ほぼ鉛直な短い線分（CL縦線）」を検出し、主軸座標系(u,v)での u0 を返す。
+    - layer_hint を与えると、そのレイヤに絞って検出（CL, CENTER 等）
+    - 見つからなければ None
+    """
+    if ezdxf is None:
+        raise RuntimeError("ezdxf not installed.")
+    try:
+        doc = ezdxf.readfile(path)
+    except Exception:
+        return None
+    msp = doc.modelspace()
+
+    # 点群と LINE を収集
+    pts_list: List[np.ndarray] = []
+    lines: List[Tuple[np.ndarray, np.ndarray, str]] = []
+    for e in msp.query("LWPOLYLINE"):
+        if (layer_hint is None) or (e.dxf.layer in layer_hint):
+            Q = _sample_entity_2d(e)
+            if Q.size:
+                pts_list.append(Q.astype(float) * unit_scale)
+    for ln in msp.query("LINE"):
+        if (layer_hint is None) or (ln.dxf.layer in layer_hint):
+            p1 = np.array([float(ln.dxf.start.x), float(ln.dxf.start.y)], float) * unit_scale
+            p2 = np.array([float(ln.dxf.end.x), float(ln.dxf.end.y)], float) * unit_scale
+            lines.append((p1, p2, ln.dxf.layer))
+            pts_list.append(np.vstack([p1, p2]))
+
+    if not pts_list or not lines:
+        return None
+
+    P = np.vstack(pts_list)
+    mu = P.mean(0)
+    X = P - mu
+    # PCA で (u,v) を決める（u: 横、v: 縦）
+    cov = np.cov(X.T)
+    w, V = np.linalg.eigh(cov)
+    V = V[:, ::-1]  # 第一主成分→u、第二→v
+    tan_tol = float(np.tan(np.radians(angle_tol_deg)))
+
+    u_med = float(np.median((P - mu) @ V[:, 0]))
+    best_u0, best_score = None, -1e18
+
+    for (p1, p2, _layer) in lines:
+        uv1 = (p1 - mu) @ V
+        uv2 = (p2 - mu) @ V
+        du = float(uv2[0] - uv1[0])
+        dv = float(uv2[1] - uv1[1])
+        # 縦線条件：|du| が小さい、かつ縦方向スパンが一定以上
+        if abs(du) <= tan_tol * max(abs(dv), 1e-9) and abs(dv) >= float(min_v_span):
+            u0 = 0.5 * (uv1[0] + uv2[0])
+            vspan = abs(dv)
+            score = vspan - 0.25 * abs(u0 - u_med)  # 長い & 中央に近いほど高評価
+            if score > best_score:
+                best_score = score
+                best_u0 = float(u0)
+
+    return best_u0
