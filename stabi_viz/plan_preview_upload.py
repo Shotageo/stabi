@@ -42,18 +42,35 @@ from stabi_io.dxf_sections import (
 # ──────────────────────────────────────────────────────────────
 # 内部ヘルパ（進行方向に対して左法線が + ）
 def _tangent_normal(centerline: np.ndarray, s: float):
-    lens = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(centerline, axis=0), axis=1))]
-    s = float(np.clip(s, lens[0], lens[-1]))
-    i = int(np.searchsorted(lens, s))
-    i0 = max(1, min(len(centerline) - 1, i))
-    t = centerline[i0] - centerline[i0 - 1]
-    if np.linalg.norm(t) == 0:
-        t = np.array([1.0, 0.0])
-    else:
-        t = t / np.linalg.norm(t)
-    # 左法線が正
-    n = np.array([-t[1], t[0]])
-    P = centerline[i0]
+    """
+    中心線 polyline と弧長 s から、投影点 P、接線 t（単位ベクトル）、左法線 n を返す。
+    ※ 頂点に丸めず、区間内で線形内挿するのがポイント。
+    """
+    if centerline.shape[0] < 2:
+        return centerline[0], np.array([1.0, 0.0]), np.array([0.0, 1.0])
+
+    segs = np.diff(centerline, axis=0)                     # 区間ベクトル
+    lens = np.linalg.norm(segs, axis=1)                    # 区間長
+    cum  = np.r_[0.0, np.cumsum(lens)]                     # 弧長累積
+    Ltot = float(cum[-1])
+    if Ltot <= 0:
+        return centerline[0], np.array([1.0, 0.0]), np.array([0.0, 1.0])
+
+    # s を曲線長にクリップ
+    s = float(np.clip(s, 0.0, Ltot))
+
+    # s が含まれる区間 i を取得（cum[i] <= s < cum[i+1]）
+    i = int(np.searchsorted(cum, s, side="right") - 1)
+    i = max(0, min(i, len(segs) - 1))
+
+    Li = lens[i] if lens[i] > 0 else 1.0
+    tau = (s - cum[i]) / Li                                 # 区間内パラメータ 0..1
+    p0  = centerline[i]
+    v   = segs[i]
+
+    P = p0 + tau * v                                        # 投影点（内挿）
+    t = v / Li                                              # 単位接線
+    n = np.array([-t[1], t[0]])                             # 左法線を正
     return P, t, n
 
 
