@@ -11,7 +11,7 @@ try:
 except Exception:
     _LEM_OK = False
     def compute_min_circle(cfg):
-        oz = np.asarray(cfg.get("section")); 
+        oz = np.asarray(cfg.get("section"))
         if oz is None or oz.size == 0:
             return {"fs": 1.10, "circle": {"oc": 0.0, "zc": 0.0, "R": 10.0}}
         oc = float(np.median(oz[:,0])); zc = float(np.percentile(oz[:,1], 25))
@@ -30,24 +30,21 @@ def _tangent_normal(centerline: np.ndarray, s: float):
     i = int(np.searchsorted(lens, s))
     i0 = max(1, min(len(centerline)-1, i))
     t = centerline[i0] - centerline[i0-1]
-    if np.linalg.norm(t) == 0:
-        t = np.array([1.0, 0.0])
-    else:
-        t = t / np.linalg.norm(t)
-    n = np.array([-t[1], t[0]])
+    if np.linalg.norm(t) == 0: t = np.array([1.0, 0.0])
+    else: t = t / np.linalg.norm(t)
+    n = np.array([-t[1], t[0]])  # 左法線 = 正
     P = centerline[i0]
     return P, t, n
 
-def _xs_to_world3D(P, n, oz):
+def _xs_to_world3D(P, n, oz, z_scale=1.0):
     X = P[0] + oz[:,0] * n[0]
     Y = P[1] + oz[:,0] * n[1]
-    Z = oz[:,1]
+    Z = oz[:,1] * float(z_scale)
     return X, Y, Z
 
 def page():
-    st.title("DXF取り込み（No×測点円スナップ → 横断集約 → 3D）")
+    st.title("DXF取り込み（No×測点円スナップ → 横断立体配置）")
 
-    # --- Step1 平面 ---
     with st.expander("Step 1｜平面（中心線＋No.ラベル＋測点円）", expanded=True):
         plan_up = st.file_uploader("平面DXF（1ファイル）", type=["dxf"], accept_multiple_files=False, key="plan")
         unit_scale_plan = st.number_input("平面倍率（mm→m は 0.001）", value=1.0, step=0.001, format="%.3f")
@@ -72,32 +69,28 @@ def page():
                     no_rows = []
                     for lab in labels:
                         key = lab["key"]; Lxy = np.array(lab["pos"], dtype=float)
-                        best = None
-                        best_circle_xy = None
+                        best = None; best_circle_xy=None
                         for c in circles:
                             Cxy = np.array(c["center"], dtype=float)
                             d = float(np.linalg.norm(Lxy - Cxy))
-                            if d <= find_radius:
-                                if (best is None) or (d < best[0]):
-                                    best = (d, Cxy, c["r"], c["layer"])
-                                    best_circle_xy = Cxy
+                            if d <= find_radius and (best is None or d<best[0]):
+                                best=(d,Cxy,c["r"],c["layer"]); best_circle_xy=Cxy
                         if best is not None:
-                            d, Cxy, r, lay = best
-                            s, dist_pc = project_point_to_polyline(cl, Cxy)
-                            no_rows.append({"key": key, "s": s, "label_to_circle": d, "circle_to_cl": dist_pc,
-                                            "circle_r": r, "circle_layer": lay, "circle_xy": tuple(Cxy), "status": "OK"})
+                            d,Cxy,r,lay=best
+                            s,dist=project_point_to_polyline(cl, Cxy)
+                            no_rows.append({"key":key,"s":s,"label_to_circle":d,"circle_to_cl":dist,
+                                            "circle_r":r,"circle_layer":lay,"circle_xy":tuple(Cxy),"status":"OK"})
                         else:
-                            s_fb, dist_fb = project_point_to_polyline(cl, Lxy)
-                            no_rows.append({"key": key, "s": s_fb, "label_to_circle": None, "circle_to_cl": dist_fb,
-                                            "circle_r": None, "circle_layer": None, "circle_xy": None, "status": "FALLBACK(label→CL)"})
-                    no_rows.sort(key=lambda d: d["s"])
+                            s,dist=project_point_to_polyline(cl, Lxy)
+                            no_rows.append({"key":key,"s":s,"label_to_circle":None,"circle_to_cl":dist,
+                                            "circle_r":None,"circle_layer":None,"circle_xy":None,"status":"FALLBACK(label→CL)"})
+                    no_rows.sort(key=lambda d:d["s"])
                     st.session_state.centerline = cl
                     st.session_state.no_table = no_rows
                     st.success(f"中心線: {len(cl)}点, No.: {len(no_rows)}件")
                 except Exception as e:
                     st.error(f"抽出失敗: {e}")
 
-    # --- Step2 横断 ---
     with st.expander("Step 2｜横断を読み込み→集約→No割当", expanded=True):
         xs_files = st.file_uploader("横断DXF/CSV（複数可）", type=["dxf","csv"], accept_multiple_files=True, key="xs")
 
@@ -108,14 +101,14 @@ def page():
         flip_z = st.checkbox("標高上下反転", value=False)
 
         agg_mode = st.selectbox("複数線の集約", ["中央値（推奨）", "下包絡（最小）", "上包絡（最大）"])
-        smooth_k = st.slider("平滑ウィンドウ（奇数、0で無効）", 0, 21, 7, step=1)
-        max_slope = st.slider("最大許容勾配 |dz/dx|（0で無効）", 0.0, 30.0, 10.0, step=0.5)
+        smooth_k = st.slider("平滑ウィンドウ（奇数、0で無効）", 0, 21, 0, step=1)
+        max_slope = st.slider("最大許容勾配 |dz/dx|（0で無効）", 0.0, 30.0, 0.0, step=0.5)
         target_step = st.number_input("出力間隔 step [m]（小さいほど精細）", value=0.20, step=0.05, format="%.2f")
 
-        center_o = st.checkbox("オフセット中央値を0に", value=False)
-        center_by_circle = st.checkbox("道路中心オフセット値を0に（円中心=0, 自動）", value=True)
+        center_o = st.checkbox("オフセット中央値を0に", value=True)
+        center_by_circle = st.checkbox("道路中心オフセット値を0に（円中心=0, 自動）", value=False)
         user_center_offset = st.number_input("（手動）道路中心オフセット値", value=0.0, step=0.1, format="%.3f")
-        elev_zero_mode = st.selectbox("標高の基準シフト", ["しない", "最小を0", "中央値を0"])
+        elev_zero_mode = st.selectbox("標高の基準シフト", ["しない", "最小を0", "中央値を0"], index=1)
         
         if xs_files and "no_table" in st.session_state:
             no_choices = [d["key"] for d in st.session_state.no_table]
@@ -158,26 +151,23 @@ def page():
                         if flip_o: o *= -1.0
                         if flip_z: z *= -1.0
 
-                        # —— 中心合わせ（自動：円中心を0に）——
                         if sel != "（未選択）":
                             s = float(no_to_s[sel]); P, t, n = _tangent_normal(st.session_state.centerline, s)
                             circ = no_to_circle.get(sel)
                             if center_by_circle and circ is not None:
-                                oc0 = float(np.dot(circ - P, n))  # 円中心の横断オフセット
+                                oc0 = float(np.dot(circ - P, n))
                                 o = o - oc0
                             elif center_o:
                                 o = o - float(np.median(o))
                             else:
                                 o = o - float(user_center_offset)
                         else:
-                            if center_o:
-                                o = o - float(np.median(o))
+                            if center_o: o = o - float(np.median(o))
 
                         if elev_zero_mode == "最小を0":      z = z - float(np.min(z))
                         elif elev_zero_mode == "中央値を0":  z = z - float(np.median(z))
                         oz = np.column_stack([o, z])
 
-                        # 2Dプレビュー
                         import matplotlib.pyplot as plt
                         fig2, ax = plt.subplots(figsize=(5.2,2.6))
                         ax.plot(oz[:,0], oz[:,1], lw=2.0)
@@ -189,37 +179,48 @@ def page():
             st.session_state._assigned = assigned
             st.info(f"割当済み：{len(assigned)} / {len(xs_files)}")
 
-    # --- Step3 3D ---
-    with st.expander("Step 3｜3Dプレビュー", expanded=True):
+    with st.expander("Step 3｜3Dプレビュー（立体配置）", expanded=True):
         can_run = ("centerline" in st.session_state) and ("_assigned" in st.session_state) and st.session_state._assigned
         if not can_run:
             st.warning("中心線＋No. と 横断の割当を完了してください。"); return
         cl = st.session_state.centerline
         assigned = st.session_state._assigned
 
+        z_scale = st.number_input("縦倍率（標高）", value=1.0, step=0.1, format="%.1f")
+        pitch_m = st.number_input("表示ピッチ（情報用・今は配置に影響しません）", value=20.0, step=1.0, format="%.1f")
+
         fig = go.Figure()
         fig.add_trace(go.Scatter3d(x=cl[:,0], y=cl[:,1], z=np.zeros(len(cl)),
                                    mode="lines", name="Centerline", line=dict(width=4, color="#A0A6B3")))
         for _, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
             s = float(rec["s"]); oz = rec["oz"]; P, t, n = _tangent_normal(cl, s)
-            X,Y,Z = _xs_to_world3D(P, n, oz)
+            X,Y,Z = _xs_to_world3D(P, n, oz, z_scale=z_scale)
             fig.add_trace(go.Scatter3d(x=X, y=Y, z=Z, mode="lines",
-                                       name=f"{rec['no_key']}", line=dict(width=5, color="#FFFFFF"), opacity=0.95))
+                                       name=f"{rec['no_key']}", line=dict(width=5, color="#FFFFFF"), opacity=0.98))
+            omin, omax = float(np.min(oz[:,0])), float(np.max(oz[:,0]))
+            xb = np.array([omin, omax]); yb = np.zeros_like(xb)
+            Xb, Yb, Zb = _xs_to_world3D(P, n, np.column_stack([xb, yb]), z_scale=z_scale)
+            fig.add_trace(go.Scatter3d(x=Xb, y=Yb, z=Zb, mode="lines",
+                                       showlegend=False, line=dict(width=2, color="#777777")))
+            zmin, zmax = float(np.min(oz[:,1]))*z_scale, float(np.max(oz[:,1]))*z_scale
+            Xp, Yp, Zp = _xs_to_world3D(P, n, np.array([[0.0, zmin], [0.0, zmax]]), z_scale=1.0)
+            fig.add_trace(go.Scatter3d(x=Xp, y=Yp, z=Zp, mode="lines",
+                                       showlegend=False, line=dict(width=3, color="#8888FF")))
             try:
                 res = compute_min_circle({"section": oz})
                 oc, zc, R = res["circle"]["oc"], res["circle"]["zc"], res["circle"]["R"]
                 ph = np.linspace(-np.pi, np.pi, 241)
                 xo = oc + R*np.cos(ph);  zo = zc + R*np.sin(ph)
-                X2 = P[0] + xo*n[0]; Y2 = P[1] + xo*n[1]; Z2 = zo
+                X2 = P[0] + xo*n[0]; Y2 = P[1] + xo*n[1]; Z2 = zo*z_scale
                 fig.add_trace(go.Scatter3d(x=X2, y=Y2, z=Z2, mode="lines",
                                            showlegend=False, line=dict(width=3, color="#E65454")))
             except Exception:
                 pass
+
         fig.update_layout(scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False),
                                      aspectmode="data"),
                           paper_bgcolor="#0f1115", plot_bgcolor="#0f1115", margin=dict(l=0,r=0,t=0,b=0))
-        st.plotly_chart(fig, use_container_width=True, height=720)
+        st.plotly_chart(fig, use_container_width=True, height=780)
 
 if __name__ == "__main__":
     page()
-
