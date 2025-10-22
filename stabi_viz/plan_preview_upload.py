@@ -161,8 +161,8 @@ def _set_plan_bytes(file):
     st.session_state.plan_hash = h
     st.session_state.plan_layers = None
     st.session_state.plan_layer_choice = None
-    st.session_state.plan_label_layers = []   # ← 初期は空に
-    st.session_state.plan_circle_layers = []  # ← 初期は空に
+    st.session_state.plan_label_layers = []   # ← 初期は空に（未選択）
+    st.session_state.plan_circle_layers = []  # ← 初期は空に（未選択）
     st.session_state.centerline_raw = None
     st.session_state.labels_raw = None
     st.session_state.circles_raw = None
@@ -315,37 +315,45 @@ def page():
                            format_func=lambda i: show_names[i], index=default_idx if layer_names else 0)
             st.session_state.plan_layer_choice = layer_names[int(idx)]
 
-            # 測点ラベル・円のレイヤ（初期値は空）＋ 全選択/全解除
+            # 測点ラベル/円のレイヤ（未選択スタート）＋全選択/全解除
             c1, c2 = st.columns(2)
             with c1:
-                st.session_state.plan_label_layers = st.multiselect(
+                current = st.session_state.get("plan_label_layers") or []
+                ms = st.multiselect(
                     "測点ラベルレイヤ（TEXT/MTEXT）",
                     layer_names,
-                    default=(st.session_state.get("plan_label_layers") or []),
+                    default=current,
                     key="plan_label_layers_ms",
                 )
+                st.session_state.plan_label_layers = ms
                 colx = st.columns([1,1,4])
                 with colx[0]:
                     if st.button("全選択", key="lab_all"):
                         st.session_state.plan_label_layers = layer_names
+                        st.session_state.plan_label_layers_ms = layer_names
                 with colx[1]:
                     if st.button("全解除", key="lab_none"):
                         st.session_state.plan_label_layers = []
+                        st.session_state.plan_label_layers_ms = []
 
             with c2:
-                st.session_state.plan_circle_layers = st.multiselect(
+                current2 = st.session_state.get("plan_circle_layers") or []
+                ms2 = st.multiselect(
                     "測点円レイヤ（CIRCLE）",
                     layer_names,
-                    default=(st.session_state.get("plan_circle_layers") or []),
+                    default=current2,
                     key="plan_circle_layers_ms",
                 )
+                st.session_state.plan_circle_layers = ms2
                 coly = st.columns([1,1,4])
                 with coly[0]:
                     if st.button("全選択", key="circ_all"):
                         st.session_state.plan_circle_layers = layer_names
+                        st.session_state.plan_circle_layers_ms = layer_names
                 with coly[1]:
                     if st.button("全解除", key="circ_none"):
                         st.session_state.plan_circle_layers = []
+                        st.session_state.plan_circle_layers_ms = []
 
             # 抽出
             if st.button("中心線＋No.＋円 抽出を実行", type="primary"):
@@ -536,7 +544,7 @@ def page():
                     # 保存
                     st.session_state.raw_sections[f.name] = {
                         "oz_raw": oz_raw,
-                        "guess_no": sel if sel != "（未選択）" else None,
+                        "guess_no": sel if sel != "（未選選）" else None,
                         "no_key":   sel if sel != "（未選択）" else None,
                         "o0_from_section": u0,
                     }
@@ -544,14 +552,19 @@ def page():
                     # 地層レイヤの読み出し（ezdxf が無い場合は案内してスキップ）
                     geology_over: Dict[str, np.ndarray] = {}
                     if geology_layers:
-                        doc = _load_doc_from_path(tmp.name)  # None のときは未対応
+                        doc = _load_doc_from_path(tmp.name)
                         if doc is None:
                             st.info("地層レイヤの抽出には ezdxf が必要です。requirements.txt に 'ezdxf' を追記してください。")
                         else:
                             msp = doc.modelspace()
+                            # 空白区切りクエリ＋フォールバック
+                            try:
+                                ents = msp.query("LINE LWPOLYLINE SPLINE")
+                            except Exception:
+                                ents = [e for e in msp if e.dxftype() in ("LINE", "LWPOLYLINE", "SPLINE")]
                             for lay in geology_layers:
                                 segs = []
-                                for e in msp.query("LINE,LWPOLYLINE,SPLINE"):
+                                for e in ents:
                                     if e.dxf.layer != lay:
                                         continue
                                     arr = _poly_vertices(e)
@@ -590,7 +603,6 @@ def page():
                             fig2.add_trace(go.Scatter(x=[u0*float(offset_scale), u0*float(offset_scale)],
                                                       y=[float(np.nanmin(z)), float(np.nanmax(z))],
                                                       mode="lines", name="CL", line=dict(width=1, dash="dot", color="#8AA0FF")))
-                        # 地層レイヤの重ね描き
                         if geology_over:
                             for nm, arr in geology_over.items():
                                 fig2.add_trace(go.Scatter(x=arr[:,0], y=arr[:,1], mode="lines",
