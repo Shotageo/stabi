@@ -1,8 +1,10 @@
 # stabi_viz/plan_preview_upload.py
 from __future__ import annotations
 
+import json
+import hashlib
 import tempfile
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import streamlit as st
@@ -24,7 +26,7 @@ except Exception:
         oc = float(np.median(oz[:, 0]))
         zc = float(np.percentile(oz[:, 1], 25))
         R = float(max(6.0, (np.max(oz[:, 0]) - np.min(oz[:, 0])) * 0.35))
-        return {"fs": 1.12, "circle": {"oc": oc, "zc": zc, "R": R}}
+        return {"fs": 1.12, "circle": {"oc": oc, "zc": zc, "R": R}, "meta": {"fallback": True}}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -153,14 +155,50 @@ def _rebuild_s_map_from_raw() -> Dict[str, float]:
 
 
 # ──────────────────────────────────────────────────────────────
+# LEM 補助（キャッシュキー、実行ラッパ）
+def _lem_params(method: str, r_min: float, r_max: float, r_step: float,
+                oc_span: float, zc_span: float, grid_step: float) -> Dict:
+    return {
+        "method": method,  # 例: "bishop", "fellenius"（stabi_core 実装に合わせる）
+        "search": {
+            "R_min": float(r_min),
+            "R_max": float(r_max),
+            "R_step": float(r_step),
+            "oc_span": float(oc_span),
+            "zc_span": float(zc_span),
+            "grid_step": float(grid_step),
+        },
+    }
+
+
+def _lem_sig(oz: np.ndarray, params: Dict) -> str:
+    arr = np.asarray(oz, np.float32)
+    blob = arr.tobytes() + json.dumps(params, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()[:16]
+
+
+def _run_lem_one(oz: np.ndarray, params: Dict) -> Dict:
+    """stabi_core の compute_min_circle を呼び出し、最低限のスキーマに整形して返す。"""
+    cfg = dict(params)
+    cfg["section"] = np.asarray(oz, float)
+    res = compute_min_circle(cfg) or {}
+    fs = float(res.get("fs", np.nan))
+    circ = dict(res.get("circle", {}))
+    oc = float(circ.get("oc", np.nan))
+    zc = float(circ.get("zc", np.nan))
+    R = float(circ.get("R", np.nan))
+    meta = dict(res.get("meta", {}))
+    meta["sig"] = _lem_sig(oz, params)
+    meta["method"] = params.get("method")
+    return {"fs": fs, "circle": {"oc": oc, "zc": zc, "R": R}, "meta": meta, "params": params}
+
+
+# ──────────────────────────────────────────────────────────────
 # 生データ raw_sections と 現在の UI 設定から assigned を再構築
 def build_assigned_from_raw():
-    if "raw_sections" not in st.session_state:
-        return
-    if "no_table" not in st.session_state:
-        return
-    if "centerline_raw" not in st.session_state:
-        return
+    if "raw_sections" not in st.session_state: return
+    if "no_table" not in st.session_state:     return
+    if "centerline_raw" not in st.session_state: return
 
     # 平面（中心線）：UI倍率適用版
     unit_scale_plan = float(st.session_state.get("unit_scale_plan_ui", 1.0))
@@ -189,7 +227,7 @@ def build_assigned_from_raw():
     flip_o = bool(st.session_state.get("flip_o_ui", False))
     flip_z = bool(st.session_state.get("flip_z_ui", False))
 
-    # 高さ合わせ（新）
+    # 高さ合わせ
     z_anchor_mode = st.session_state.get("z_anchor_mode_ui", "横断CLを0に（相対）")
 
     assigned: Dict[str, Dict] = {}
@@ -206,10 +244,8 @@ def build_assigned_from_raw():
         # 倍率・反転
         o = oz_raw[:, 0] * offset_scale
         z = oz_raw[:, 1] * elev_scale
-        if flip_o:
-            o *= -1.0
-        if flip_z:
-            z *= -1.0
+        if flip_o: o *= -1.0
+        if flip_z: z *= -1.0
 
         # ── 横方向の原点合わせ（優先順位：CL縦線 → 円中心 → 中央値 → 手動）
         s = float(s_map[sel])
@@ -230,29 +266,20 @@ def build_assigned_from_raw():
                 o = o - float(user_center_offset)
 
         # ── 縦方向（高さ）の合わせ方
-        # 0点（offset=0）での高さ z0 を補間で求める
         idx = np.argsort(o)
         oo = o[idx]; zz = z[idx]
-        # np.interp は範囲外は端値でクランプ
         z0 = float(np.interp(0.0, oo, zz)) if len(oo) >= 2 else float(zz[0]) if len(zz) else 0.0
 
         if z_anchor_mode.startswith("横断CLを0に"):
-            # 相対高さ：CL高さを 0 に
             z = z - z0
         elif z_anchor_mode.startswith("縦断CSVに合わせる"):
-            # 絶対高さ：縦断の CL 標高(s) に合わせて上乗せ
             base = _profile_eval(s)
-            if base is None:
-                # 縦断が未設定なら相対にフォールバック
-                z = z - z0
-            else:
-                z = (z - z0) + float(base)
+            z = (z - z0) + (float(base) if base is not None else 0.0)
         elif z_anchor_mode == "最小を0（簡易）":
             z = z - float(np.min(z))
         elif z_anchor_mode == "中央値を0（簡易）":
             z = z - float(np.median(z))
         else:
-            # しない：そのまま
             pass
 
         assigned[fname] = {"oz": np.column_stack([o, z]), "no_key": sel, "s": s}
@@ -268,7 +295,7 @@ def build_assigned_from_raw():
 # ──────────────────────────────────────────────────────────────
 # 本体ページ
 def page():
-    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（CLで“横”と“高さ”を合わせる）")
+    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（CLで“横”と“高さ”を合わせる＋LEM連携）")
 
     # ── Step 1: 平面（中心線＋No.ラベル＋測点円）
     with st.expander("Step 1｜平面（中心線＋No.ラベル＋測点円）", expanded=True):
@@ -353,7 +380,6 @@ def page():
             try:
                 import pandas as pd
                 df = pd.read_csv(prof_up)
-                # 列名解釈
                 if "s" in df.columns and "z" in df.columns:
                     ss = df["s"].astype(float).to_numpy() * float(s_scale)
                     zz = df["z"].astype(float).to_numpy() * float(z_scale)
@@ -366,12 +392,11 @@ def page():
             except Exception as e:
                 st.error(f"縦断の読み込み失敗: {e}")
 
-        # プレビュー
         if st.session_state.get("profile_s") is not None:
             prof = st.session_state.profile_s
             st.line_chart({"z": prof[:, 1]}, height=140)
 
-    # ── Step 2: 横断読み込み・集約・No割当（CL縦線=0）
+    # ── Step 2: 横断読み込み・集約・No割当（横と高さの基準合わせ・再アップ不要）
     with st.expander("Step 2｜横断を読み込み→集約→No割当（横と高さの基準合わせ・再アップ不要）", expanded=True):
         xs_files = st.file_uploader("横断DXF/CSV（複数可）", type=["dxf", "csv"], accept_multiple_files=True, key="xs")
 
@@ -394,7 +419,7 @@ def page():
         max_slope = st.slider("最大許容勾配 |dz/dx|（0で無効）", 0.0, 30.0, 0.0, step=0.5)
         target_step = st.number_input("出力間隔 step [m]（小さいほど精細）", value=0.50, step=0.05, format="%.2f")
 
-        # 横方向の中心合わせ（優先順位に関わるスイッチ）
+        # 横方向の中心合わせ（優先順位）
         center_by_section_cl = _sync_ui_value(
             "center_by_section_cl_ui", st.checkbox("横断内のCL縦線を 0 に（自動・推奨）", value=True)
         )
@@ -406,7 +431,7 @@ def page():
             "user_center_offset_ui", st.number_input("（手動）道路中心オフセット値", value=0.0, step=0.1, format="%.3f")
         )
 
-        # 縦方向の高さ合わせ（新）
+        # 縦方向の高さ合わせ
         z_anchor_mode = _sync_ui_value(
             "z_anchor_mode_ui",
             st.selectbox(
@@ -540,8 +565,87 @@ def page():
         raw_cnt = len(st.session_state.get("raw_sections", {}))
         st.info(f"割当済み：{assigned_cnt} / 取り込み済みファイル：{raw_cnt}")
 
-    # ── Step 3: 3D プレビュー（立体配置）
-    with st.expander("Step 3｜3Dプレビュー（立体配置）", expanded=True):
+    # ── Step 2.9: LEM 解析（円弧探索） ← 追加
+    with st.expander("Step 2.9｜LEM 解析（円弧探索）", expanded=False):
+        # 現在の割当を確実に反映
+        if st.button("（安全）割当を再構築してから開始", help="UIの倍率や基準変更後は念のため実行してください"):
+            build_assigned_from_raw()
+            st.success("最新の割当を再構築しました。")
+
+        assigned = st.session_state.get("_assigned", {})
+        if not assigned:
+            st.warning("先に Step 1 と Step 2 を完了し、割当を作ってください。")
+        else:
+            # 解析対象の選択
+            all_keys = list(assigned.keys())
+            default_sel = all_keys  # 既定：全断面
+            target_keys = st.multiselect("解析する断面（ファイル単位）", all_keys, default=default_sel)
+
+            # 手法・探索パラメータ
+            method = st.selectbox("手法", ["bishop", "fellenius"], index=0)
+            colx = st.columns(3)
+            with colx[0]:
+                r_min = st.number_input("R_min [m]", value=5.0, step=0.5, format="%.1f")
+                oc_span = st.number_input("oc スパン [m]", value=30.0, step=1.0, format="%.1f")
+            with colx[1]:
+                r_max = st.number_input("R_max [m]", value=120.0, step=1.0, format="%.1f")
+                zc_span = st.number_input("zc スパン [m]", value=30.0, step=1.0, format="%.1f")
+            with colx[2]:
+                r_step = st.number_input("R_step [m]", value=2.0, step=0.5, format="%.1f")
+                grid_step = st.number_input("グリッド刻み [m]", value=2.0, step=0.5, format="%.1f")
+
+            # 実行
+            if st.button("選択した断面を解析して保存", type="primary"):
+                build_assigned_from_raw()  # 念のため
+                params = _lem_params(method, r_min, r_max, r_step, oc_span, zc_span, grid_step)
+                results = st.session_state.get("lem_results", {})
+                prog = st.progress(0.0, text="LEM 解析を実行中…")
+
+                for i, k in enumerate(target_keys):
+                    rec = assigned.get(k)
+                    if rec is None:
+                        continue
+                    oz = np.asarray(rec["oz"], float)
+                    sig = _lem_sig(oz, params)
+                    # 既存キャッシュがあって有効なら飛ばす
+                    old = results.get(k)
+                    if old and old.get("meta", {}).get("sig") == sig:
+                        prog.progress((i + 1) / max(1, len(target_keys)),
+                                      text=f"スキップ（キャッシュ有効）：{k}")
+                        continue
+                    try:
+                        res = _run_lem_one(oz, params)
+                        results[k] = res
+                        prog.progress((i + 1) / max(1, len(target_keys)),
+                                      text=f"完了：{k}  FS={res['fs']:.3f}")
+                    except Exception as e:
+                        results[k] = {"fs": np.nan, "circle": {}, "meta": {"error": str(e), "sig": sig}, "params": params}
+                        prog.progress((i + 1) / max(1, len(target_keys)),
+                                      text=f"エラー：{k}  {e}")
+
+                st.session_state.lem_results = results
+                st.success(f"LEM 結果を保存しました（{len(target_keys)} 件）。下の 3D で反映されます。")
+
+            # 既存結果の一覧
+            if st.session_state.get("lem_results"):
+                rows = []
+                for k, res in st.session_state.lem_results.items():
+                    fs = res.get("fs")
+                    c = res.get("circle", {})
+                    rows.append({"断面": k, "FS": fs, "oc": c.get("oc"), "zc": c.get("zc"), "R": c.get("R")})
+                import pandas as pd
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True)
+                if st.download_button("CSVでダウンロード", data=df.to_csv(index=False).encode("utf-8"),
+                                      file_name="lem_results.csv", mime="text/csv"):
+                    pass
+
+                if st.button("全ての LEM 結果をクリア"):
+                    st.session_state.lem_results = {}
+                    st.info("LEM 結果を削除しました。")
+
+    # ── Step 3: 3D プレビュー（立体配置＋LEM 結果の反映）
+    with st.expander("Step 3｜3Dプレビュー（立体配置＋LEM 結果の反映）", expanded=True):
         can_run = ("centerline" in st.session_state) and ("_assigned" in st.session_state) and st.session_state._assigned
         if not can_run:
             st.warning("中心線＋No. と 横断の割当（再適用）を完了してください。")
@@ -555,8 +659,19 @@ def page():
         _ = st.number_input("表示ピッチ（情報用・今は配置に影響しません）", value=20.0, step=1.0, format="%.1f")
         max_pts_cl = st.number_input("中心線の最大点数（3D間引き）", min_value=500, max_value=20000, value=4000, step=500)
         max_pts_xs = st.number_input("断面1本あたりの最大点数（3D間引き）", min_value=200, max_value=10000, value=1200, step=100)
-        show_arcs = st.checkbox("最小円（LEM円弧）を表示する", value=False)
-        delta_s = _sync_ui_value("delta_s_all_ui", st.number_input("Δs 全体 [m]（微調整、±2m 程度）", value=0.0, step=0.1, format="%.1f"))
+
+        # LEM 表示設定
+        show_arcs = st.checkbox("LEM 円弧を表示する", value=True)
+        arc_source = st.radio("円弧のソース", ["LEM 解析結果を使用（推奨）", "その場で簡易算出"], index=0)
+        show_fs_label = st.checkbox("FSラベルを表示", value=True)
+
+        # FSに応じた色
+        def fs_color(fs: float) -> str:
+            if fs is None or np.isnan(fs): return "#999999"
+            if fs < 1.0:   return "#FF3B30"  # 赤
+            if fs < 1.2:   return "#FF9500"  # 橙
+            if fs < 1.5:   return "#34C759"  # 緑
+            return "#0A84FF"                 # 青
 
         fig = go.Figure()
 
@@ -568,7 +683,9 @@ def page():
         ))
 
         # 断面群
-        for _, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
+        lem_results = st.session_state.get("lem_results", {}) if show_arcs and arc_source.startswith("LEM") else {}
+
+        for sec_key, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
             s = float(rec["s"]); oz = np.asarray(rec["oz"], float)
             P, t, n = _tangent_normal(cl, s)
 
@@ -590,17 +707,46 @@ def page():
             Xp, Yp, Zp = _xs_to_world3D(P, n, np.array([[0.0, zmin], [0.0, zmax]]), z_scale=1.0)
             fig.add_trace(go.Scatter3d(x=Xp, y=Yp, z=Zp, mode="lines", showlegend=False, line=dict(width=3, color="#8888FF")))
 
-            # 円弧（LEM）※重いのでトグル
+            # 円弧（LEM）
             if show_arcs:
-                try:
-                    res = compute_min_circle({"section": oz})
-                    oc, zc, R = res["circle"]["oc"], res["circle"]["zc"], res["circle"]["R"]
+                use_cached = arc_source.startswith("LEM")
+                if use_cached:
+                    res = lem_results.get(sec_key)
+                    if res:
+                        circ = res.get("circle", {})
+                        fs = float(res.get("fs", np.nan))
+                        oc, zc, R = circ.get("oc"), circ.get("zc"), circ.get("R")
+                    else:
+                        oc = zc = R = None
+                        fs = np.nan
+                else:
+                    # その場で簡易試算（表示用）
+                    try:
+                        res = compute_min_circle({"section": oz})
+                        circ = res.get("circle", {}) if res else {}
+                        oc, zc, R = circ.get("oc"), circ.get("zc"), circ.get("R")
+                        fs = float(res.get("fs", np.nan)) if res else np.nan
+                    except Exception:
+                        oc = zc = R = None
+                        fs = np.nan
+
+                if oc is not None and zc is not None and R is not None and np.isfinite(R):
                     ph = np.linspace(-np.pi, np.pi, 241)
-                    xo = oc + R * np.cos(ph); zo = zc + R * np.sin(ph)
+                    xo = float(oc) + float(R) * np.cos(ph)
+                    zo = float(zc) + float(R) * np.sin(ph)
                     X2 = P[0] + xo * n[0]; Y2 = P[1] + xo * n[1]; Z2 = zo * z_scale
-                    fig.add_trace(go.Scatter3d(x=X2, y=Y2, z=Z2, mode="lines", showlegend=False, line=dict(width=3, color="#E65454")))
-                except Exception:
-                    pass
+                    fig.add_trace(go.Scatter3d(
+                        x=X2, y=Y2, z=Z2, mode="lines",
+                        showlegend=False, line=dict(width=3, color=fs_color(fs))
+                    ))
+                    if show_fs_label and np.isfinite(fs):
+                        # ラベル用（円弧の頂点近く）
+                        j = int(np.argmin(np.abs(ph)))  # 0 付近
+                        fig.add_trace(go.Scatter3d(
+                            x=[X2[j]], y=[Y2[j]], z=[Z2[j]],
+                            mode="text", text=[f"FS={fs:.2f}"], showlegend=False,
+                            textfont=dict(size=12, color=fs_color(fs))
+                        ))
 
         fig.update_layout(
             scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False), aspectmode="data"),
