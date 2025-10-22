@@ -25,7 +25,6 @@ def _load_doc_from_bytes(data: bytes):
         return None
 
 def _poly_vertices(e) -> Optional[np.ndarray]:
-    """LINE/LWPOLYLINE/SPLINE を Nx2 の座標列へ（DXF座標）"""
     try:
         if e.dxftype() == "LINE":
             p0 = e.dxf.start; p1 = e.dxf.end
@@ -46,8 +45,11 @@ def _scan_layers_for_horizons(doc, *, allow_regex: Optional[str]=None) -> Dict[s
     if doc is None:
         return out
     msp = doc.modelspace()
-    query = "LINE,LWPOLYLINE,SPLINE"
-    ents = list(msp.query(query))
+    # 空白区切りのクエリ＋フォールバック
+    try:
+        ents = list(msp.query("LINE LWPOLYLINE SPLINE"))
+    except Exception:
+        ents = [e for e in msp if e.dxftype() in ("LINE", "LWPOLYLINE", "SPLINE")]
     pat = re.compile(allow_regex) if allow_regex else None
     for e in ents:
         layer = e.dxf.layer
@@ -64,7 +66,6 @@ def _to_section_oz(seg: np.ndarray, *,
                    off_scale=1.0, z_scale=1.0,
                    flip_o=False, flip_z=False,
                    u0: Optional[float]=None) -> np.ndarray:
-    """DXF XY → 断面の (offset,elev) に変換"""
     if axis.startswith("X=elev"):
         o = seg[:,1].astype(float) * off_scale
         z = seg[:,0].astype(float) * z_scale
@@ -75,10 +76,8 @@ def _to_section_oz(seg: np.ndarray, *,
     if flip_z: z *= -1.0
     if u0 is not None:
         o = o - float(u0) * float(off_scale)
-    # xでソート＋重複間引き
     idx = np.argsort(o); o=o[idx]; z=z[idx]
     if len(o) >= 2:
-        # 同一offsetの重複は平均化
         uniq_o, inv = np.unique(np.round(o, 4), return_inverse=True)
         acc = np.zeros_like(uniq_o); cnt = np.zeros_like(uniq_o)
         for i, j in enumerate(inv):
@@ -88,7 +87,6 @@ def _to_section_oz(seg: np.ndarray, *,
     return np.column_stack([o, z])
 
 def _merge_segments(segments: List[np.ndarray], *, step: float = 0.50) -> np.ndarray:
-    """複数セグメントを1本の折れ線へ（等間隔 resample）"""
     if not segments:
         return np.zeros((0,2), float)
     arr = np.vstack(segments)
@@ -137,7 +135,6 @@ def _auto_suggest(layer_stats: pd.DataFrame) -> pd.DataFrame:
     if mask_gl.any():
         df.loc[mask_gl, "use"] = True
         df.loc[mask_gl, "role"] = "地表"
-    # それでも無ければ最上位（z_med 最大）を地表
     else:
         if len(df):
             i = int(df["z_med"].idxmax())
@@ -231,7 +228,7 @@ def page():
         flip_z = st.checkbox("上下反転", value=bool(st.session_state.get("flip_z_ui", False)))
         use_u0 = st.checkbox("CL縦線で offset=0 を合わせる（推奨）", value=True)
         step   = st.number_input("再サンプル間隔 step [m]", value=0.50, step=0.10, format="%.2f")
-        layer_filter = st.text_input("レイヤ正規表現フィルタ（空で全て）", value="")  # 例: GL|地表|砂|粘|礫|岩
+        layer_filter = st.text_input("レイヤ正規表現フィルタ（空で全て）", value="")
 
         scan_btn = st.button("スキャンして候補を作る", type="primary", disabled=(dxf_bytes is None))
         if scan_btn:
@@ -284,7 +281,6 @@ def page():
                     st.session_state["_map_table"] = _auto_suggest(df)
 
             if "_map_table" not in st.session_state:
-                # 初期表
                 df["use"] = False; df["role"] = "層境界"; df["name"] = df["layer"]
                 st.session_state["_map_table"] = df[["use","role","name","layer","pts","span","z_med"]]
 
@@ -323,13 +319,11 @@ def page():
                         name = str(r.get("name") or r.get("layer"))
                         arr  = st.session_state["_scan_layers_oz"].get(r["layer"])
                         if arr is not None:
-                            # 「地表」は特別扱いせず、通常の層境界として保存（最上位として使われる）
                             new_h[name] = arr
                     st.session_state.lem_horizons[sec_key] = new_h
                     st.success(f"{len(new_h)} 本のラインを断面に保存しました。")
             with c2:
                 if st.button("このマッピングをレシピ保存"):
-                    # 正規表現用に素直に layer→name/role を保存
                     recipe = { r["layer"]: {"role":r["role"], "name":r["name"]} for _,r in ed.iterrows() if r["use"] }
                     st.session_state.lem_recipe = recipe
                     st.success("レシピを保存しました。次の断面で『レシピ適用』できます。")
@@ -362,7 +356,6 @@ def page():
             st.session_state.lem_water_lines.pop(sec_key, None)
             st.success("水位線をクリアしました。")
 
-    # 最後に再プレビュー
     with st.expander("確認プレビュー（最終）", expanded=False):
         horizons = st.session_state.lem_horizons.get(sec_key, {})
         water = st.session_state.lem_water_lines.get(sec_key)
