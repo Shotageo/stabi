@@ -9,13 +9,14 @@ from typing import Dict, Optional, List, Tuple
 import re
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
 # ──────────────────────────────────────────────────────────────
 # LEM（フォールバック付き）
 try:
-    from stabi_core.stabi_lem import compute_min_circle  # 既存の簡易
+    from stabi_core.stabi_lem import compute_min_circle  # 既存 or ダミー
     _LEM_OK = True
 except Exception:
     _LEM_OK = False
@@ -29,7 +30,7 @@ except Exception:
         return {"fs": 1.12, "circle": {"oc": oc, "zc": zc, "R": R}, "meta": {"fallback": True}}
 
 # ──────────────────────────────────────────────────────────────
-# DXF/CSV ユーティリティ
+# DXF/CSV ユーティリティ（既存の io パッケージ）
 from stabi_io.dxf_sections import (
     list_layers,
     read_centerline,
@@ -137,17 +138,36 @@ def _to_section_oz(seg: np.ndarray, *, axis="X=offset/Y=elev",
         o = uniq_o
     return np.column_stack([o, z])
 
-def _merge_segments(segments: List[np.ndarray], *, step: float = 0.50) -> np.ndarray:
-    if not segments:
-        return np.zeros((0,2), float)
-    arr = np.vstack(segments)
-    arr = arr[np.argsort(arr[:,0])]
-    o = arr[:,0]; z = arr[:,1]
-    if len(o) < 2:
-        return arr
-    o_new = np.arange(o.min(), o.max()+step/2, step)
-    z_new = np.interp(o_new, o, z)
-    return np.column_stack([o_new, z_new])
+# ── ロバスト結合（短片除外＋ビン中央値＋ローリング中央値）
+def _merge_segments_robust(
+    segments: List[np.ndarray],
+    step: float = 0.50,
+    min_span: float = 5.0,   # 短い縦棒などは除外
+    roll: int = 7            # 平滑化（奇数）
+) -> np.ndarray:
+    keep = []
+    for seg in segments:
+        if seg is None or len(seg) < 2:
+            continue
+        seg = seg[np.isfinite(seg[:,0]) & np.isfinite(seg[:,1])]
+        if len(seg) < 2:
+            continue
+        seg = seg[np.argsort(seg[:,0])]
+        span = float(seg[:,0].max() - seg[:,0].min())
+        if span >= float(min_span):
+            keep.append(seg)
+    if not keep:
+        return np.zeros((0, 2), float)
+    arr = np.vstack(keep)
+    o_min = float(arr[:,0].min())
+    bins = np.floor((arr[:,0] - o_min) / float(step)).astype(int)
+    df = pd.DataFrame({"bin": bins, "z": arr[:,1]})
+    med = df.groupby("bin")["z"].median()
+    o = o_min + med.index.to_numpy(dtype=float) * float(step)
+    z = med.to_numpy(dtype=float)
+    if int(roll) >= 3:
+        z = pd.Series(z).rolling(int(roll), center=True, min_periods=1).median().to_numpy()
+    return np.column_stack([o, z])
 
 # ──────────────────────────────────────────────────────────────
 # Step1: 平面DXFの永続化・レイヤ一覧の安定化
@@ -161,8 +181,8 @@ def _set_plan_bytes(file):
     st.session_state.plan_hash = h
     st.session_state.plan_layers = None
     st.session_state.plan_layer_choice = None
-    st.session_state.plan_label_layers = []   # ← 初期は空に（未選択）
-    st.session_state.plan_circle_layers = []  # ← 初期は空に（未選択）
+    st.session_state.plan_label_layers = []   # ← 初期は空（未選択）
+    st.session_state.plan_circle_layers = []  # ← 初期は空（未選択）
     st.session_state.centerline_raw = None
     st.session_state.labels_raw = None
     st.session_state.circles_raw = None
@@ -287,7 +307,7 @@ def _build_assigned_from_raw():
 # 画面本体
 
 def page():
-    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（レイヤ選択改善＋地層選択）")
+    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（レイヤ選択改善＋地層選択・ロバスト化）")
 
     # ========== Step 1：平面 ==========
     with st.expander("Step 1｜平面（中心線＋No.ラベル＋測点円）", expanded=True):
@@ -421,7 +441,6 @@ def page():
         z_scale = st.number_input("z の倍率", value=1.0, step=0.001, format="%.3f")
         if up is not None and st.button("縦断を読み込む"):
             try:
-                import pandas as pd
                 df = pd.read_csv(up)
                 ss = df["s"].astype(float).to_numpy() * float(s_scale)
                 zz = df["z"].astype(float).to_numpy() * float(z_scale)
@@ -469,6 +488,13 @@ def page():
         z_anchor_mode = st.selectbox("高さの合わせ方（Zアンカー）",
                                      ["横断CLを0に（相対）", "縦断CSVに合わせる（CL基準）", "最小を0（簡易）", "中央値を0（簡易）", "しない"],
                                      index=0, key="z_anchor_mode_ui")
+
+        # 地層ラインの前処理パラメータ（短片除外＋平滑化）
+        geol_min_span = st.number_input("地層: 短片除外の最小スパン [m]",
+                                        value=5.0, step=0.5,
+                                        help="この長さ未満の線分（ボーリング位置などの縦棒）は地層として集約しません。")
+        geol_roll_win = st.slider("地層: 平滑化（ローリング中央値の窓）",
+                                  min_value=1, max_value=21, value=7, step=2)
 
         st.session_state.setdefault("raw_sections", {})
         st.session_state.setdefault("raw_sections_bytes", {})
@@ -544,7 +570,7 @@ def page():
                     # 保存
                     st.session_state.raw_sections[f.name] = {
                         "oz_raw": oz_raw,
-                        "guess_no": sel if sel != "（未選選）" else None,
+                        "guess_no": sel if sel != "（未選択）" else None,
                         "no_key":   sel if sel != "（未選択）" else None,
                         "o0_from_section": u0,
                     }
@@ -557,7 +583,7 @@ def page():
                             st.info("地層レイヤの抽出には ezdxf が必要です。requirements.txt に 'ezdxf' を追記してください。")
                         else:
                             msp = doc.modelspace()
-                            # 空白区切りクエリ＋フォールバック
+                            # 空白クエリ＋フォールバック
                             try:
                                 ents = msp.query("LINE LWPOLYLINE SPLINE")
                             except Exception:
@@ -586,8 +612,14 @@ def page():
                                     )
                                     if len(oz_l) >= 2: oz_list.append(oz_l)
                                 if oz_list:
-                                    merged = _merge_segments(oz_list, step=float(target_step))
-                                    geology_over[lay] = merged
+                                    merged = _merge_segments_robust(
+                                        oz_list,
+                                        step=float(target_step),
+                                        min_span=float(geol_min_span),
+                                        roll=int(geol_roll_win)
+                                    )
+                                    if len(merged) > 0:
+                                        geology_over[lay] = merged
                             # 断面キーに保存（LEM①へ即連携）
                             if geology_over:
                                 st.session_state.lem_horizons[f.name] = geology_over
