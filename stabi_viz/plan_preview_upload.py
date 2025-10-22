@@ -6,6 +6,7 @@ import json
 import hashlib
 import tempfile
 from typing import Dict, Optional, List, Tuple
+import re
 
 import numpy as np
 import streamlit as st
@@ -90,27 +91,84 @@ def _profile_eval(s: float) -> Optional[float]:
     return float(np.interp(s, ss, zz))
 
 # ──────────────────────────────────────────────────────────────
+# 断面レイヤから地層を読む（ezdxf 利用・無ければ機能ごとOFF）
+def _load_doc_from_path(path: str):
+    try:
+        import ezdxf
+        return ezdxf.readfile(path)
+    except Exception:
+        return None
+
+def _poly_vertices(e) -> Optional[np.ndarray]:
+    try:
+        if e.dxftype() == "LINE":
+            p0 = e.dxf.start; p1 = e.dxf.end
+            return np.array([[p0.x, p0.y], [p1.x, p1.y]], float)
+        if e.dxftype() == "LWPOLYLINE":
+            pts = np.array([(p[0], p[1]) for p in e.get_points("xy")], float)
+            return pts
+        if e.dxftype() == "SPLINE":
+            pts = np.array([(p.x, p.y) for p in e.approximate(300)], float)
+            return pts
+    except Exception:
+        return None
+    return None
+
+def _to_section_oz(seg: np.ndarray, *, axis="X=offset/Y=elev",
+                   off_scale=1.0, z_scale=1.0, flip_o=False, flip_z=False,
+                   u0: Optional[float]=None) -> np.ndarray:
+    if axis.startswith("X=elev"):
+        o = seg[:,1].astype(float) * off_scale
+        z = seg[:,0].astype(float) * z_scale
+    else:
+        o = seg[:,0].astype(float) * off_scale
+        z = seg[:,1].astype(float) * z_scale
+    if flip_o: o *= -1.0
+    if flip_z: z *= -1.0
+    if u0 is not None:
+        o = o - float(u0) * float(off_scale)
+    idx = np.argsort(o); o=o[idx]; z=z[idx]
+    if len(o) >= 2:
+        uniq_o, inv = np.unique(np.round(o, 4), return_inverse=True)
+        acc = np.zeros_like(uniq_o); cnt = np.zeros_like(uniq_o)
+        for i, j in enumerate(inv):
+            acc[j] += z[i]; cnt[j] += 1
+        z = acc / np.maximum(cnt, 1)
+        o = uniq_o
+    return np.column_stack([o, z])
+
+def _merge_segments(segments: List[np.ndarray], *, step: float = 0.50) -> np.ndarray:
+    if not segments:
+        return np.zeros((0,2), float)
+    arr = np.vstack(segments)
+    arr = arr[np.argsort(arr[:,0])]
+    o = arr[:,0]; z = arr[:,1]
+    if len(o) < 2:
+        return arr
+    o_new = np.arange(o.min(), o.max()+step/2, step)
+    z_new = np.interp(o_new, o, z)
+    return np.column_stack([o_new, z_new])
+
+# ──────────────────────────────────────────────────────────────
 # Step1: 平面DXFの永続化・レイヤ一覧の安定化
 
 def _set_plan_bytes(file):
-    """アップロードファイルを bytes として保持"""
     if file is None:
         return
     data = bytes(file.getbuffer())
     h = hashlib.sha1(data).hexdigest()[:12]
     st.session_state.plan_bytes = data
     st.session_state.plan_hash = h
-    st.session_state.plan_layers = None     # レイヤ一覧は再スキャン
+    st.session_state.plan_layers = None
     st.session_state.plan_layer_choice = None
-    st.session_state.plan_label_layers = []
-    st.session_state.plan_circle_layers = []
+    st.session_state.plan_label_layers = []   # ← 初期は空に
+    st.session_state.plan_circle_layers = []  # ← 初期は空に
     st.session_state.centerline_raw = None
     st.session_state.labels_raw = None
     st.session_state.circles_raw = None
     st.session_state.no_table = None
 
 def _ensure_plan_layers():
-    """bytes → 一時ファイル → レイヤ一覧を一度だけ作る"""
     if not st.session_state.get("plan_bytes"):
         return
     if st.session_state.get("plan_layers") is not None:
@@ -122,7 +180,7 @@ def _ensure_plan_layers():
     try:
         layers = list_layers(st.session_state._plan_path)
         st.session_state.plan_layers = layers
-        if layers:
+        if layers and st.session_state.get("plan_layer_choice") is None:
             st.session_state.plan_layer_choice = layers[0].name
     except Exception as e:
         st.session_state.plan_layers = []
@@ -130,7 +188,6 @@ def _ensure_plan_layers():
         st.warning(f"レイヤ一覧の取得に失敗: {e}")
 
 # ──────────────────────────────────────────────────────────────
-# 割当の再構築（倍率・基準を変更したとき）
 def _rebuild_s_map_from_raw() -> Dict[str, float]:
     s_map: Dict[str, float] = {}
     if "centerline_raw" not in st.session_state or "no_table" not in st.session_state:
@@ -230,13 +287,12 @@ def _build_assigned_from_raw():
 # 画面本体
 
 def page():
-    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（安定化UI）")
+    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（レイヤ選択改善＋地層選択）")
 
     # ========== Step 1：平面 ==========
     with st.expander("Step 1｜平面（中心線＋No.ラベル＋測点円）", expanded=True):
         plan_up = st.file_uploader("平面DXF（1ファイル）", type=["dxf"], accept_multiple_files=False, key="plan")
 
-        # ファイルを受け取ったら bytes に固定
         if plan_up is not None and st.button("このファイルを読み込む/更新", type="primary"):
             _set_plan_bytes(plan_up)
             st.success("平面DXFを読み込みました。")
@@ -245,10 +301,8 @@ def page():
                                           step=0.001, format="%.3f", key="unit_scale_plan_ui")
         find_radius = st.number_input("ラベル→円 紐付け距離しきい[m]", value=12.0, step=1.0, format="%.1f")
 
-        # レイヤ一覧を準備
         _ensure_plan_layers()
 
-        # レイヤ選択 UI（常時表示・選択は session_state に保持）
         layers = st.session_state.get("plan_layers") or []
         if layers:
             layer_names = [L.name for L in layers]
@@ -261,70 +315,94 @@ def page():
                            format_func=lambda i: show_names[i], index=default_idx if layer_names else 0)
             st.session_state.plan_layer_choice = layer_names[int(idx)]
 
-            # 測点ラベル・円のレイヤ
-            st.session_state.plan_label_layers = st.multiselect(
-                "測点ラベルレイヤ（TEXT/MTEXT）", layer_names,
-                default=(st.session_state.get("plan_label_layers") or layer_names))
-            st.session_state.plan_circle_layers = st.multiselect(
-                "測点円レイヤ（CIRCLE）", layer_names,
-                default=(st.session_state.get("plan_circle_layers") or layer_names))
+            # 測点ラベル・円のレイヤ（初期値は空）＋ 全選択/全解除
+            c1, c2 = st.columns(2)
+            with c1:
+                st.session_state.plan_label_layers = st.multiselect(
+                    "測点ラベルレイヤ（TEXT/MTEXT）",
+                    layer_names,
+                    default=(st.session_state.get("plan_label_layers") or []),
+                    key="plan_label_layers_ms",
+                )
+                colx = st.columns([1,1,4])
+                with colx[0]:
+                    if st.button("全選択", key="lab_all"):
+                        st.session_state.plan_label_layers = layer_names
+                with colx[1]:
+                    if st.button("全解除", key="lab_none"):
+                        st.session_state.plan_label_layers = []
 
-            # 抽出ボタン（ここで初めて確定処理）
+            with c2:
+                st.session_state.plan_circle_layers = st.multiselect(
+                    "測点円レイヤ（CIRCLE）",
+                    layer_names,
+                    default=(st.session_state.get("plan_circle_layers") or []),
+                    key="plan_circle_layers_ms",
+                )
+                coly = st.columns([1,1,4])
+                with coly[0]:
+                    if st.button("全選択", key="circ_all"):
+                        st.session_state.plan_circle_layers = layer_names
+                with coly[1]:
+                    if st.button("全解除", key="circ_none"):
+                        st.session_state.plan_circle_layers = []
+
+            # 抽出
             if st.button("中心線＋No.＋円 抽出を実行", type="primary"):
-                try:
-                    # 一時ファイルへ
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
-                        tmp.write(st.session_state.plan_bytes)
-                        tmp.flush()
-                        st.session_state._plan_path = tmp.name
+                if not st.session_state.plan_label_layers and not st.session_state.plan_circle_layers:
+                    st.warning("少なくとも『測点ラベル』または『測点円』のレイヤを1つ以上選んでください。")
+                else:
+                    try:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
+                            tmp.write(st.session_state.plan_bytes)
+                            tmp.flush()
+                            st.session_state._plan_path = tmp.name
 
-                    # 中心線：選択レイヤ優先 → 見つからなければ全レイヤでフォールバック
-                    cl_raw = read_centerline(tmp.name,
-                                             allow_layers=[st.session_state.plan_layer_choice],
-                                             unit_scale=1.0)
-                    if cl_raw is None or len(cl_raw) < 2:
-                        cl_raw = read_centerline(tmp.name, allow_layers=None, unit_scale=1.0)
-                        st.warning("選択レイヤで中心線が見つからなかったため、全レイヤから探索しました。")
+                        cl_raw = read_centerline(tmp.name,
+                                                 allow_layers=[st.session_state.plan_layer_choice],
+                                                 unit_scale=1.0)
+                        if cl_raw is None or len(cl_raw) < 2:
+                            cl_raw = read_centerline(tmp.name, allow_layers=None, unit_scale=1.0)
+                            st.warning("選択レイヤで中心線が見つからなかったため、全レイヤから探索しました。")
 
-                    labels = extract_no_labels(tmp.name, st.session_state.plan_label_layers, unit_scale=1.0)
-                    circles = extract_circles(tmp.name, st.session_state.plan_circle_layers, unit_scale=1.0)
+                        labels = extract_no_labels(tmp.name, st.session_state.plan_label_layers, unit_scale=1.0)
+                        circles = extract_circles(tmp.name, st.session_state.plan_circle_layers, unit_scale=1.0)
 
-                    # s 投影（円が近いものを優先）
-                    cl_scaled = cl_raw * float(unit_scale_plan)
-                    rows = []
-                    for lab in labels:
-                        key = lab["key"]
-                        Lxy_s = np.array(lab["pos"], float) * float(unit_scale_plan)
-                        cand = []
-                        for c in circles:
-                            Cxy_s = np.array(c["center"], float) * float(unit_scale_plan)
-                            d = float(np.linalg.norm(Lxy_s - Cxy_s))
-                            if d <= float(find_radius):
-                                cand.append((d, Cxy_s, c.get("r", None), c.get("layer", "")))
-                        if cand:
-                            d, Cxy_s, r, lay = min(cand, key=lambda t: t[0])
-                            s_now, dist = project_point_to_polyline(cl_scaled, Cxy_s)
-                            rows.append({"key": key, "s": float(s_now),
-                                         "label_to_circle": d, "circle_to_cl": dist,
-                                         "circle_r": r, "circle_layer": lay,
-                                         "circle_xy": tuple(Cxy_s / float(unit_scale_plan)),
-                                         "status": "OK(circle)"})
-                        else:
-                            s_now, dist = project_point_to_polyline(cl_scaled, Lxy_s)
-                            rows.append({"key": key, "s": float(s_now),
-                                         "label_to_circle": None, "circle_to_cl": dist,
-                                         "circle_r": None, "circle_layer": None, "circle_xy": None,
-                                         "status": "FALLBACK(label→CL)"})
-                    rows.sort(key=lambda d: d["s"])
+                        cl_scaled = cl_raw * float(unit_scale_plan)
+                        rows = []
+                        for lab in labels:
+                            key = lab["key"]
+                            Lxy_s = np.array(lab["pos"], float) * float(unit_scale_plan)
+                            cand = []
+                            for c in circles:
+                                Cxy_s = np.array(c["center"], float) * float(unit_scale_plan)
+                                d = float(np.linalg.norm(Lxy_s - Cxy_s))
+                                if d <= float(find_radius):
+                                    cand.append((d, Cxy_s, c.get("r", None), c.get("layer", "")))
+                            if cand:
+                                d, Cxy_s, r, lay = min(cand, key=lambda t: t[0])
+                                s_now, dist = project_point_to_polyline(cl_scaled, Cxy_s)
+                                rows.append({"key": key, "s": float(s_now),
+                                             "label_to_circle": d, "circle_to_cl": dist,
+                                             "circle_r": r, "circle_layer": lay,
+                                             "circle_xy": tuple(Cxy_s / float(unit_scale_plan)),
+                                             "status": "OK(circle)"})
+                            else:
+                                s_now, dist = project_point_to_polyline(cl_scaled, Lxy_s)
+                                rows.append({"key": key, "s": float(s_now),
+                                             "label_to_circle": None, "circle_to_cl": dist,
+                                             "circle_r": None, "circle_layer": None, "circle_xy": None,
+                                             "status": "FALLBACK(label→CL)"})
+                        rows.sort(key=lambda d: d["s"])
 
-                    st.session_state.centerline_raw = cl_raw
-                    st.session_state.labels_raw = labels
-                    st.session_state.circles_raw = circles
-                    st.session_state.no_table = rows
-                    st.success(f"中心線: {len(cl_raw)}点 / No.: {len(rows)}件 を抽出しました。")
+                        st.session_state.centerline_raw = cl_raw
+                        st.session_state.labels_raw = labels
+                        st.session_state.circles_raw = circles
+                        st.session_state.no_table = rows
+                        st.success(f"中心線: {len(cl_raw)}点 / No.: {len(rows)}件 を抽出しました。")
 
-                except Exception as e:
-                    st.error(f"抽出に失敗しました: {e}")
+                    except Exception as e:
+                        st.error(f"抽出に失敗しました: {e}")
         else:
             st.info("DXFを読み込み、『このファイルを読み込む/更新』を押すとレイヤ一覧が表示されます。")
 
@@ -349,7 +427,7 @@ def page():
             st.line_chart({"z": prof[:, 1]}, height=120)
 
     # ========== Step 2：横断 ==========
-    with st.expander("Step 2｜横断を読み込み→集約→No割当（プレビュー可）", expanded=True):
+    with st.expander("Step 2｜横断を読み込み→集約→No割当（地層レイヤも選択可）", expanded=True):
         xs_files = st.file_uploader("横断DXF/CSV（複数可）", type=["dxf", "csv"], accept_multiple_files=True, key="xs")
         show_2d = st.checkbox("2Dプレビューを表示", value=True)
 
@@ -368,7 +446,6 @@ def page():
         max_slope = st.slider("最大許容勾配 |dz/dx|（0で無効）", 0.0, 30.0, 0.0, step=0.5)
         target_step = st.number_input("出力間隔 step [m]", value=0.50, step=0.05, format="%.2f")
 
-        # 横方向の原点
         center_by_section_cl = st.checkbox("横断内のCL縦線を 0 に（自動・推奨）",
                                            value=bool(st.session_state.get("center_by_section_cl_ui", True)),
                                            key="center_by_section_cl_ui")
@@ -385,36 +462,45 @@ def page():
                                      ["横断CLを0に（相対）", "縦断CSVに合わせる（CL基準）", "最小を0（簡易）", "中央値を0（簡易）", "しない"],
                                      index=0, key="z_anchor_mode_ui")
 
-        # 生データバッファ
         st.session_state.setdefault("raw_sections", {})
+        st.session_state.setdefault("raw_sections_bytes", {})
+        st.session_state.setdefault("lem_horizons", {})  # 断面ごとの地層ライン保存
 
-        # No 候補
         no_choices = [d["key"] for d in (st.session_state.get("no_table") or [])]
         agg_map = {"中央値（推奨）": "median", "下包絡（最小）": "lower", "上包絡（最大）": "upper"}
 
-        # 取り込み
         if xs_files:
             for f in xs_files:
                 with st.expander(f"割当：{f.name}", expanded=False):
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + f.name.split(".")[-1])
                     tmp.write(f.getbuffer()); tmp.flush(); tmp.close()
 
+                    # バイトを保存（LEM①で再利用可能）
+                    st.session_state.raw_sections_bytes[f.name] = bytes(f.getbuffer())
+
                     layer_name = None
+                    geology_layers: List[str] = []
+                    cl_hint_layers = []
                     if f.name.lower().endswith(".dxf"):
                         try:
                             scan_layers = list_layers(tmp.name)
+                            all_layer_names = [L.name for L in scan_layers]
                             layer_name = st.selectbox("横断レイヤ（任意／未選択=自動）",
-                                                      ["（未選択）"] + [L.name for L in scan_layers])
+                                                      ["（未選択）"] + all_layer_names)
                             if layer_name == "（未選択）":
                                 layer_name = None
                             cl_hint_layers = st.multiselect("CL縦線レイヤ（任意）",
-                                                            [L.name for L in scan_layers], default=[])
+                                                            all_layer_names, default=[])
+                            geology_layers = st.multiselect("地層レイヤ（任意・複数）",
+                                                            all_layer_names, default=[])
                         except Exception:
-                            cl_hint_layers = None
+                            cl_hint_layers = []
+                            geology_layers = []
                     else:
-                        cl_hint_layers = None
+                        cl_hint_layers = []
+                        geology_layers = []
 
-                    # 解析（ここは常に実行可能）
+                    # 断面本体の読み出し
                     sec = read_single_section_file(
                         tmp.name,
                         layer_name=layer_name,
@@ -447,6 +533,7 @@ def page():
                     guess_idx = no_choices.index(guess) + 1 if no_choices and guess in no_choices else 0
                     sel = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=guess_idx)
 
+                    # 保存
                     st.session_state.raw_sections[f.name] = {
                         "oz_raw": oz_raw,
                         "guess_no": sel if sel != "（未選択）" else None,
@@ -454,8 +541,46 @@ def page():
                         "o0_from_section": u0,
                     }
 
+                    # 地層レイヤの読み出し（ezdxf が無い場合は案内してスキップ）
+                    geology_over: Dict[str, np.ndarray] = {}
+                    if geology_layers:
+                        doc = _load_doc_from_path(tmp.name)  # None のときは未対応
+                        if doc is None:
+                            st.info("地層レイヤの抽出には ezdxf が必要です。requirements.txt に 'ezdxf' を追記してください。")
+                        else:
+                            msp = doc.modelspace()
+                            for lay in geology_layers:
+                                segs = []
+                                for e in msp.query("LINE,LWPOLYLINE,SPLINE"):
+                                    if e.dxf.layer != lay:
+                                        continue
+                                    arr = _poly_vertices(e)
+                                    if arr is None or len(arr) < 2:
+                                        continue
+                                    segs.append(arr)
+                                if not segs:
+                                    continue
+                                # XY→(offset,elev) 変換
+                                oz_list = []
+                                for sgm in segs:
+                                    oz_l = _to_section_oz(
+                                        sgm, axis=axis_mode,
+                                        off_scale=float(offset_scale),
+                                        z_scale=float(elev_scale),
+                                        flip_o=bool(st.session_state.get("flip_o_ui", False)),
+                                        flip_z=bool(st.session_state.get("flip_z_ui", False)),
+                                        u0=u0 if center_by_section_cl else None,
+                                    )
+                                    if len(oz_l) >= 2: oz_list.append(oz_l)
+                                if oz_list:
+                                    merged = _merge_segments(oz_list, step=float(target_step))
+                                    geology_over[lay] = merged
+                            # 断面キーに保存（LEM①へ即連携）
+                            if geology_over:
+                                st.session_state.lem_horizons[f.name] = geology_over
+
+                    # プレビュー
                     if show_2d:
-                        # プレビュー（倍率・反転を反映）
                         o = o_raw * float(offset_scale); z = z_raw * float(elev_scale)
                         if st.session_state.get("flip_o_ui", False): o *= -1.0
                         if st.session_state.get("flip_z_ui", False): z *= -1.0
@@ -465,13 +590,17 @@ def page():
                             fig2.add_trace(go.Scatter(x=[u0*float(offset_scale), u0*float(offset_scale)],
                                                       y=[float(np.nanmin(z)), float(np.nanmax(z))],
                                                       mode="lines", name="CL", line=dict(width=1, dash="dot", color="#8AA0FF")))
-                        fig2.update_layout(height=260, margin=dict(l=10,r=10,t=10,b=10),
+                        # 地層レイヤの重ね描き
+                        if geology_over:
+                            for nm, arr in geology_over.items():
+                                fig2.add_trace(go.Scatter(x=arr[:,0], y=arr[:,1], mode="lines",
+                                                          name=f"層:{nm}", line=dict(width=2)))
+                        fig2.update_layout(height=300, margin=dict(l=10,r=10,t=10,b=10),
                                            xaxis_title="offset [m]", yaxis_title="elev [m]",
                                            paper_bgcolor="#0f1115", plot_bgcolor="#0f1115")
                         fig2.update_xaxes(gridcolor="#2a2f3a"); fig2.update_yaxes(gridcolor="#2a2f3a")
                         st.plotly_chart(fig2, use_container_width=True)
 
-        # 再計算（割当を確定）
         if st.button("変更を適用（再計算）", type="primary"):
             try:
                 _build_assigned_from_raw()
@@ -509,12 +638,10 @@ def page():
             X, Y, Z = _xs_to_world3D(P, n, oz_plot, z_scale=z_scale)
             fig.add_trace(go.Scatter3d(x=X, y=Y, z=Z, mode="lines", name=f"{rec['no_key']}",
                                        line=dict(width=5, color="#FFFFFF"), opacity=0.98))
-            # 基線
             omin, omax = float(np.min(oz_plot[:,0])), float(np.max(oz_plot[:,0]))
             Xb, Yb, Zb = _xs_to_world3D(P, n, np.array([[omin,0.0],[omax,0.0]]), z_scale=z_scale)
             fig.add_trace(go.Scatter3d(x=Xb, y=Yb, z=Zb, mode="lines", showlegend=False,
                                        line=dict(width=2, color="#777777")))
-            # 縦ポール
             zmin, zmax = float(np.min(oz_plot[:,1]))*z_scale, float(np.max(oz_plot[:,1]))*z_scale
             Xp, Yp, Zp = _xs_to_world3D(P, n, np.array([[0.0, zmin], [0.0, zmax]]), z_scale=1.0)
             fig.add_trace(go.Scatter3d(x=Xp, y=Yp, z=Zp, mode="lines", showlegend=False,
