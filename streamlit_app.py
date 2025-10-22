@@ -31,11 +31,13 @@ st.title("🪨 Stabi – 斜面安定解析ビューワー")
 # ===============================================================
 PAGES = {}
 
+# ① 新ビューア（DXF取り込み→Noスナップ→3D配置＋LEM連携）
+#    ※ こちらを「DXF取り込み・プレビュー」の既定ページにします
 try:
-    from stabi_viz import plan_preview
-    PAGES["DXF取り込み・プレビュー"] = plan_preview.page
+    from stabi_viz import plan_preview_upload
+    PAGES["DXF取り込み・プレビュー"] = plan_preview_upload.page
 except Exception as e:
-    st.sidebar.warning(f"plan_preview 読み込み失敗: {e}")
+    st.sidebar.warning(f"plan_preview_upload 読み込み失敗: {e}")
 
 try:
     from stabi_viz import plan_preview_upload
