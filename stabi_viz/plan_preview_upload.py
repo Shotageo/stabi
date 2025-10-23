@@ -138,12 +138,14 @@ def _to_section_oz(seg: np.ndarray, *, axis="X=offset/Y=elev",
         o = uniq_o
     return np.column_stack([o, z])
 
-# ── ロバスト結合（短片除外＋ビン中央値＋ローリング中央値）
-def _merge_segments_robust(
+# ── 地層のロバスト結合（短片除外＋分位集約＋平滑化）
+def _merge_segments_geo(
     segments: List[np.ndarray],
+    *,
     step: float = 0.50,
     min_span: float = 5.0,   # 短い縦棒などは除外
-    roll: int = 7            # 平滑化（奇数）
+    roll: int = 7,           # 平滑化（奇数）
+    mode: str = "中央値（ロバスト）"  # / 上包絡（90%） / 下包絡（10%） / 最長曲線（最大スパン）
 ) -> np.ndarray:
     keep = []
     for seg in segments:
@@ -158,13 +160,29 @@ def _merge_segments_robust(
             keep.append(seg)
     if not keep:
         return np.zeros((0, 2), float)
+
+    if mode.startswith("最長"):
+        seg = max(keep, key=lambda s: float(s[:,0].max() - s[:,0].min()))
+        o = np.arange(seg[:,0].min(), seg[:,0].max() + step/2.0, step)
+        z = np.interp(o, seg[:,0], seg[:,1])
+        if int(roll) >= 3:
+            z = pd.Series(z).rolling(int(roll), center=True, min_periods=1).median().to_numpy()
+        return np.column_stack([o, z])
+
     arr = np.vstack(keep)
     o_min = float(arr[:,0].min())
     bins = np.floor((arr[:,0] - o_min) / float(step)).astype(int)
     df = pd.DataFrame({"bin": bins, "z": arr[:,1]})
-    med = df.groupby("bin")["z"].median()
-    o = o_min + med.index.to_numpy(dtype=float) * float(step)
-    z = med.to_numpy(dtype=float)
+
+    if mode.startswith("上"):
+        agg = df.groupby("bin")["z"].quantile(0.90)   # 上側 90% 分位
+    elif mode.startswith("下"):
+        agg = df.groupby("bin")["z"].quantile(0.10)   # 下側 10% 分位
+    else:
+        agg = df.groupby("bin")["z"].median()
+
+    o = o_min + agg.index.to_numpy(dtype=float) * float(step)
+    z = agg.to_numpy(dtype=float)
     if int(roll) >= 3:
         z = pd.Series(z).rolling(int(roll), center=True, min_periods=1).median().to_numpy()
     return np.column_stack([o, z])
@@ -307,7 +325,7 @@ def _build_assigned_from_raw():
 # 画面本体
 
 def page():
-    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（レイヤ選択改善＋地層選択・ロバスト化）")
+    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（地層ロバスト集約付き）")
 
     # ========== Step 1：平面 ==========
     with st.expander("Step 1｜平面（中心線＋No.ラベル＋測点円）", expanded=True):
@@ -489,12 +507,14 @@ def page():
                                      ["横断CLを0に（相対）", "縦断CSVに合わせる（CL基準）", "最小を0（簡易）", "中央値を0（簡易）", "しない"],
                                      index=0, key="z_anchor_mode_ui")
 
-        # 地層ラインの前処理パラメータ（短片除外＋平滑化）
+        # 地層ラインの前処理パラメータ（短片除外＋平滑化＋モード）
         geol_min_span = st.number_input("地層: 短片除外の最小スパン [m]",
                                         value=5.0, step=0.5,
                                         help="この長さ未満の線分（ボーリング位置などの縦棒）は地層として集約しません。")
         geol_roll_win = st.slider("地層: 平滑化（ローリング中央値の窓）",
                                   min_value=1, max_value=21, value=7, step=2)
+        geol_agg_mode = st.selectbox("地層: 集約モード",
+                                     ["中央値（ロバスト）", "上包絡（90%）", "下包絡（10%）", "最長曲線（最大スパン）"])
 
         st.session_state.setdefault("raw_sections", {})
         st.session_state.setdefault("raw_sections_bytes", {})
@@ -612,11 +632,12 @@ def page():
                                     )
                                     if len(oz_l) >= 2: oz_list.append(oz_l)
                                 if oz_list:
-                                    merged = _merge_segments_robust(
+                                    merged = _merge_segments_geo(
                                         oz_list,
                                         step=float(target_step),
                                         min_span=float(geol_min_span),
-                                        roll=int(geol_roll_win)
+                                        roll=int(geol_roll_win),
+                                        mode=geol_agg_mode
                                     )
                                     if len(merged) > 0:
                                         geology_over[lay] = merged
