@@ -1,4 +1,4 @@
-# stabi_viz/plan_preview_upload.py
+# stabi_viz/plan_preview_upload.py  — 2025-10-24 full replace
 from __future__ import annotations
 
 import hashlib
@@ -11,15 +11,14 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ──────────────────────────────────────────────────────────────
-# LEM（フォールバック付き）
+# LEM（フォールバック付き：ライブラリが無くてもプレビューは動く）
 try:
-    from stabi_core.stabi_lem import compute_min_circle  # 実装済があれば使用
+    from stabi_core.stabi_lem import compute_min_circle  # 既存実装があれば使用
     _LEM_OK = True
 except Exception:
     _LEM_OK = False
 
     def compute_min_circle(cfg):
-        """最小円弧のダミー（プレビュー用）"""
         oz = np.asarray(cfg.get("section"))
         if oz is None or oz.size == 0:
             return {"fs": 1.10, "circle": {"oc": 0.0, "zc": 0.0, "R": 10.0}}
@@ -29,7 +28,7 @@ except Exception:
         return {"fs": 1.12, "circle": {"oc": oc, "zc": zc, "R": R}, "meta": {"fallback": True}}
 
 # ──────────────────────────────────────────────────────────────
-# DXF/CSV ユーティリティ（既存）
+# DXF/CSV ユーティリティ
 from stabi_io.dxf_sections import (
     list_layers,
     read_centerline,
@@ -44,14 +43,12 @@ from stabi_io.dxf_sections import (
 # ──────────────────────────────────────────────────────────────
 # 幾何ヘルパ
 def _tangent_normal(centerline: np.ndarray, s: float):
-    """中心線 cl 上の距離 s の点 P と、接線 t、法線 n を返す"""
     if centerline.shape[0] < 2:
         return centerline[0], np.array([1.0, 0.0]), np.array([0.0, 1.0])
     segs = np.diff(centerline, axis=0)
     lens = np.linalg.norm(segs, axis=1)
     cum = np.r_[0.0, np.cumsum(lens)]
-    L = float(cum[-1])
-    s = float(np.clip(s, 0.0, L))
+    s = float(np.clip(s, 0.0, cum[-1]))
     i = int(np.searchsorted(cum, s, side="right") - 1)
     i = max(0, min(i, len(segs) - 1))
     Li = lens[i] if lens[i] > 0 else 1.0
@@ -63,7 +60,6 @@ def _tangent_normal(centerline: np.ndarray, s: float):
 
 
 def _xs_to_world3D(P: np.ndarray, n: np.ndarray, oz: np.ndarray, z_scale: float = 1.0):
-    """横断座標 (o,z) を世界座標 (X,Y,Z) に射影"""
     X = P[0] + oz[:, 0] * n[0]
     Y = P[1] + oz[:, 0] * n[1]
     Z = oz[:, 1] * float(z_scale)
@@ -111,7 +107,6 @@ def _load_doc_from_path(path: str):
 
 
 def _poly_vertices(e) -> Optional[np.ndarray]:
-    """DXF エンティティ → 2D ポリライン座標"""
     try:
         if e.dxftype() == "LINE":
             p0 = e.dxf.start
@@ -138,7 +133,7 @@ def _to_section_oz(
     flip_z=False,
     u0: Optional[float] = None,
 ) -> np.ndarray:
-    """平面XY → 断面(o,z) に変換（忠実モードでも使用。並べ替え以外は加工しない）"""
+    """平面XY → 断面(o,z) に変換（忠実モード：並べ替え以外は加工しない）"""
     if axis.startswith("X=elev"):
         o = seg[:, 1].astype(float) * off_scale
         z = seg[:, 0].astype(float) * z_scale
@@ -151,25 +146,24 @@ def _to_section_oz(
         z *= -1.0
     if u0 is not None:
         o = o - float(u0) * float(off_scale)
-    # x(=o) で昇順に並べ替え（CAD値は保持）
+    # o で昇順、同一 o は平均化（可視化安定用）
     idx = np.argsort(o)
     o = o[idx]
     z = z[idx]
-    # 同一oが多数ある場合は平均化（可視化安定用・値の破壊を避ける）
     if len(o) >= 2:
-        uniq_o, inv = np.unique(np.round(o, 6), return_inverse=True)
-        acc = np.zeros_like(uniq_o)
-        cnt = np.zeros_like(uniq_o)
+        uniq, inv = np.unique(np.round(o, 6), return_inverse=True)
+        acc = np.zeros_like(uniq)
+        cnt = np.zeros_like(uniq)
         for i, j in enumerate(inv):
             acc[j] += z[i]
             cnt[j] += 1
         z = acc / np.maximum(cnt, 1)
-        o = uniq_o
+        o = uniq
     return np.column_stack([o, z])
 
 
 def _filter_near_vertical(oz: np.ndarray, eps_o: float = 0.02) -> np.ndarray:
-    """ほぼ縦棒（|Δo|<eps）を除去。値はなるべく温存"""
+    """ほぼ縦棒（|Δo|<eps）を除去（値の破壊最小）"""
     if oz is None or len(oz) < 2:
         return oz
     o = oz[:, 0]
@@ -184,21 +178,14 @@ def _filter_near_vertical(oz: np.ndarray, eps_o: float = 0.02) -> np.ndarray:
     return np.column_stack([o[keep], z[keep]])
 
 
-def _hspan(arr: np.ndarray) -> float:
-    if arr is None or len(arr) == 0:
-        return 0.0
-    return float(np.max(arr[:, 0]) - np.min(arr[:, 0]))
-
-
 def _qa_delta_metrics(g: np.ndarray, b: np.ndarray, step: float = 0.5) -> Dict[str, float]:
-    """GS(=g) と BNDR(=b) の Δz を等間隔グリッドで評価（元データは変更しない）"""
     if g is None or b is None or len(g) < 2 or len(b) < 2:
         return {}
     o_min = max(float(np.min(g[:, 0])), float(np.min(b[:, 0])))
     o_max = min(float(np.max(g[:, 0])), float(np.max(b[:, 0])))
     if o_max <= o_min:
         return {}
-    o = np.arange(o_min, o_max + step / 2.0, step)
+    o = np.arange(o_min, o_max + step / 2, step)
     zg = np.interp(o, g[:, 0], g[:, 1])
     zb = np.interp(o, b[:, 0], b[:, 1])
     dz = zg - zb
@@ -207,7 +194,7 @@ def _qa_delta_metrics(g: np.ndarray, b: np.ndarray, step: float = 0.5) -> Dict[s
         "dz_max": float(np.max(dz)),
         "dz_min": float(np.min(dz)),
         "dz_mean": float(np.mean(dz)),
-        "dz_std": float(float(np.std(dz))),
+        "dz_std": float(np.std(dz)),
     }
 
 
@@ -251,33 +238,34 @@ def _ensure_plan_layers():
 
 
 def _rebuild_s_map_from_raw() -> Dict[str, float]:
-    """ラベル or 円の座標 → 中心線距離 s を再投影"""
+    """No → s の再投影（円があれば円、無ければラベルで CL に直投影）"""
     s_map: Dict[str, float] = {}
     if "centerline_raw" not in st.session_state or "no_table" not in st.session_state:
         return s_map
     cl_raw = st.session_state.centerline_raw
     k = float(st.session_state.get("unit_scale_plan_ui", 1.0))
+    cl = cl_raw * k
+
+    # ラベル位置（スケール済み）
     labels = st.session_state.get("labels_raw") or []
-    label_pos: Dict[str, np.ndarray] = {lab["key"]: np.array(lab["pos"], float) for lab in labels}
+    label_pos = {lab["key"]: np.array(lab["pos"], float) * k for lab in labels}
+
     for row in st.session_state.no_table or []:
         key = row["key"]
         circ_raw = np.array(row["circle_xy"], float) if row.get("circle_xy") is not None else None
-        src = circ_raw if src is not None else label_pos.get(key) if (src := None) is None else src  # noqa: E701
-        if src is None:
-            s_map[key] = float(row.get("s", 0.0)) * k
+        src = np.array(circ_raw, float) * k if circ_raw is not None else label_pos.get(key)
+        if src is not None:
+            s_raw, _ = project_point_to_polyline(cl, src)
+            s_map[key] = float(s_raw)
         else:
-            s_raw, _ = project_point_to_polyline(cl_raw, src)
-            s_map[key] = float(s_raw) * k
+            # 最後の手段：保存されている s（Step1 時点）を使う
+            s_map[key] = float(row.get("s", 0.0))
     return s_map
 
 
 def _build_assigned_from_raw():
-    """割当を再構築（倍率・原点合わせ・Zアンカーなどを反映）"""
-    if "raw_sections" not in st.session_state:
-        return
-    if "no_table" not in st.session_state:
-        return
-    if "centerline_raw" not in st.session_state:
+    """割当を再構築（倍率・原点合わせ・Zアンカー等を反映）"""
+    if "raw_sections" not in st.session_state or "no_table" not in st.session_state or "centerline_raw" not in st.session_state:
         return
 
     unit_scale_plan = float(st.session_state.get("unit_scale_plan_ui", 1.0))
@@ -305,10 +293,18 @@ def _build_assigned_from_raw():
     z_anchor_mode = st.session_state.get("z_anchor_mode_ui", "横断CLを0に（相対）")
 
     assigned: Dict[str, Dict] = {}
-    for fname, rec in st.session_state.get("raw_sections", {}).items():
-        sel = rec.get("no_key") or rec.get("guess_no")
-        if not sel or sel not in s_map:
+    for key, rec in st.session_state.get("raw_sections", {}).items():
+        sel = rec.get("no_key")
+        manual_s = rec.get("manual_s")  # 直接入力 s[m]（任意）
+        if sel in s_map:
+            s = float(s_map[sel])
+        elif manual_s is not None:
+            s = float(manual_s)
+        else:
+            # s が決まらないと立体配置できない
+            st.warning(f"[{key}] は No も s[m] も未指定のため配置できません。")
             continue
+
         oz_raw = np.asarray(rec["oz_raw"], float)
         if oz_raw.ndim != 2 or oz_raw.shape[1] < 2:
             continue
@@ -319,14 +315,14 @@ def _build_assigned_from_raw():
         if flip_z:
             z *= -1.0
 
-        s = float(s_map[sel])
+        # CL/円/中央値/手動の順で 0 オフセット
         P, _, n = _tangent_normal(cl, s)
 
         if center_by_section_cl and (rec.get("o0_from_section") is not None):
             o0 = float(rec["o0_from_section"]) * offset_scale
             o = o - o0
         else:
-            circ_raw = no_to_circle_raw.get(sel)
+            circ_raw = no_to_circle_raw.get(sel) if sel else None
             if center_by_circle and circ_raw is not None:
                 circ_scaled = circ_raw * unit_scale_plan
                 oc0 = float(np.dot(circ_scaled - P, n))
@@ -340,7 +336,7 @@ def _build_assigned_from_raw():
         idx = np.argsort(o)
         oo = o[idx]
         zz = z[idx]
-        z0 = float(np.interp(0.0, oo, zz)) if len(oo) >= 2 else float(zz[0]) if len(zz) else 0.0
+        z0 = float(np.interp(0.0, oo, zz)) if len(oo) >= 2 else (float(zz[0]) if len(zz) else 0.0)
         if z_anchor_mode.startswith("横断CLを0に"):
             z = z - z0
         elif z_anchor_mode.startswith("縦断CSVに合わせる"):
@@ -351,7 +347,7 @@ def _build_assigned_from_raw():
         elif z_anchor_mode == "中央値を0（簡易）":
             z = z - float(np.median(z))
 
-        assigned[fname] = {"oz": np.column_stack([o, z]).astype(np.float32), "no_key": sel, "s": s}
+        assigned[key] = {"oz": np.column_stack([o, z]).astype(np.float32), "no_key": sel, "s": s}
 
     st.session_state.centerline = cl.astype(np.float32)
     st.session_state._assigned = assigned
@@ -362,7 +358,7 @@ def _build_assigned_from_raw():
 def page():
     st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（CAD忠実モード対応）")
 
-    # ========== Step 1：平面 ==========
+    # ===== Step 1: 平面 =====
     with st.expander("Step 1｜平面（中心線＋No.ラベル＋測点円）", expanded=True):
         plan_up = st.file_uploader("平面DXF（1ファイル）", type=["dxf"], accept_multiple_files=False, key="plan")
 
@@ -380,7 +376,6 @@ def page():
         find_radius = st.number_input("ラベル→円 紐付け距離しきい[m]", value=12.0, step=1.0, format="%.1f")
 
         _ensure_plan_layers()
-
         layers = st.session_state.get("plan_layers") or []
         if layers:
             layer_names = [L.name for L in layers]
@@ -398,7 +393,6 @@ def page():
             )
             st.session_state.plan_layer_choice = layer_names[int(idx)]
 
-            # 測点ラベル/円レイヤ（未選択スタート）＋全選択/全解除
             c1, c2 = st.columns(2)
             with c1:
                 current = st.session_state.get("plan_label_layers") or []
@@ -406,31 +400,29 @@ def page():
                     "測点ラベルレイヤ（TEXT/MTEXT）", layer_names, default=current, key="plan_label_layers_ms"
                 )
                 st.session_state.plan_label_layers = ms
-                colx = st.columns([1, 1, 4])
-                with colx[0]:
+                b = st.columns([1, 1, 4])
+                with b[0]:
                     if st.button("全選択", key="lab_all"):
                         st.session_state.plan_label_layers = layer_names
                         st.session_state.plan_label_layers_ms = layer_names
-                with colx[1]:
+                with b[1]:
                     if st.button("全解除", key="lab_none"):
                         st.session_state.plan_label_layers = []
                         st.session_state.plan_label_layers_ms = []
-
             with c2:
                 current2 = st.session_state.get("plan_circle_layers") or []
                 ms2 = st.multiselect("測点円レイヤ（CIRCLE）", layer_names, default=current2, key="plan_circle_layers_ms")
                 st.session_state.plan_circle_layers = ms2
-                coly = st.columns([1, 1, 4])
-                with coly[0]:
+                b2 = st.columns([1, 1, 4])
+                with b2[0]:
                     if st.button("全選択", key="circ_all"):
                         st.session_state.plan_circle_layers = layer_names
                         st.session_state.plan_circle_layers_ms = layer_names
-                with coly[1]:
+                with b2[1]:
                     if st.button("全解除", key="circ_none"):
                         st.session_state.plan_circle_layers = []
                         st.session_state.plan_circle_layers_ms = []
 
-            # 抽出
             if st.button("中心線＋No.＋円 抽出を実行", type="primary"):
                 if not st.session_state.plan_label_layers and not st.session_state.plan_circle_layers:
                     st.warning("少なくとも『測点ラベル』または『測点円』のレイヤを1つ以上選んでください。")
@@ -441,9 +433,7 @@ def page():
                             tmp.flush()
                             st.session_state._plan_path = tmp.name
 
-                        cl_raw = read_centerline(
-                            tmp.name, allow_layers=[st.session_state.plan_layer_choice], unit_scale=1.0
-                        )
+                        cl_raw = read_centerline(tmp.name, allow_layers=[st.session_state.plan_layer_choice], unit_scale=1.0)
                         if cl_raw is None or len(cl_raw) < 2:
                             cl_raw = read_centerline(tmp.name, allow_layers=None, unit_scale=1.0)
                             st.warning("選択レイヤで中心線が見つからなかったため、全レイヤから探索しました。")
@@ -503,7 +493,7 @@ def page():
         else:
             st.info("DXFを読み込み、『このファイルを読み込む/更新』を押すとレイヤ一覧が表示されます。")
 
-    # ========== Step 1.5：縦断 ==========
+    # ===== Step 1.5: 縦断 =====
     with st.expander("Step 1.5｜縦断（中心線の標高）を設定（任意）", expanded=False):
         up = st.file_uploader("縦断CSV（s,z）", type=["csv"])
         s_scale = st.number_input("s の倍率", value=1.0, step=0.001, format="%.3f")
@@ -522,7 +512,7 @@ def page():
             prof = st.session_state.profile_s
             st.line_chart({"z": prof[:, 1]}, height=120)
 
-    # ========== Step 2：横断 ==========
+    # ===== Step 2: 横断 =====
     with st.expander("Step 2｜横断を読み込み → 集約/忠実モード → No割当（地層も選択可）", expanded=True):
         xs_files = st.file_uploader("横断DXF/CSV（複数可）", type=["dxf", "csv"], accept_multiple_files=True, key="xs")
 
@@ -548,7 +538,7 @@ def page():
         exact_mode = st.toggle("CAD忠実モード（Exact / 再標本化・平滑なし）", value=True)
         show_2d = st.checkbox("2Dプレビューを表示", value=True)
 
-        # 従来集約モード（忠実モードOFFのときだけ使う）
+        # 従来集約モード（忠実モードOFFのときのみ）
         agg_mode = st.selectbox("複数線の集約（断面本体・忠実モードOFF時）", ["中央値（推奨）", "下包絡（最小）", "上包絡（最大）"])
         smooth_k = st.slider("平滑ウィンドウ（奇数、0で無効）", 0, 21, 3, step=2)
         max_slope = st.slider("最大許容勾配 |dz/dx|（0で無効）", 0.0, 30.0, 0.0, step=0.5)
@@ -562,12 +552,8 @@ def page():
             value=bool(st.session_state.get("center_by_circle_ui", False)),
             key="center_by_circle_ui",
         )
-        center_o = st.checkbox(
-            "オフセット中央値を0に（フォールバック）", value=bool(st.session_state.get("center_o_ui", False)), key="center_o_ui"
-        )
-        user_center_offset = st.number_input(
-            "（手動）道路中心オフセット値", value=float(st.session_state.get("user_center_offset_ui", 0.0)), step=0.1, format="%.3f", key="user_center_offset_ui"
-        )
+        center_o = st.checkbox("オフセット中央値を0に（フォールバック）", value=bool(st.session_state.get("center_o_ui", False)), key="center_o_ui")
+        user_center_offset = st.number_input("（手動）道路中心オフセット値", value=float(st.session_state.get("user_center_offset_ui", 0.0)), step=0.1, format="%.3f", key="user_center_offset_ui")
 
         z_anchor_mode = st.selectbox(
             "高さの合わせ方（Zアンカー）",
@@ -579,7 +565,7 @@ def page():
         # 忠実モードの微調整
         eps_o = st.number_input("忠実モード：縦棒除去の閾値 |Δo|< [m]", value=0.02, step=0.01, format="%.2f")
 
-        # 地層ラインの既定パラメータ（従来モード用）
+        # 地層ライン（従来モード用の既定）
         geol_min_span = st.number_input("地層: 短片除外の最小スパン [m]（忠実モードでは無効）", value=5.0, step=0.5)
         geol_roll_win = st.slider("地層: 平滑化（ローリング中央値の窓）（忠実モードでは無効）", min_value=1, max_value=21, value=7, step=2)
         geol_agg_mode = st.selectbox("地層: 既定の集約モード（忠実モードでは無効）", ["中央値（ロバスト）", "上包絡（90%）", "下包絡（10%）", "最長曲線（最大スパン）"])
@@ -587,7 +573,6 @@ def page():
         st.session_state.setdefault("raw_sections", {})
         st.session_state.setdefault("raw_sections_bytes", {})
         st.session_state.setdefault("lem_horizons", {})
-        st.session_state.setdefault("geol_layer_modes", {})  # 旧来のレイヤ別上書き保存
 
         no_choices = [d["key"] for d in (st.session_state.get("no_table") or [])]
         agg_map = {"中央値（推奨）": "median", "下包絡（最小）": "lower", "上包絡（最大）": "upper"}
@@ -602,12 +587,12 @@ def page():
 
                     st.session_state.raw_sections_bytes[f.name] = bytes(f.getbuffer())
 
-                    # レイヤ選択 UI
+                    # レイヤ選択
                     layer_name = None
                     geology_layers: List[str] = []
-                    cl_hint_layers = []
+                    cl_hint_layers: List[str] = []
+                    all_layer_names: List[str] = []
 
-                    all_layer_names = []
                     if f.name.lower().endswith(".dxf"):
                         try:
                             scan_layers = list_layers(tmp.name)
@@ -618,13 +603,9 @@ def page():
                             cl_hint_layers = st.multiselect("CL縦線レイヤ（任意）", all_layer_names, default=[])
                             geology_layers = st.multiselect("地層レイヤ（任意・複数）", all_layer_names, default=[])
                         except Exception:
-                            cl_hint_layers = []
-                            geology_layers = []
-                    else:
-                        cl_hint_layers = []
-                        geology_layers = []
+                            pass
 
-                    # CL縦線の自動検出（u0）
+                    # u0（CL縦線 or 自動）検出
                     u0 = None
                     try:
                         if f.name.lower().endswith(".dxf") and center_by_section_cl:
@@ -632,7 +613,7 @@ def page():
                     except Exception:
                         u0 = None
 
-                    # 忠実モード
+                    # ===== 忠実モード（DXFのみ） =====
                     if exact_mode and f.name.lower().endswith(".dxf"):
                         doc = _load_doc_from_path(tmp.name)
                         if doc is None:
@@ -644,7 +625,7 @@ def page():
                         except Exception:
                             ents = [e for e in msp if e.dxftype() in ("LINE", "LWPOLYLINE", "SPLINE")]
 
-                        # レイヤ→候補ポリライン（XY）
+                        # レイヤ→ポリライン
                         layer_to_polys: Dict[str, List[np.ndarray]] = {}
                         for e in ents:
                             arr = _poly_vertices(e)
@@ -652,7 +633,7 @@ def page():
                                 continue
                             layer_to_polys.setdefault(e.dxf.layer, []).append(arr)
 
-                        # 断面候補（横断レイヤが未指定なら全レイヤを候補に）
+                        # 断面候補（横断レイヤ未指定なら全レイヤ）
                         sec_cands: List[Tuple[str, np.ndarray]] = []
                         targets_for_sec = [layer_name] if layer_name else list(layer_to_polys.keys())
                         for lay in targets_for_sec:
@@ -662,94 +643,174 @@ def page():
                             st.warning("断面候補が見つかりませんでした。横断レイヤを指定してみてください。")
                             continue
 
-                        # デフォルトは最大水平スパン
                         def _span_xy(a: np.ndarray) -> float:
                             return float(np.max(a[:, 0]) - np.min(a[:, 0]))
-                        def_idx = int(np.argmax([_span_xy(a) for _, a in sec_cands]))
+
                         labels_sec = [f"{i}: {lay}  span={_span_xy(a):.2f}" for i, (lay, a) in enumerate(sec_cands)]
-                        sel_idx = st.selectbox("忠実モード：『断面（地表）』に採用するポリライン", list(range(len(sec_cands))),
-                                               index=def_idx, format_func=lambda i: labels_sec[i],
-                                               key=f"exact_sec_{f.name}")
+                        def_idx = int(np.argmax([_span_xy(a) for _, a in sec_cands]))
 
-                        sec_xy = sec_cands[sel_idx][1]
-                        sec_oz = _to_section_oz(sec_xy, axis=axis_mode, off_scale=float(offset_scale),
-                                                z_scale=float(elev_scale), flip_o=flip_o, flip_z=flip_z, u0=u0)
-                        sec_oz = _filter_near_vertical(sec_oz, eps_o=float(eps_o))
+                        # ★ 地表（断面）を複数選択可能に
+                        sel_sec_multi = st.multiselect(
+                            "忠実モード：『地表（断面）』に採用するポリライン（複数可）",
+                            list(range(len(sec_cands))),
+                            default=[def_idx],
+                            format_func=lambda i: labels_sec[i],
+                            key=f"exact_sec_multi_{f.name}",
+                        )
 
-                        # 地層候補（指定レイヤ＋同レイヤ可）：複数選択
+                        # 地層候補（複数）
                         geo_cands: List[Tuple[str, int, np.ndarray]] = []
                         pick_layers = geology_layers[:]  # copy
-                        # 断面と地層が同一レイヤのケースに対応
                         if layer_name and (layer_name not in pick_layers):
-                            pick_layers.append(layer_name)
+                            pick_layers.append(layer_name)  # 同一レイヤの境界も拾いたいケース
                         for lay in pick_layers:
                             for j, arr in enumerate(layer_to_polys.get(lay, [])):
                                 geo_cands.append((lay, j, arr))
                         labels_geo = [f"{lay}#[{j}]  span={_span_xy(arr):.2f}" for (lay, j, arr) in geo_cands]
-                        sel_geo = st.multiselect("忠実モード：『地層』に採用するポリライン（複数可）",
-                                                 list(range(len(geo_cands))),
-                                                 default=[], format_func=lambda i: labels_geo[i],
-                                                 key=f"exact_geo_{f.name}")
+                        sel_geo = st.multiselect(
+                            "忠実モード：『地層』に採用するポリライン（複数可）",
+                            list(range(len(geo_cands))),
+                            default=[],
+                            format_func=lambda i: labels_geo[i],
+                            key=f"exact_geo_{f.name}",
+                        )
 
-                        geology_over: Dict[str, np.ndarray] = {}
-                        for k in sel_geo:
-                            lay, j, arr = geo_cands[k]
-                            oz = _to_section_oz(arr, axis=axis_mode, off_scale=float(offset_scale),
-                                                z_scale=float(elev_scale), flip_o=flip_o, flip_z=flip_z, u0=u0)
-                            oz = _filter_near_vertical(oz, eps_o=float(eps_o))
-                            geology_over[f"{lay}#{j}"] = oz
-
-                        # No推定/選択
-                        guess = normalize_no_key(f.name) or ""
-                        guess_idx = no_choices.index(guess) + 1 if no_choices and guess in no_choices else 0
-                        sel_no = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=guess_idx)
-
-                        # プレビュー
+                        # 2D プレビュー用 figure
                         if show_2d:
                             fig2 = go.Figure()
-                            fig2.add_trace(go.Scatter(x=sec_oz[:, 0], y=sec_oz[:, 1],
-                                                      mode="lines", name="断面（忠実）",
-                                                      line=dict(width=3, color="#FFFFFF")))
-                            if u0 is not None:
-                                fig2.add_trace(
-                                    go.Scatter(x=[0, 0],
-                                               y=[float(np.nanmin(sec_oz[:, 1])), float(np.nanmax(sec_oz[:, 1]))],
-                                               mode="lines", name="CL",
-                                               line=dict(width=1, dash="dot", color="#8AA0FF"))
+
+                        # 各“地表（断面）”について個別に登録
+                        for k_idx, k in enumerate(sel_sec_multi):
+                            sec_xy = sec_cands[k][1]
+                            sec_oz = _to_section_oz(
+                                sec_xy,
+                                axis=axis_mode,
+                                off_scale=float(offset_scale),
+                                z_scale=float(elev_scale),
+                                flip_o=flip_o,
+                                flip_z=flip_z,
+                                u0=u0,
+                            )
+                            sec_oz = _filter_near_vertical(sec_oz, eps_o=float(eps_o))
+
+                            # 地層も計算（同じ選択を各断面に適用）
+                            geology_over: Dict[str, np.ndarray] = {}
+                            for k_geo in sel_geo:
+                                lay, j, arr = geo_cands[k_geo]
+                                oz = _to_section_oz(
+                                    arr,
+                                    axis=axis_mode,
+                                    off_scale=float(offset_scale),
+                                    z_scale=float(elev_scale),
+                                    flip_o=flip_o,
+                                    flip_z=flip_z,
+                                    u0=u0,
                                 )
-                            for nm, arr in geology_over.items():
-                                fig2.add_trace(go.Scatter(x=arr[:, 0], y=arr[:, 1],
-                                                          mode="lines", name=f"層:{nm}",
-                                                          line=dict(width=2, color="#FFB0A0")))
-                            fig2.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10),
-                                               xaxis_title="offset [m]", yaxis_title="elev [m]",
-                                               paper_bgcolor="#0f1115", plot_bgcolor="#0f1115")
+                                oz = _filter_near_vertical(oz, eps_o=float(eps_o))
+                                geology_over[f"{lay}#{j}"] = oz
+
+                            # No 候補＋フォールバック
+                            guess = normalize_no_key(f.name) or ""
+                            choices = ["（未選択）"] + ([guess] if (guess and guess not in no_choices) else []) + no_choices
+                            sel_no = st.selectbox(
+                                f"[{f.name} 断面#{k_idx}] 割当No.",
+                                choices,
+                                index=choices.index(guess) if guess in choices else 0,
+                                key=f"no_sel_{f.name}_{k}",
+                            )
+                            custom_no = st.text_input(
+                                f"[{f.name} 断面#{k_idx}] No. 手入力（任意）",
+                                value="",
+                                key=f"no_custom_{f.name}_{k}",
+                                placeholder="例: No.0+40 など（ラベルと一致すれば優先）",
+                            )
+                            manual_s = st.number_input(
+                                f"[{f.name} 断面#{k_idx}] No無し：中心線 s[m] を直接入力（任意）",
+                                value=0.0,
+                                min_value=0.0,
+                                step=1.0,
+                                format="%.3f",
+                                key=f"manual_s_{f.name}_{k}",
+                            )
+
+                            # 2D プレビュー
+                            if show_2d:
+                                fig2.add_trace(
+                                    go.Scatter(
+                                        x=sec_oz[:, 0],
+                                        y=sec_oz[:, 1],
+                                        mode="lines",
+                                        name=f"断面#{k_idx}",
+                                        line=dict(width=3, color="#FFFFFF"),
+                                    )
+                                )
+                                if u0 is not None:
+                                    fig2.add_trace(
+                                        go.Scatter(
+                                            x=[0, 0],
+                                            y=[float(np.nanmin(sec_oz[:, 1])), float(np.nanmax(sec_oz[:, 1]))],
+                                            mode="lines",
+                                            name=f"CL#{k_idx}",
+                                            line=dict(width=1, dash="dot", color="#8AA0FF"),
+                                        )
+                                    )
+                                for nm, arr in geology_over.items():
+                                    fig2.add_trace(
+                                        go.Scatter(
+                                            x=arr[:, 0],
+                                            y=arr[:, 1],
+                                            mode="lines",
+                                            name=f"層:{nm} (#{k_idx})",
+                                            line=dict(width=2, color="#FFB0A0"),
+                                        )
+                                    )
+
+                            # QA（Δz）— 先頭の層のみ
+                            if geology_over:
+                                first_nm = list(geology_over.keys())[0]
+                                met = _qa_delta_metrics(sec_oz, geology_over[first_nm], step=0.5)
+                                if met:
+                                    st.info(
+                                        f"Δz QA（断面#{k_idx} − 層 '{first_nm}'）: "
+                                        f"count={met['count']}  max={met['dz_max']:.3f}  "
+                                        f"min={met['dz_min']:.3f}  mean={met['dz_mean']:.3f}  std={met['dz_std']:.3f}"
+                                    )
+
+                            # 永続化（複数断面をそれぞれ個別キーで保存）
+                            sec_key = f"{f.name}#G{k}"
+                            # No の決定
+                            final_no = None
+                            if sel_no and sel_no != "（未選択）":
+                                final_no = sel_no
+                            elif custom_no.strip():
+                                final_no = custom_no.strip()
+
+                            st.session_state.raw_sections[sec_key] = {
+                                "oz_raw": sec_oz,
+                                "guess_no": final_no,
+                                "no_key": final_no,
+                                "manual_s": (None if manual_s <= 0 else float(manual_s)),
+                                "o0_from_section": 0.0,  # 忠実モードは u0 を既に引いた o
+                            }
+                            st.session_state.lem_horizons[sec_key] = geology_over
+
+                        if show_2d:
+                            fig2.update_layout(
+                                height=320,
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                xaxis_title="offset [m]",
+                                yaxis_title="elev [m]",
+                                paper_bgcolor="#0f1115",
+                                plot_bgcolor="#0f1115",
+                            )
                             fig2.update_xaxes(gridcolor="#2a2f3a")
                             fig2.update_yaxes(gridcolor="#2a2f3a")
                             st.plotly_chart(fig2, use_container_width=True)
 
-                        # QA（Δz）
-                        if geology_over:
-                            first_nm = list(geology_over.keys())[0]
-                            met = _qa_delta_metrics(sec_oz, geology_over[first_nm], step=0.5)
-                            if met:
-                                st.info(f"Δz QA（断面−層 '{first_nm}'）: "
-                                        f"count={met['count']}  max={met['dz_max']:.3f}  "
-                                        f"min={met['dz_min']:.3f}  mean={met['dz_mean']:.3f}  std={met['dz_std']:.3f}")
+                        st.success("忠実モードで取り込み（複数断面）を登録しました。")
 
-                        # 永続化
-                        st.session_state.raw_sections[f.name] = {
-                            "oz_raw": sec_oz,
-                            "guess_no": sel_no if sel_no != "（未選択）" else None,
-                            "no_key": sel_no if sel_no != "（未選択）" else None,
-                            "o0_from_section": 0.0,  # 忠実モードはu0を既に引いた o なので 0 扱い
-                        }
-                        st.session_state.lem_horizons[f.name] = geology_over
-                        st.success("忠実モードで取り込みました。")
-
-                    # 従来モード
+                    # ===== 従来モード（参考） =====
                     else:
-                        # 断面本体の読み出し（集約）
                         sec = read_single_section_file(
                             tmp.name,
                             layer_name=layer_name,
@@ -772,12 +833,14 @@ def page():
                             z_raw = sec[:, 1].astype(float)
                         oz_raw = np.column_stack([o_raw, z_raw])
 
-                        # No推定
+                        # No 候補＋フォールバック
                         guess = normalize_no_key(f.name) or ""
-                        guess_idx = no_choices.index(guess) + 1 if no_choices and guess in no_choices else 0
-                        sel = st.selectbox("割当No.", ["（未選択）"] + no_choices, index=guess_idx)
+                        choices = ["（未選択）"] + ([guess] if (guess and guess not in no_choices) else []) + no_choices
+                        sel = st.selectbox("割当No.", choices, index=choices.index(guess) if guess in choices else 0)
+                        custom_no = st.text_input("No. 手入力（任意）", value="", placeholder="例: No.1+40 など")
+                        manual_s = st.number_input("No無し：中心線 s[m] を直接入力（任意）", value=0.0, min_value=0.0, step=1.0, format="%.3f")
 
-                        # 地層（従来のロバスト集約）
+                        # 地層（従来集約）
                         geology_over: Dict[str, np.ndarray] = {}
                         if geology_layers and f.name.lower().endswith(".dxf"):
                             doc = _load_doc_from_path(tmp.name)
@@ -801,7 +864,6 @@ def page():
                                     if not segs:
                                         continue
 
-                                    # XY→(o,z)
                                     oz_list = []
                                     for sgm in segs:
                                         oz_l = _to_section_oz(
@@ -811,7 +873,7 @@ def page():
                                             z_scale=float(elev_scale),
                                             flip_o=flip_o,
                                             flip_z=flip_z,
-                                            u0=u0 if center_by_section_cl else None,
+                                            u0=None,
                                         )
                                         if len(oz_l) >= 2:
                                             oz_list.append(oz_l)
@@ -827,36 +889,29 @@ def page():
                                         if len(merged) > 0:
                                             geology_over[lay] = merged
 
-                        # 2D プレビュー
                         if show_2d:
                             fig2 = go.Figure()
-                            fig2.add_trace(
-                                go.Scatter(x=oz_raw[:, 0], y=oz_raw[:, 1],
-                                           mode="lines", name="断面", line=dict(width=3, color="#FFFFFF"))
-                            )
-                            if u0 is not None:
-                                fig2.add_trace(
-                                    go.Scatter(x=[u0 * float(offset_scale), u0 * float(offset_scale)],
-                                               y=[float(np.nanmin(oz_raw[:, 1])), float(np.nanmax(oz_raw[:, 1]))],
-                                               mode="lines", name="CL",
-                                               line=dict(width=1, dash="dot", color="#8AA0FF"))
-                                )
+                            fig2.add_trace(go.Scatter(x=oz_raw[:, 0], y=oz_raw[:, 1], mode="lines", name="断面", line=dict(width=3, color="#FFFFFF")))
                             for nm, arr in geology_over.items():
-                                fig2.add_trace(go.Scatter(x=arr[:, 0], y=arr[:, 1],
-                                                          mode="lines", name=f"層:{nm}", line=dict(width=2)))
-                            fig2.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10),
-                                               xaxis_title="offset [m]", yaxis_title="elev [m]",
+                                fig2.add_trace(go.Scatter(x=arr[:, 0], y=arr[:, 1], mode="lines", name=f"層:{nm}", line=dict(width=2)))
+                            fig2.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="offset [m]", yaxis_title="elev [m]",
                                                paper_bgcolor="#0f1115", plot_bgcolor="#0f1115")
                             fig2.update_xaxes(gridcolor="#2a2f3a")
                             fig2.update_yaxes(gridcolor="#2a2f3a")
                             st.plotly_chart(fig2, use_container_width=True)
 
-                        # 永続化
+                        final_no = None
+                        if sel and sel != "（未選択）":
+                            final_no = sel
+                        elif custom_no.strip():
+                            final_no = custom_no.strip()
+
                         st.session_state.raw_sections[f.name] = {
                             "oz_raw": oz_raw,
-                            "guess_no": sel if sel != "（未選択）" else None,
-                            "no_key": sel if sel != "（未選択）" else None,
-                            "o0_from_section": u0 if center_by_section_cl else None,
+                            "guess_no": final_no,
+                            "no_key": final_no,
+                            "manual_s": (None if manual_s <= 0 else float(manual_s)),
+                            "o0_from_section": None,
                         }
                         st.session_state.lem_horizons[f.name] = geology_over
 
@@ -867,12 +922,9 @@ def page():
             except Exception as e:
                 st.error(f"再適用エラー: {e}")
 
-        st.info(
-            f"割当済み：{len(st.session_state.get('_assigned', {}))} / "
-            f"取り込み済み：{len(st.session_state.get('raw_sections', {}))}"
-        )
+        st.info(f"割当済み：{len(st.session_state.get('_assigned', {}))} / 取り込み済み：{len(st.session_state.get('raw_sections', {}))}")
 
-    # ========== Step 3：3Dプレビュー ==========
+    # ===== Step 3: 3D プレビュー =====
     with st.expander("Step 3｜3Dプレビュー（立体配置＋円弧の簡易表示）", expanded=True):
         can_run = ("centerline" in st.session_state) and ("_assigned" in st.session_state) and st.session_state._assigned
         if not can_run:
@@ -889,16 +941,8 @@ def page():
 
         fig = go.Figure()
         cl_plot = _decimate1d(cl, int(max_pts_cl))
-        fig.add_trace(
-            go.Scatter3d(
-                x=cl_plot[:, 0],
-                y=cl_plot[:, 1],
-                z=np.zeros(len(cl_plot)),
-                mode="lines",
-                name="Centerline",
-                line=dict(width=4, color="#A0A6B3"),
-            )
-        )
+        fig.add_trace(go.Scatter3d(x=cl_plot[:, 0], y=cl_plot[:, 1], z=np.zeros(len(cl_plot)), mode="lines",
+                                   name="Centerline", line=dict(width=4, color="#A0A6B3")))
 
         for sec_key, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
             s = float(rec["s"])
@@ -906,14 +950,12 @@ def page():
             P, t, n = _tangent_normal(cl, s)
             oz_plot = _decimate(oz, int(max_pts_xs))
             X, Y, Z = _xs_to_world3D(P, n, oz_plot, z_scale=z_scale)
-            fig.add_trace(
-                go.Scatter3d(
-                    x=X, y=Y, z=Z, mode="lines", name=f"{rec['no_key']}", line=dict(width=5, color="#FFFFFF"), opacity=0.98
-                )
-            )
+            fig.add_trace(go.Scatter3d(x=X, y=Y, z=Z, mode="lines", name=f"{rec['no_key'] or sec_key}", line=dict(width=5, color="#FFFFFF"), opacity=0.98))
+
             omin, omax = float(np.min(oz_plot[:, 0])), float(np.max(oz_plot[:, 0]))
             Xb, Yb, Zb = _xs_to_world3D(P, n, np.array([[omin, 0.0], [omax, 0.0]]), z_scale=z_scale)
             fig.add_trace(go.Scatter3d(x=Xb, y=Yb, z=Zb, mode="lines", showlegend=False, line=dict(width=2, color="#777777")))
+
             zmin, zmax = float(np.min(oz_plot[:, 1])) * z_scale, float(np.max(oz_plot[:, 1])) * z_scale
             Xp, Yp, Zp = _xs_to_world3D(P, n, np.array([[0.0, zmin], [0.0, zmax]]), z_scale=1.0)
             fig.add_trace(go.Scatter3d(x=Xp, y=Yp, z=Zp, mode="lines", showlegend=False, line=dict(width=3, color="#8888FF")))
@@ -930,18 +972,63 @@ def page():
                         X2 = P[0] + xo * n[0]
                         Y2 = P[1] + xo * n[1]
                         Z2 = zo * z_scale
-                        fig.add_trace(
-                            go.Scatter3d(
-                                x=X2, y=Y2, z=Z2, mode="lines", showlegend=False, line=dict(width=3, color="#FF9500")
-                            )
-                        )
+                        fig.add_trace(go.Scatter3d(x=X2, y=Y2, z=Z2, mode="lines", showlegend=False, line=dict(width=3, color="#FF9500")))
                 except Exception:
                     pass
 
-        fig.update_layout(
-            scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False), aspectmode="data"),
-            paper_bgcolor="#0f1115",
-            plot_bgcolor="#0f1115",
-            margin=dict(l=0, r=0, t=0, b=0),
-        )
+        fig.update_layout(scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False), aspectmode="data"),
+                          paper_bgcolor="#0f1115", plot_bgcolor="#0f1115", margin=dict(l=0, r=0, t=0, b=0))
         st.plotly_chart(fig, use_container_width=True, height=760)
+
+
+# ──────────────────────────────────────────────────────────────
+# 既存の地層集約（忠実モード OFF 用）— そのまま流用
+def _merge_segments_geo(oz_list: List[np.ndarray], step: float = 0.2, min_span: float = 5.0, roll: int = 7, mode: str = "中央値（ロバスト）") -> np.ndarray:
+    """複数断面をロバストにマージ（既存ロジック簡略版）"""
+    if not oz_list:
+        return np.empty((0, 2), float)
+
+    # すべての o 範囲を結合
+    omin = min(float(np.min(oz[:, 0])) for oz in oz_list)
+    omax = max(float(np.max(oz[:, 0])) for oz in oz_list)
+    if omax <= omin:
+        return np.empty((0, 2), float)
+    grid = np.arange(omin, omax + step / 2.0, step)
+
+    stack = []
+    for oz in oz_list:
+        if len(oz) < 2:
+            continue
+        z = np.interp(grid, oz[:, 0], oz[:, 1], left=np.nan, right=np.nan)
+        stack.append(z)
+    if not stack:
+        return np.empty((0, 2), float)
+    A = np.vstack(stack)  # n × m
+    with np.errstate(invalid="ignore"):
+        if mode.startswith("最長"):
+            # 有効データ点数が最大の系列（=実質一番長い曲線）
+            valid_counts = np.sum(~np.isnan(A), axis=0)
+            best = np.argmax(valid_counts)  # 参考：単純選択（厳密ではない）
+            z = np.nanmedian(A, axis=0)  # 安定のため中央値
+        elif mode.startswith("上包絡"):
+            z = np.nanpercentile(A, 90, axis=0)
+        elif mode.startswith("下包絡"):
+            z = np.nanpercentile(A, 10, axis=0)
+        else:
+            z = np.nanmedian(A, axis=0)
+
+    # 短片除外（NaN 部分を除く）
+    m = ~np.isnan(z)
+    if not np.any(m):
+        return np.empty((0, 2), float)
+    oz = np.column_stack([grid[m], z[m]])
+    # 簡易ローリング中央値
+    if roll and roll >= 3 and roll % 2 == 1:
+        k = roll
+        z2 = oz[:, 1].copy()
+        for i in range(len(oz)):
+            a = max(0, i - k // 2)
+            b = min(len(oz), i + k // 2 + 1)
+            z2[i] = np.median(oz[a:b, 1])
+        oz[:, 1] = z2
+    return oz
