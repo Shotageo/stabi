@@ -1,4 +1,5 @@
 # stabi_viz/plan_preview_upload.py  — 2025-10-24 full replace
+
 from __future__ import annotations
 
 import hashlib
@@ -28,7 +29,7 @@ except Exception:
         return {"fs": 1.12, "circle": {"oc": oc, "zc": zc, "R": R}, "meta": {"fallback": True}}
 
 # ──────────────────────────────────────────────────────────────
-# DXF/CSV ユーティリティ
+# DXF/CSV ユーティリティ（既存モジュール）
 from stabi_io.dxf_sections import (
     list_layers,
     read_centerline,
@@ -39,6 +40,188 @@ from stabi_io.dxf_sections import (
     normalize_no_key,
     detect_section_centerline_u,
 )
+
+# =============================================================
+# 追加ヘルパー：DXF 単位診断 / 中心線連結 / 2点法スケール
+# =============================================================
+INSUNITS_TO_M = {
+    0: 1.0,     # Unitless
+    1: 0.0254,  # Inch
+    2: 0.3048,  # Foot
+    3: 1609.344,# Mile
+    4: 0.001,   # Millimeter
+    5: 0.01,    # Centimeter
+    6: 1.0,     # Meter
+    7: 1000.0,  # Kilometer
+    10: 0.9144, # Yard
+    14: 0.1,    # Decimeter
+    15: 10.0,   # Decameter
+    16: 100.0   # Hectometer
+}
+
+
+def _load_doc_from_path(path: str):
+    """ezdxf で DXF を読む。失敗時は None。"""
+    try:
+        import ezdxf
+        return ezdxf.readfile(path)
+    except Exception:
+        return None
+
+
+def _read_insunits(doc) -> Tuple[int, float]:
+    try:
+        code = int(doc.header.get("$INSUNITS", 0))
+    except Exception:
+        code = 0
+    return code, INSUNITS_TO_M.get(code, 1.0)
+
+
+def _poly_vertices(e) -> Optional[np.ndarray]:
+    try:
+        if e.dxftype() == "LINE":
+            p0 = e.dxf.start
+            p1 = e.dxf.end
+            return np.array([[p0.x, p0.y], [p1.x, p1.y]], float)
+        if e.dxftype() == "LWPOLYLINE":
+            pts = np.array([(p[0], p[1]) for p in e.get_points("xy")], float)
+            return pts
+        if e.dxftype() == "SPLINE":
+            pts = np.array([(p.x, p.y) for p in e.approximate(300)], float)
+            return pts
+    except Exception:
+        return None
+    return None
+
+
+def _diagnose_dxf_bbox(path: str, layer_filter: Optional[List[str]] = None) -> Dict:
+    """図面の XY 外接箱・セグメント統計と INSUNITS→m の倍率を返す"""
+    doc = _load_doc_from_path(path)
+    if doc is None:
+        return {}
+    msp = doc.modelspace()
+    code, to_m = _read_insunits(doc)
+    try:
+        ents = msp.query("LINE LWPOLYLINE SPLINE")
+    except Exception:
+        ents = [e for e in msp if e.dxftype() in ("LINE", "LWPOLYLINE", "SPLINE")]
+
+    bb_min = np.array([np.inf, np.inf])
+    bb_max = -bb_min
+    seg_lens = []
+    n = 0
+    for e in ents:
+        if layer_filter and e.dxf.layer not in layer_filter:
+            continue
+        arr = _poly_vertices(e)
+        if arr is None or len(arr) < 2:
+            continue
+        bb_min = np.minimum(bb_min, np.min(arr, axis=0))
+        bb_max = np.maximum(bb_max, np.max(arr, axis=0))
+        d = np.diff(arr, axis=0)
+        if len(d):
+            seg_lens.extend(np.linalg.norm(d, axis=1))
+        n += 1
+    if n == 0:
+        return {}
+    span = (bb_max - bb_min).tolist()
+    return {
+        "units_code": code,
+        "units_to_m": to_m,
+        "bbox_min": bb_min.tolist(),
+        "bbox_max": bb_max.tolist(),
+        "span": span,
+        "entities": n,
+        "median_seg": float(np.median(seg_lens)) if seg_lens else 0.0,
+    }
+
+
+def _suggest_unit_scale_from_diag(diag: Dict) -> float:
+    """INSUNITS と図面スパンから現実的な m スケールを推定（mm→m など）"""
+    if not diag:
+        return 1.0
+    factor = float(diag.get("units_to_m", 1.0))
+    span = diag.get("span", [0, 0])
+    max_span = max(span) if span else 0.0
+    # INSUNITS が未設定（=1.0）かつスパンが数万以上なら mm 運用の可能性が高い
+    if factor == 1.0 and max_span > 50000:
+        factor = 0.001
+    return factor
+
+
+def _connect_segments(segs: List[np.ndarray], tol: float) -> np.ndarray:
+    """端点が tol 以内なら結合して一本化（最長経路を返す）"""
+    used = [False] * len(segs)
+    paths: List[np.ndarray] = []
+    for i, arr in enumerate(segs):
+        if used[i]:
+            continue
+        path = arr.copy()
+        used[i] = True
+        changed = True
+        while changed:
+            changed = False
+            for j, arr2 in enumerate(segs):
+                if used[j]:
+                    continue
+                if np.linalg.norm(path[-1] - arr2[0]) <= tol:
+                    path = np.vstack([path, arr2[1:]])
+                    used[j] = True
+                    changed = True
+                    continue
+                if np.linalg.norm(path[-1] - arr2[-1]) <= tol:
+                    path = np.vstack([path, arr2[-2::-1]])
+                    used[j] = True
+                    changed = True
+                    continue
+                if np.linalg.norm(path[0] - arr2[-1]) <= tol:
+                    path = np.vstack([arr2[:-1], path])
+                    used[j] = True
+                    changed = True
+                    continue
+                if np.linalg.norm(path[0] - arr2[0]) <= tol:
+                    path = np.vstack([arr2[::-1][:-1], path])
+                    used[j] = True
+                    changed = True
+                    continue
+        paths.append(path)
+    if not paths:
+        return np.empty((0, 2))
+    lens = [np.sum(np.linalg.norm(np.diff(p, axis=0), axis=1)) for p in paths]
+    return paths[int(np.argmax(lens))]
+
+
+def _join_centerline_segments(path: str, layers: List[str], tol_m: float, scale: float) -> Optional[np.ndarray]:
+    """CL レイヤ(複数可)の線分を結合して一本の中心線に。戻り値は [N,2] (m 単位)"""
+    doc = _load_doc_from_path(path)
+    if doc is None:
+        return None
+    msp = doc.modelspace()
+    try:
+        ents = msp.query("LINE LWPOLYLINE SPLINE")
+    except Exception:
+        ents = [e for e in msp if e.dxftype() in ("LINE", "LWPOLYLINE", "SPLINE")]
+    segs = []
+    for e in ents:
+        if layers and e.dxf.layer not in layers:
+            continue
+        arr = _poly_vertices(e)
+        if arr is None or len(arr) < 2:
+            continue
+        segs.append(arr * float(scale))
+    if not segs:
+        return None
+    joined = _connect_segments(segs, tol=float(tol_m))
+    return joined if len(joined) >= 2 else None
+
+
+def _scale_from_two_points(p1: Tuple[float, float], p2: Tuple[float, float], real_dist_m: float) -> float:
+    """2 点の CAD 座標から実距離[m]でスケールを逆算（m スケール）"""
+    d = float(np.linalg.norm(np.array(p2) - np.array(p1)))
+    if d <= 0:
+        return 1.0
+    return float(real_dist_m) / d
+
 
 # ──────────────────────────────────────────────────────────────
 # 幾何ヘルパ
@@ -97,109 +280,7 @@ def _profile_eval(s: float) -> Optional[float]:
 
 
 # ──────────────────────────────────────────────────────────────
-# DXF リーダ（忠実モードでも使用）
-def _load_doc_from_path(path: str):
-    try:
-        import ezdxf
-        return ezdxf.readfile(path)
-    except Exception:
-        return None
-
-
-def _poly_vertices(e) -> Optional[np.ndarray]:
-    try:
-        if e.dxftype() == "LINE":
-            p0 = e.dxf.start
-            p1 = e.dxf.end
-            return np.array([[p0.x, p0.y], [p1.x, p1.y]], float)
-        if e.dxftype() == "LWPOLYLINE":
-            pts = np.array([(p[0], p[1]) for p in e.get_points("xy")], float)
-            return pts
-        if e.dxftype() == "SPLINE":
-            pts = np.array([(p.x, p.y) for p in e.approximate(300)], float)
-            return pts
-    except Exception:
-        return None
-    return None
-
-
-def _to_section_oz(
-    seg: np.ndarray,
-    *,
-    axis="X=offset / Y=elev（標準）",
-    off_scale=1.0,
-    z_scale=1.0,
-    flip_o=False,
-    flip_z=False,
-    u0: Optional[float] = None,
-) -> np.ndarray:
-    """平面XY → 断面(o,z) に変換（忠実モード：並べ替え以外は加工しない）"""
-    if axis.startswith("X=elev"):
-        o = seg[:, 1].astype(float) * off_scale
-        z = seg[:, 0].astype(float) * z_scale
-    else:
-        o = seg[:, 0].astype(float) * off_scale
-        z = seg[:, 1].astype(float) * z_scale
-    if flip_o:
-        o *= -1.0
-    if flip_z:
-        z *= -1.0
-    if u0 is not None:
-        o = o - float(u0) * float(off_scale)
-    # o で昇順、同一 o は平均化（可視化安定用）
-    idx = np.argsort(o)
-    o = o[idx]
-    z = z[idx]
-    if len(o) >= 2:
-        uniq, inv = np.unique(np.round(o, 6), return_inverse=True)
-        acc = np.zeros_like(uniq)
-        cnt = np.zeros_like(uniq)
-        for i, j in enumerate(inv):
-            acc[j] += z[i]
-            cnt[j] += 1
-        z = acc / np.maximum(cnt, 1)
-        o = uniq
-    return np.column_stack([o, z])
-
-
-def _filter_near_vertical(oz: np.ndarray, eps_o: float = 0.02) -> np.ndarray:
-    """ほぼ縦棒（|Δo|<eps）を除去（値の破壊最小）"""
-    if oz is None or len(oz) < 2:
-        return oz
-    o = oz[:, 0]
-    z = oz[:, 1]
-    keep = [0]
-    for i in range(1, len(o)):
-        if abs(o[i] - o[i - 1]) >= eps_o:
-            keep.append(i)
-    if keep[-1] != len(o) - 1:
-        keep.append(len(o) - 1)
-    keep = sorted(set(keep))
-    return np.column_stack([o[keep], z[keep]])
-
-
-def _qa_delta_metrics(g: np.ndarray, b: np.ndarray, step: float = 0.5) -> Dict[str, float]:
-    if g is None or b is None or len(g) < 2 or len(b) < 2:
-        return {}
-    o_min = max(float(np.min(g[:, 0])), float(np.min(b[:, 0])))
-    o_max = min(float(np.max(g[:, 0])), float(np.max(b[:, 0])))
-    if o_max <= o_min:
-        return {}
-    o = np.arange(o_min, o_max + step / 2, step)
-    zg = np.interp(o, g[:, 0], g[:, 1])
-    zb = np.interp(o, b[:, 0], b[:, 1])
-    dz = zg - zb
-    return {
-        "count": len(dz),
-        "dz_max": float(np.max(dz)),
-        "dz_min": float(np.min(dz)),
-        "dz_mean": float(np.mean(dz)),
-        "dz_std": float(np.std(dz)),
-    }
-
-
-# ──────────────────────────────────────────────────────────────
-# Step1: 平面DXFの永続化・レイヤ一覧
+# 設定保持（平面DXF）
 def _set_plan_bytes(file):
     if file is None:
         return
@@ -212,9 +293,11 @@ def _set_plan_bytes(file):
     st.session_state.plan_label_layers = []  # 未選択スタート
     st.session_state.plan_circle_layers = []  # 未選択スタート
     st.session_state.centerline_raw = None
+    st.session_state.centerline_joined_applied = False
     st.session_state.labels_raw = None
     st.session_state.circles_raw = None
     st.session_state.no_table = None
+    st.session_state._plan_diag = None
 
 
 def _ensure_plan_layers():
@@ -301,7 +384,6 @@ def _build_assigned_from_raw():
         elif manual_s is not None:
             s = float(manual_s)
         else:
-            # s が決まらないと立体配置できない
             st.warning(f"[{key}] は No も s[m] も未指定のため配置できません。")
             continue
 
@@ -315,7 +397,6 @@ def _build_assigned_from_raw():
         if flip_z:
             z *= -1.0
 
-        # CL/円/中央値/手動の順で 0 オフセット
         P, _, n = _tangent_normal(cl, s)
 
         if center_by_section_cl and (rec.get("o0_from_section") is not None):
@@ -354,9 +435,31 @@ def _build_assigned_from_raw():
 
 
 # ──────────────────────────────────────────────────────────────
+# 2D QA：Δz
+def _qa_delta_metrics(g: np.ndarray, b: np.ndarray, step: float = 0.5) -> Dict[str, float]:
+    if g is None or b is None or len(g) < 2 or len(b) < 2:
+        return {}
+    o_min = max(float(np.min(g[:, 0])), float(np.min(b[:, 0])))
+    o_max = min(float(np.max(g[:, 0])), float(np.max(b[:, 0])))
+    if o_max <= o_min:
+        return {}
+    o = np.arange(o_min, o_max + step / 2, step)
+    zg = np.interp(o, g[:, 0], g[:, 1])
+    zb = np.interp(o, b[:, 0], b[:, 1])
+    dz = zg - zb
+    return {
+        "count": len(dz),
+        "dz_max": float(np.max(dz)),
+        "dz_min": float(np.min(dz)),
+        "dz_mean": float(np.mean(dz)),
+        "dz_std": float(np.std(dz)),
+    }
+
+
+# ──────────────────────────────────────────────────────────────
 # 画面本体
 def page():
-    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（CAD忠実モード対応）")
+    st.title("DXF取り込み｜No×測点円スナップ → 横断の立体配置（CAD忠実モード＋スケール診断）")
 
     # ===== Step 1: 平面 =====
     with st.expander("Step 1｜平面（中心線＋No.ラベル＋測点円）", expanded=True):
@@ -393,11 +496,99 @@ def page():
             )
             st.session_state.plan_layer_choice = layer_names[int(idx)]
 
+            # 追加：スケール診断 / 連結 / 2点法
+            st.markdown("### 🔧 スケール診断と中心線の整備")
+            col_diag = st.columns([1, 1, 1, 1])
+            with col_diag[0]:
+                if st.button("診断（INSUNITS/外接箱）", use_container_width=True):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmpx:
+                        tmpx.write(st.session_state.plan_bytes)
+                        tmpx.flush()
+                        st.session_state._plan_path = tmpx.name
+                    diag = _diagnose_dxf_bbox(tmpx.name, [st.session_state.plan_layer_choice])
+                    if not diag:
+                        st.warning("診断データが取得できませんでした。")
+                    else:
+                        st.session_state._plan_diag = diag
+                        st.success("診断結果を保存しました。下の表を確認してください。")
+
+            with col_diag[1]:
+                diag_ready = bool(st.session_state.get("_plan_diag"))
+                if st.button("推奨倍率を適用", use_container_width=True, disabled=(not diag_ready)):
+                    diag = st.session_state.get("_plan_diag") or {}
+                    if diag:
+                        rec = _suggest_unit_scale_from_diag(diag)
+                        st.session_state.unit_scale_plan_ui = float(rec)
+                        st.success(f"平面倍率を {rec:g} に設定しました。")
+
+            with col_diag[2]:
+                tol = st.number_input("CL連結 端点許容[m]", value=0.50, step=0.1, format="%.2f")
+            with col_diag[3]:
+                if st.button("中心線を連結して採用", use_container_width=True):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmpx:
+                        tmpx.write(st.session_state.plan_bytes)
+                        tmpx.flush()
+                        st.session_state._plan_path = tmpx.name
+                    joined = _join_centerline_segments(
+                        tmpx.name,
+                        layers=[st.session_state.plan_layer_choice],
+                        tol_m=float(tol),
+                        scale=float(st.session_state.unit_scale_plan_ui),
+                    )
+                    if joined is None or len(joined) < 2:
+                        st.warning("連結できませんでした。レイヤ選択や許容距離を見直してください。")
+                    else:
+                        # raw は「未スケール」で持つ設計 → 逆換算で格納
+                        st.session_state.centerline_raw = joined / float(st.session_state.unit_scale_plan_ui)
+                        st.session_state.centerline_joined_applied = True
+                        st.success(f"中心線を連結して登録しました（{len(joined)} 点）。")
+
+            # 診断サマリー
+            diag = st.session_state.get("_plan_diag")
+            if diag:
+                st.write("**診断結果 (INSUNITS & 図面スパン)**")
+                st.dataframe(
+                    pd.DataFrame(
+                        {
+                            "units_code": [diag["units_code"]],
+                            "units_to_m(INSUNITS)": [diag["units_to_m"]],
+                            "span_x": [diag["span"][0]],
+                            "span_y": [diag["span"][1]],
+                            "entities": [diag["entities"]],
+                            "median_seg_len": [diag["median_seg"]],
+                            "suggest_scale": [_suggest_unit_scale_from_diag(diag)],
+                        }
+                    ),
+                    use_container_width=True,
+                )
+
+            # 2点法キャリブレーション
+            st.markdown("### 📏 2点法キャリブレーション（平面倍率）")
+            cxy = st.columns(3)
+            with cxy[0]:
+                p1 = st.text_input("点A (x,y)", value="")
+            with cxy[1]:
+                p2 = st.text_input("点B (x,y)", value="")
+            with cxy[2]:
+                real_d = st.number_input("実距離[m]", value=0.0, step=1.0, format="%.3f")
+            if st.button("2点法を適用", disabled=(not p1 or not p2 or real_d <= 0)):
+                try:
+                    x1, y1 = [float(v) for v in p1.split(",")]
+                    x2, y2 = [float(v) for v in p2.split(",")]
+                    k = _scale_from_two_points((x1, y1), (x2, y2), real_d)
+                    st.session_state.unit_scale_plan_ui = float(k)
+                    st.success(f"平面倍率を {k:g} に設定しました。")
+                except Exception as e:
+                    st.error(f"入力を確認してください: {e}")
+
             c1, c2 = st.columns(2)
             with c1:
                 current = st.session_state.get("plan_label_layers") or []
                 ms = st.multiselect(
-                    "測点ラベルレイヤ（TEXT/MTEXT）", layer_names, default=current, key="plan_label_layers_ms"
+                    "測点ラベルレイヤ（TEXT/MTEXT）",
+                    layer_names,
+                    default=current,
+                    key="plan_label_layers_ms",
                 )
                 st.session_state.plan_label_layers = ms
                 b = st.columns([1, 1, 4])
@@ -433,15 +624,20 @@ def page():
                             tmp.flush()
                             st.session_state._plan_path = tmp.name
 
-                        cl_raw = read_centerline(tmp.name, allow_layers=[st.session_state.plan_layer_choice], unit_scale=1.0)
-                        if cl_raw is None or len(cl_raw) < 2:
-                            cl_raw = read_centerline(tmp.name, allow_layers=None, unit_scale=1.0)
-                            st.warning("選択レイヤで中心線が見つからなかったため、全レイヤから探索しました。")
+                        # 連結した中心線があればそれを優先
+                        cl_raw = st.session_state.get("centerline_raw")
+                        if (cl_raw is None) or (not st.session_state.get("centerline_joined_applied", False)):
+                            cl_raw = read_centerline(tmp.name, allow_layers=[st.session_state.plan_layer_choice], unit_scale=1.0)
+                            if cl_raw is None or len(cl_raw) < 2:
+                                cl_raw = read_centerline(tmp.name, allow_layers=None, unit_scale=1.0)
+                                st.warning("選択レイヤで中心線が見つからなかったため、全レイヤから探索しました。")
+                            st.session_state.centerline_raw = cl_raw
+                            st.session_state.centerline_joined_applied = False
 
                         labels = extract_no_labels(tmp.name, st.session_state.plan_label_layers, unit_scale=1.0)
                         circles = extract_circles(tmp.name, st.session_state.plan_circle_layers, unit_scale=1.0)
 
-                        cl_scaled = cl_raw * float(unit_scale_plan)
+                        cl_scaled = st.session_state.centerline_raw * float(unit_scale_plan)
                         rows = []
                         for lab in labels:
                             key = lab["key"]
@@ -483,11 +679,10 @@ def page():
                                 )
                         rows.sort(key=lambda d: d["s"])
 
-                        st.session_state.centerline_raw = cl_raw
                         st.session_state.labels_raw = labels
                         st.session_state.circles_raw = circles
                         st.session_state.no_table = rows
-                        st.success(f"中心線: {len(cl_raw)}点 / No.: {len(rows)}件 を抽出しました。")
+                        st.success(f"中心線: {len(st.session_state.centerline_raw)}点 / No.: {len(rows)}件 を抽出しました。")
                     except Exception as e:
                         st.error(f"抽出に失敗しました: {e}")
         else:
@@ -605,10 +800,85 @@ def page():
                         except Exception:
                             pass
 
-                    # u0（CL縦線 or 自動）検出
+                        # 追加：スケール診断 & 2点法（横断）
+                        st.markdown("#### 🔧 スケール診断（この横断DXF）")
+                        if st.button(f"[{f.name}] 診断を実行", key=f"diag_{f.name}"):
+                            diag_xs = _diagnose_dxf_bbox(tmp.name, None)
+                            st.session_state[f"_xs_diag_{f.name}"] = diag_xs
+                            if diag_xs:
+                                st.success("診断結果を保存しました。下に表示します。")
+                            else:
+                                st.warning("診断できませんでした。")
+
+                        diag_xs = st.session_state.get(f"_xs_diag_{f.name}")
+                        if diag_xs:
+                            k_suggest = _suggest_unit_scale_from_diag(diag_xs)
+                            st.write(
+                                pd.DataFrame(
+                                    {
+                                        "units_code": [diag_xs["units_code"]],
+                                        "units_to_m(INSUNITS)": [diag_xs["units_to_m"]],
+                                        "span_x": [diag_xs["span"][0]],
+                                        "span_y": [diag_xs["span"][1]],
+                                        "suggest_scale": [k_suggest],
+                                    }
+                                )
+                            )
+                            c_apply = st.columns(3)
+                            with c_apply[0]:
+                                if st.button("offset に適用", key=f"xs_apply_o_{f.name}"):
+                                    st.session_state.offset_scale_ui = float(k_suggest)
+                            with c_apply[1]:
+                                if st.button("elev に適用", key=f"xs_apply_z_{f.name}"):
+                                    st.session_state.elev_scale_ui = float(k_suggest)
+                            with c_apply[2]:
+                                if st.button("offset & elev 両方に適用", key=f"xs_apply_both_{f.name}"):
+                                    st.session_state.offset_scale_ui = float(k_suggest)
+                                    st.session_state.elev_scale_ui = float(k_suggest)
+
+                        st.markdown("#### 📏 2点法キャリブレーション（横断スケール）")
+                        cxy2 = st.columns(4)
+                        with cxy2[0]:
+                            p1x = st.text_input("点A x", key=f"xs_p1x_{f.name}", value="")
+                        with cxy2[1]:
+                            p1y = st.text_input("点A y", key=f"xs_p1y_{f.name}", value="")
+                        with cxy2[2]:
+                            p2x = st.text_input("点B x", key=f"xs_p2x_{f.name}", value="")
+                        with cxy2[3]:
+                            p2y = st.text_input("点B y", key=f"xs_p2y_{f.name}", value="")
+                        cxy3 = st.columns(3)
+                        with cxy3[0]:
+                            real_d2 = st.number_input(
+                                "実距離[m]（offsetに適用）", value=0.0, step=0.1, format="%.3f", key=f"xs_real_o_{f.name}"
+                            )
+                        with cxy3[1]:
+                            real_h2 = st.number_input(
+                                "実高低差[m]（elevに適用）", value=0.0, step=0.1, format="%.3f", key=f"xs_real_z_{f.name}"
+                            )
+                        with cxy3[2]:
+                            if st.button("2点法を適用", key=f"xs_apply_2pt_{f.name}"):
+                                try:
+                                    p1 = (float(p1x), float(p1y))
+                                    p2 = (float(p2x), float(p2y))
+                                    if real_d2 > 0:
+                                        ko = _scale_from_two_points(p1, p2, real_d2)
+                                        st.session_state.offset_scale_ui = float(ko)
+                                    if real_h2 > 0:
+                                        # 軸割に応じて elev の差分を抽出
+                                        if axis_mode.startswith("X=offset"):
+                                            dz_cad = abs(float(p2[1] - p1[1]))
+                                        else:
+                                            dz_cad = abs(float(p2[0] - p1[0]))
+                                        kz = float(real_h2) / dz_cad if dz_cad > 0 else st.session_state.elev_scale_ui
+                                        st.session_state.elev_scale_ui = float(kz)
+                                    st.success("2点法スケールを適用しました。")
+                                except Exception as e:
+                                    st.error(f"入力を確認してください: {e}")
+
+                    # u0（CL縦線 or 自動）検出（忠実モード時）
                     u0 = None
                     try:
-                        if f.name.lower().endswith(".dxf") and center_by_section_cl:
+                        if f.name.lower().endswith(".dxf") and exact_mode and center_by_section_cl:
                             u0 = detect_section_centerline_u(tmp.name, layer_hint=(cl_hint_layers or None), unit_scale=1.0)
                     except Exception:
                         u0 = None
@@ -934,32 +1204,119 @@ def page():
         cl = st.session_state.centerline
         assigned = st.session_state._assigned
 
-        z_scale = st.number_input("縦倍率（標高）", value=1.0, step=0.1, format="%.1f")
-        max_pts_cl = st.number_input("中心線の最大点数（3D間引き）", value=4000, step=500, min_value=500, max_value=20000)
-        max_pts_xs = st.number_input("断面1本あたりの最大点数（3D間引き）", value=1200, step=100, min_value=200, max_value=10000)
-        show_arcs = st.checkbox("円弧を表示する（簡易）", value=True)
+        # ---- 表示フィルタ ----
+        items_sorted = sorted(assigned.items(), key=lambda kv: kv[1]["s"])
+        option_labels = [f"{(rec['no_key'] or key)}  |  s={rec['s']:.1f} m" for key, rec in items_sorted]
+        option_keys = [key for key, _ in items_sorted]
 
+        default_labels = st.session_state.get("step3_show_labels", option_labels)
+        col_btn = st.columns([1, 1, 8])
+        with col_btn[0]:
+            if st.button("全選択", use_container_width=True):
+                default_labels = option_labels
+        with col_btn[1]:
+            if st.button("全解除", use_container_width=True):
+                default_labels = []
+
+        selected_labels = st.multiselect(
+            "表示する断面（複数可）",
+            option_labels,
+            default=default_labels,
+            key="step3_show_labels",
+        )
+        selected_keys = {option_keys[option_labels.index(lbl)] for lbl in selected_labels}
+
+        # ---- 表示オプション ----
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            z_scale = st.number_input("縦倍率（標高）", value=1.0, step=0.1, format="%.1f")
+        with c2:
+            max_pts_cl = st.number_input("中心線の最大点数", value=4000, step=500, min_value=500, max_value=20000)
+        with c3:
+            max_pts_xs = st.number_input("断面1本あたりの最大点数", value=1200, step=100, min_value=200, max_value=10000)
+        with c4:
+            show_arcs = st.checkbox("円弧を表示", value=True)
+
+        c5, c6, c7 = st.columns(3)
+        with c5:
+            show_centerline = st.checkbox("中心線を表示", value=True)
+        with c6:
+            show_zero_axis = st.checkbox("o=0 軸を表示", value=False)
+        with c7:
+            show_cl_axis = st.checkbox("CL 縦線を表示", value=True)
+
+        # ---- 描画 ----
         fig = go.Figure()
-        cl_plot = _decimate1d(cl, int(max_pts_cl))
-        fig.add_trace(go.Scatter3d(x=cl_plot[:, 0], y=cl_plot[:, 1], z=np.zeros(len(cl_plot)), mode="lines",
-                                   name="Centerline", line=dict(width=4, color="#A0A6B3")))
+        if show_centerline:
+            cl_plot = _decimate1d(cl, int(max_pts_cl))
+            fig.add_trace(
+                go.Scatter3d(
+                    x=cl_plot[:, 0],
+                    y=cl_plot[:, 1],
+                    z=np.zeros(len(cl_plot)),
+                    mode="lines",
+                    name="Centerline",
+                    line=dict(width=4, color="#A0A6B3"),
+                )
+            )
 
-        for sec_key, rec in sorted(assigned.items(), key=lambda kv: kv[1]["s"]):
+        if not selected_keys:
+            st.plotly_chart(fig, use_container_width=True, height=760)
+            st.info("表示する断面が選択されていません。")
+            return
+
+        for sec_key, rec in items_sorted:
+            if sec_key not in selected_keys:
+                continue
             s = float(rec["s"])
             oz = np.asarray(rec["oz"], float)
+
             P, t, n = _tangent_normal(cl, s)
             oz_plot = _decimate(oz, int(max_pts_xs))
             X, Y, Z = _xs_to_world3D(P, n, oz_plot, z_scale=z_scale)
-            fig.add_trace(go.Scatter3d(x=X, y=Y, z=Z, mode="lines", name=f"{rec['no_key'] or sec_key}", line=dict(width=5, color="#FFFFFF"), opacity=0.98))
+            fig.add_trace(
+                go.Scatter3d(
+                    x=X,
+                    y=Y,
+                    z=Z,
+                    mode="lines",
+                    name=f"{rec['no_key'] or sec_key}",
+                    line=dict(width=5, color="#FFFFFF"),
+                    opacity=0.98,
+                )
+            )
 
-            omin, omax = float(np.min(oz_plot[:, 0])), float(np.max(oz_plot[:, 0]))
-            Xb, Yb, Zb = _xs_to_world3D(P, n, np.array([[omin, 0.0], [omax, 0.0]]), z_scale=z_scale)
-            fig.add_trace(go.Scatter3d(x=Xb, y=Yb, z=Zb, mode="lines", showlegend=False, line=dict(width=2, color="#777777")))
+            # o=0 軸（水平）
+            if show_zero_axis:
+                omin, omax = float(np.min(oz_plot[:, 0])), float(np.max(oz_plot[:, 0]))
+                Xb, Yb, Zb = _xs_to_world3D(P, n, np.array([[omin, 0.0], [omax, 0.0]]), z_scale=z_scale)
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=Xb,
+                        y=Yb,
+                        z=Zb,
+                        mode="lines",
+                        showlegend=False,
+                        line=dict(width=2, color="#777777"),
+                    )
+                )
 
-            zmin, zmax = float(np.min(oz_plot[:, 1])) * z_scale, float(np.max(oz_plot[:, 1])) * z_scale
-            Xp, Yp, Zp = _xs_to_world3D(P, n, np.array([[0.0, zmin], [0.0, zmax]]), z_scale=1.0)
-            fig.add_trace(go.Scatter3d(x=Xp, y=Yp, z=Zp, mode="lines", showlegend=False, line=dict(width=3, color="#8888FF")))
+            # CL 縦線（o=0 の鉛直）
+            if show_cl_axis:
+                zmin, zmax = float(np.min(oz_plot[:, 1])) * z_scale, float(np.max(oz_plot[:, 1])) * z_scale
+                Xp, Yp, Zp = _xs_to_world3D(P, n, np.array([[0.0, zmin], [0.0, zmax]]), z_scale=1.0)
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=Xp,
+                        y=Yp,
+                        z=Zp,
+                        mode="lines",
+                        showlegend=False,
+                        line=dict(width=3, color="#8888FF"),
+                    )
+                )
 
+            # 簡易円弧
             if show_arcs:
                 try:
                     res = compute_min_circle({"section": oz})
@@ -972,23 +1329,46 @@ def page():
                         X2 = P[0] + xo * n[0]
                         Y2 = P[1] + xo * n[1]
                         Z2 = zo * z_scale
-                        fig.add_trace(go.Scatter3d(x=X2, y=Y2, z=Z2, mode="lines", showlegend=False, line=dict(width=3, color="#FF9500")))
+                        fig.add_trace(
+                            go.Scatter3d(
+                                x=X2,
+                                y=Y2,
+                                z=Z2,
+                                mode="lines",
+                                showlegend=False,
+                                line=dict(width=3, color="#FF9500"),
+                            )
+                        )
                 except Exception:
                     pass
 
-        fig.update_layout(scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False), aspectmode="data"),
-                          paper_bgcolor="#0f1115", plot_bgcolor="#0f1115", margin=dict(l=0, r=0, t=0, b=0))
+        fig.update_layout(
+            scene=dict(
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+                zaxis=dict(visible=False),
+                aspectmode="data",
+            ),
+            paper_bgcolor="#0f1115",
+            plot_bgcolor="#0f1115",
+            margin=dict(l=0, r=0, t=0, b=0),
+        )
         st.plotly_chart(fig, use_container_width=True, height=760)
 
 
 # ──────────────────────────────────────────────────────────────
-# 既存の地層集約（忠実モード OFF 用）— そのまま流用
-def _merge_segments_geo(oz_list: List[np.ndarray], step: float = 0.2, min_span: float = 5.0, roll: int = 7, mode: str = "中央値（ロバスト）") -> np.ndarray:
+# 既存の地層集約（忠実モード OFF 用）— そのまま流用（簡略版）
+def _merge_segments_geo(
+    oz_list: List[np.ndarray],
+    step: float = 0.2,
+    min_span: float = 5.0,
+    roll: int = 7,
+    mode: str = "中央値（ロバスト）",
+) -> np.ndarray:
     """複数断面をロバストにマージ（既存ロジック簡略版）"""
     if not oz_list:
         return np.empty((0, 2), float)
 
-    # すべての o 範囲を結合
     omin = min(float(np.min(oz[:, 0])) for oz in oz_list)
     omax = max(float(np.max(oz[:, 0])) for oz in oz_list)
     if omax <= omin:
@@ -1007,9 +1387,8 @@ def _merge_segments_geo(oz_list: List[np.ndarray], step: float = 0.2, min_span: 
     with np.errstate(invalid="ignore"):
         if mode.startswith("最長"):
             # 有効データ点数が最大の系列（=実質一番長い曲線）
-            valid_counts = np.sum(~np.isnan(A), axis=0)
-            best = np.argmax(valid_counts)  # 参考：単純選択（厳密ではない）
-            z = np.nanmedian(A, axis=0)  # 安定のため中央値
+            # ここでは安定のため中央値を採用
+            z = np.nanmedian(A, axis=0)
         elif mode.startswith("上包絡"):
             z = np.nanpercentile(A, 90, axis=0)
         elif mode.startswith("下包絡"):
@@ -1017,7 +1396,6 @@ def _merge_segments_geo(oz_list: List[np.ndarray], step: float = 0.2, min_span: 
         else:
             z = np.nanmedian(A, axis=0)
 
-    # 短片除外（NaN 部分を除く）
     m = ~np.isnan(z)
     if not np.any(m):
         return np.empty((0, 2), float)
